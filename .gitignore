@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ESPHome build
+.esphome/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Secrets
+secrets.yaml
+
+.claude/
+
+# Host-side frame verification binary
+tools/frame_check/frame_check
+
+# Local-only notes (internal source references), not for the public repo
+*.local.md
+*.local.txt
+
+# Keep the README local for now
+README.md
+
+tools/frame_check/f202_check
+
+# Semgrep plugin scratch output
+.semgrep/
