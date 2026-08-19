@@ -39,7 +39,7 @@ nartis_rf_2_meter:
   # frequency: 443.9MHz     # default: derived from `address`
   # data_page: auto         # auto | 0xF200 | 0xF202
   # request_gap: 500ms
-  # rf_rx_timeout: 1000ms
+  # rf_rx_timeout: 1500ms
   # rf_retries: 2
   # rx_center_offset: 758
 

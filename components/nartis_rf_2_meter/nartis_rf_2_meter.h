@@ -200,7 +200,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint8_t missing_tags_{0};
 
   uint32_t request_gap_ms_{500};
-  uint32_t rf_rx_timeout_ms_{1000};
+  uint32_t rf_rx_timeout_ms_{1500};
   uint8_t rf_retries_{2};
   int rx_center_offset_{758};
 

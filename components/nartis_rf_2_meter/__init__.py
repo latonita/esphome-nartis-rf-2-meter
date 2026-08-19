@@ -235,9 +235,13 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,
-        # How long to wait for a reply per on-air attempt.
+        # How long to wait for a reply per on-air attempt. Measured on the reference
+        # meter: a good reply completes a median of ~965 ms after the start of
+        # transmit, and TX airtime alone is ~230 ms of that, so the reply lands
+        # ~735 ms into the RX window with real spread above it. 1000 ms cut into
+        # that spread; 1500 ms is the value proven in the field.
         cv.Optional(
-            CONF_RF_RX_TIMEOUT, default="1000ms"
+            CONF_RF_RX_TIMEOUT, default="1500ms"
         ): cv.positive_time_period_milliseconds,
         # Retransmissions per exchange on no-reply or a bad frame. Total on-air
         # attempts = 1 + rf_retries.
