@@ -278,8 +278,20 @@ void Cmt2300aHal::init_rx(int off_codes) {
   this->spi_write_reg(REG_PKT13, 0x55);      // SYNC_VALUE<63:56> = 1st byte on air (frame 0xAA)
   this->spi_write_reg(REG_PKT12, 0x19);      // SYNC_VALUE<55:48> = 2nd byte on air (frame 0x98)
   this->spi_write_reg(REG_PKT11, 0xCF);      // SYNC_VALUE<47:40> = 3rd byte on air (frame 0xf3)
-  this->spi_write_reg(REG_PKT14, 0x12);      // PAYLOAD_BIT_ORDER=1 (chip flips bits) + fixed length
-  this->spi_write_reg(REG_PKT15, 0xFF);      // fixed length ceiling 0x1FF (511)
+  // Fixed RX length 180, matching the original display (PKT14=0x02 PKT15=0xB4 in all six
+  // SPI dumps of it). PAYLOAD_LENG spans both registers - PKT14<6:4> carries bits 10:8 -
+  // so the ceiling only drops to 180 if those are cleared as well; leaving PKT14 at 0x12
+  // would give 0x1B4 = 436, not 180. Bit 1 is PAYLOAD_BIT_ORDER and stays set, so the chip
+  // still flips the payload bit order for us. (That also means the display runs with the
+  // flip on, not off as HAL_FIXES_FROM_SPI.md §3 reads it - 0x02 differs from our 0x12 only
+  // in the length bits.)
+  //
+  // 180 sits above the 146-byte largest frame the parser will accept and equals the drain
+  // cap, so nothing decodable can be truncated. Per RF_PHY_SPEC.md §4.5 the ceiling MUST be
+  // re-set here on every RX: transmit() leaves the packet engine at the exact TX length, and
+  // an un-restored ceiling truncates every incoming frame.
+  this->spi_write_reg(REG_PKT14, 0x02);      // PAYLOAD_BIT_ORDER=1, PAYLOAD_LENG<10:8>=0
+  this->spi_write_reg(REG_PKT15, 0xB4);      // fixed length 180 (was 0x1FF = 511)
   this->update_reg(REG_INT2_CTL, MASK_INT2_SEL, INT_SEL_RX_FIFO_TH);
   this->update_reg(REG_FIFO_CTL, MASK_FIFO_RX_TX_SEL | MASK_SPI_FIFO_RD_WR_SEL, 0x00);  // FIFO -> RX read
   this->spi_write_reg(REG_FIFO_CLR, FIFO_RESTORE | FIFO_CLR_RX | FIFO_CLR_TX);
