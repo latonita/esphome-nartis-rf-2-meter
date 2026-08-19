@@ -10,20 +10,13 @@ esp32:
 logger:
   level: DEBUG
 
-  # level: VERBOSE
-  # tx_buffer_size: 1024
-# VERBOSE prints state transitions and full RX/TX hex dumps. Raise tx_buffer_size
-# so the frame dumps are not truncated mid-line. DEBUG is enough for everyday use.
-
-# Home Assistant API / OTA / Wi-Fi - uncomment and fill in your secrets to use.
+# Fill in your own secrets to enable these.
 #api:
 #  encryption:
 #    key: !secret api_encryption_key
-
 #ota:
 #  - platform: esphome
 #    password: !secret ota_password
-
 #wifi:
 #  ssid: !secret wifi_ssid
 #  password: !secret wifi_password
@@ -31,67 +24,31 @@ logger:
 external_components:
   - source: github://latonita/esphome-nartis-rf-2-meter
     components: [nartis_rf_2_meter]
-    refresh: 1s
 
-# CMT2300A RF transceiver wiring (ESP32 GPIOs - adjust to your board).
+# CMT2300A wiring - adjust the GPIOs to your board.
 nartis_rf_2_meter:
   id: nartis
-  address: "023240271060"    # 12 digits from the meter nameplate
+  address: "023240271060"   # 12 digits from the meter nameplate
   pin_sdio: GPIO19
   pin_sclk: GPIO18
   pin_csb: GPIO5
   pin_fcsb: GPIO21
-  pin_gpio3: GPIO22          # INT2 - required
+  pin_gpio3: GPIO22         # INT2
   update_interval: 300s
-  # frequency: 443.9MHz      # override; by default derived from `address`
+  # Optional, shown with their defaults:
+  # frequency: 443.9MHz     # default: derived from `address`
+  # data_page: auto         # auto | 0xF200 | 0xF202
   # request_gap: 500ms
   # rf_rx_timeout: 1000ms
   # rf_retries: 2
   # rx_center_offset: 758
 
-  # Which page the `tag` sensors are read from. The default `auto` works it out
-  # from the sensors below: DI 0xF202 if any of them can only come from there -
-  # the voltages, currents, power and frequency - and DI 0xF200 otherwise.
-  #
-  # Always just one page. DI 0xF202 also carries the energy registers and the
-  # clock, so a mix never needs both polled.
-  #
-  # Which TAGs a page actually carries is set with the vendor tool, so `auto` can
-  # be too optimistic: on the reference meter the DI 0xF200 page holds only TAGs
-  # 0x00-0x02 and 0x29, so export energy 0x05 is absent from it even though it is a
-  # cumulative register like the others. If that happens the component notices the
-  # missing TAGs after the first poll and moves up to DI 0xF202 by itself, with a
-  # warning - it never moves back down, so it cannot oscillate.
-  #
-  # Force a page if your meter answers one but not the other; `probe:` is how to
-  # find out which. A DI the meter does not implement answers with a refusal, so
-  # it is distinguishable from silence.
-  # data_page: 0xF200
-
-  # Extra reads to try once per cycle, logged and not turned into entities. New
-  # DIs want the 6-byte body: 0xF202 is silently dropped with the 1-byte default.
-  # probe:
-  #   - di: 0xF204
-  #     body: [0x00, 0x00, 0x00, 0x00, 0x01, 0x23]
-
+# Values arrive raw, so each entity states its own scaling with a `multiply` filter.
+# A TAG your meter's page does not carry simply stays unavailable.
 sensor:
-  # ==========================================================================
-  # Everything below is what a DI 0xF202 page carries. Values are published raw,
-  # so each entity states its own scaling with a `multiply` filter:
-  #
-  #   energy       4 bytes binary LE, Wh    -> x0.001 kWh
-  #   voltage      4 bytes BCD              -> x0.1    V
-  #   current      4 bytes BCD              -> x0.01   A
-  #   power        4 bytes BCD, kW          -> x10     W
-  #   frequency    4 bytes BCD              -> x0.01   Hz
-  #
-  # A TAG your meter's page does not include simply stays unavailable; the log
-  # says "TAG 0xNN is not in this meter's indication set".
-  # ==========================================================================
-
-  # --- Active energy, import (A+) -------------------------------------------
+  # Active energy, import (A+)
   - platform: nartis_rf_2_meter
-    name: "Active energy total"     # Активная энергия, импорт, всего
+    name: "Active energy total"          # Активная энергия, импорт, всего
     tag: 0x00
     unit_of_measurement: kWh
     accuracy_decimals: 3
@@ -100,7 +57,7 @@ sensor:
     filters: [multiply: 0.001]
 
   - platform: nartis_rf_2_meter
-    name: "Active energy T1"        # Тариф 1 (день)
+    name: "Active energy T1"             # Тариф 1 (день)
     tag: 0x01
     unit_of_measurement: kWh
     accuracy_decimals: 3
@@ -109,7 +66,7 @@ sensor:
     filters: [multiply: 0.001]
 
   - platform: nartis_rf_2_meter
-    name: "Active energy T2"        # Тариф 2 (ночь)
+    name: "Active energy T2"             # Тариф 2 (ночь)
     tag: 0x02
     unit_of_measurement: kWh
     accuracy_decimals: 3
@@ -117,7 +74,7 @@ sensor:
     state_class: total_increasing
     filters: [multiply: 0.001]
 
-  # --- Active energy, export (A-) -------------------------------------------
+  # Active energy, export (A-)
   - platform: nartis_rf_2_meter
     name: "Active energy export total"   # Активная энергия, экспорт, всего
     tag: 0x05
@@ -145,9 +102,9 @@ sensor:
     state_class: total_increasing
     filters: [multiply: 0.001]
 
-  # --- Phase voltages -------------------------------------------------------
+  # Phase voltages
   - platform: nartis_rf_2_meter
-    name: "Voltage L1"              # Напряжение фазы A
+    name: "Voltage L1"                   # Напряжение фазы A
     tag: 0x15
     unit_of_measurement: V
     accuracy_decimals: 1
@@ -156,7 +113,7 @@ sensor:
     filters: [multiply: 0.1]
 
   - platform: nartis_rf_2_meter
-    name: "Voltage L2"              # Напряжение фазы B
+    name: "Voltage L2"                   # Напряжение фазы B
     tag: 0x16
     unit_of_measurement: V
     accuracy_decimals: 1
@@ -165,7 +122,7 @@ sensor:
     filters: [multiply: 0.1]
 
   - platform: nartis_rf_2_meter
-    name: "Voltage L3"              # Напряжение фазы C
+    name: "Voltage L3"                   # Напряжение фазы C
     tag: 0x17
     unit_of_measurement: V
     accuracy_decimals: 1
@@ -173,9 +130,9 @@ sensor:
     state_class: measurement
     filters: [multiply: 0.1]
 
-  # --- Currents -------------------------------------------------------------
+  # Currents
   - platform: nartis_rf_2_meter
-    name: "Current neutral"         # Ток нейтрали
+    name: "Current neutral"              # Ток нейтрали
     tag: 0x1C
     unit_of_measurement: A
     accuracy_decimals: 2
@@ -184,7 +141,7 @@ sensor:
     filters: [multiply: 0.01]
 
   - platform: nartis_rf_2_meter
-    name: "Current L1"              # Ток фазы A
+    name: "Current L1"                   # Ток фазы A
     tag: 0x1D
     unit_of_measurement: A
     accuracy_decimals: 2
@@ -193,7 +150,7 @@ sensor:
     filters: [multiply: 0.01]
 
   - platform: nartis_rf_2_meter
-    name: "Current L2"              # Ток фазы B
+    name: "Current L2"                   # Ток фазы B
     tag: 0x1E
     unit_of_measurement: A
     accuracy_decimals: 2
@@ -201,9 +158,8 @@ sensor:
     state_class: measurement
     filters: [multiply: 0.01]
 
-  # Ток фазы C - absent from the observed page, kept for meters that do send it.
   - platform: nartis_rf_2_meter
-    name: "Current L3"
+    name: "Current L3"                   # Ток фазы C
     tag: 0x1F
     unit_of_measurement: A
     accuracy_decimals: 2
@@ -211,11 +167,9 @@ sensor:
     state_class: measurement
     filters: [multiply: 0.01]
 
-  # --- Power and frequency --------------------------------------------------
-  # The meter sends kW; x10 converts to the watts Home Assistant prefers. How a
-  # negative (export) value is carried in BCD is not known - none has been seen.
+  # Power and frequency - the meter sends kW, so x10 gives watts.
   - platform: nartis_rf_2_meter
-    name: "Active power"            # Активная мощность, сумма по фазам
+    name: "Active power"                 # Активная мощность, сумма по фазам
     tag: 0x20
     unit_of_measurement: W
     accuracy_decimals: 0
@@ -224,7 +178,7 @@ sensor:
     filters: [multiply: 10]
 
   - platform: nartis_rf_2_meter
-    name: "Frequency"               # Частота сети
+    name: "Frequency"                    # Частота сети
     tag: 0x28
     unit_of_measurement: Hz
     accuracy_decimals: 2
@@ -232,38 +186,21 @@ sensor:
     state_class: measurement
     filters: [multiply: 0.01]
 
-  # --- Status block (DI 0xF201) --------------------------------------------
+  # Status block (DI 0xF201)
   - platform: nartis_rf_2_meter
-    name: "Active tariff"           # Текущий тариф
+    name: "Active tariff"                # Текущий тариф
     status: active_tariff
     icon: mdi:counter
     entity_category: diagnostic
 
   - platform: nartis_rf_2_meter
-    name: "Tariff count"            # Число тарифов
+    name: "Tariff count"                 # Число тарифов
     status: tariff_count
     entity_category: diagnostic
 
-  # EXPERIMENTAL: byte 5 of the status block moves like a room thermometer across
-  # the captures, but that has never been confirmed.
-  # - platform: nartis_rf_2_meter
-  #   name: "Temperature"
-  #   status: temperature
-  #   unit_of_measurement: °C
-  #   accuracy_decimals: 0
-  #   device_class: temperature
-  #   state_class: measurement
-
 text_sensor:
   - platform: nartis_rf_2_meter
-    name: "Meter clock"             # Часы счётчика
+    name: "Meter clock"                  # Часы счётчика
     tag: 0x29
     icon: mdi:clock-outline
     entity_category: diagnostic
-
-  # Hex dump of the whole 9-byte status block - useful for reporting the bytes
-  # that are still unexplained.
-  # - platform: nartis_rf_2_meter
-  #   name: "Status raw"
-  #   status: raw
-  #   entity_category: diagnostic
