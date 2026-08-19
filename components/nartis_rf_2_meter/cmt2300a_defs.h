@@ -39,6 +39,7 @@ static constexpr uint8_t REG_SYS2 = 0x0D;   // PLL/XO trim cluster - selects TX-
 static constexpr uint8_t REG_SYS11 = 0x16;  // FIFO merge config
 static constexpr uint8_t REG_PKT5 = 0x3C;   // SYNC_SIZE / SYNC_TOL
 static constexpr uint8_t REG_PKT10 = 0x41;  // SYNC_VALUE bytes: PKT10..PKT13 (0x41..0x44)
+static constexpr uint8_t REG_PKT11 = 0x42;  // SYNC_VALUE<47:40>
 static constexpr uint8_t REG_PKT12 = 0x43;  // SYNC_VALUE<55:48>
 static constexpr uint8_t REG_PKT13 = 0x44;  // SYNC_VALUE<63:56>
 static constexpr uint8_t REG_PKT14 = 0x45;  // PKT_TYPE / PAYLOAD_BIT_ORDER / PAYLOAD_LENG<10:8>

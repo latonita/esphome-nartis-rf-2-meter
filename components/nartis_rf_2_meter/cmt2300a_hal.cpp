@@ -252,14 +252,32 @@ void Cmt2300aHal::init_tx() {
 }
 
 // ================= RX INIT (before each receive) =================
-// 2-byte sync 98 f3 (chip bytes 19 CF), chip bit-order flip, wide ~28 kHz profile
-// centred on the reply, FIFO -> RX on RX_FIFO_TH.
+// 3-byte sync 55 19 CF (= the meter's last preamble byte plus 98 f3), chip bit-order
+// flip, wide ~25 kHz profile centred on the reply, FIFO -> RX on RX_FIFO_TH.
 void Cmt2300aHal::init_rx(int off_codes) {
   this->spi_write_reg(REG_MODE_CTL, GO_STBY);
   this->wait_for_state(STA_STBY);
-  this->spi_write_reg(REG_PKT5, 0x22);       // SYNC_TOL=2, SYNC_SIZE=1 (2 bytes)
-  this->spi_write_reg(REG_PKT13, 0x19);      // SYNC_VALUE<63:56> = first byte  (on-air 0x98)
-  this->spi_write_reg(REG_PKT12, 0xCF);      // SYNC_VALUE<55:48> = second byte (on-air 0xf3)
+  // Sync taken verbatim from the original display: PKT5=0x04 with 0x44=55 0x43=19
+  // 0x42=CF, identical in all six SPI dumps of it and never rewritten between TX and RX.
+  //
+  // The sync bytes sit in on-air order descending from PKT13, held in the on-air
+  // (bit-reversed) domain: 55 19 CF on air is AA 98 F3 in frame terms. That leading AA
+  // is the meter's last preamble byte - it sends exactly 8 of them, and in every capture
+  // where a mis-lock left the preamble sitting in the FIFO all 8 were bit-perfect, so
+  // folding one into the sync costs nothing and narrows the match window 256x.
+  //
+  // SYNC_TOL=0 for the same reason: wherever a reply's body arrived intact its sync word
+  // had arrived with zero bit errors, so tolerance never once helped. What it did do was
+  // widen the window - a 2-byte sync at TOL=2 accepts 137 of 65536 patterns, and the
+  // detector was locking onto noise ahead of the reply on roughly 10% of all attempts.
+  // Every such mis-lock puts the reply in the FIFO at a wrong bit phase, where the frame
+  // layer cannot see it, and can also end the RX window early on a noise byte read as LEN.
+  //
+  // The FIFO still starts at the LEN byte, so the frame layer is unaffected.
+  this->spi_write_reg(REG_PKT5, 0x04);       // SYNC_TOL=0, SYNC_SIZE=2 (3 bytes)
+  this->spi_write_reg(REG_PKT13, 0x55);      // SYNC_VALUE<63:56> = 1st byte on air (frame 0xAA)
+  this->spi_write_reg(REG_PKT12, 0x19);      // SYNC_VALUE<55:48> = 2nd byte on air (frame 0x98)
+  this->spi_write_reg(REG_PKT11, 0xCF);      // SYNC_VALUE<47:40> = 3rd byte on air (frame 0xf3)
   this->spi_write_reg(REG_PKT14, 0x12);      // PAYLOAD_BIT_ORDER=1 (chip flips bits) + fixed length
   this->spi_write_reg(REG_PKT15, 0xFF);      // fixed length ceiling 0x1FF (511)
   this->update_reg(REG_INT2_CTL, MASK_INT2_SEL, INT_SEL_RX_FIFO_TH);
