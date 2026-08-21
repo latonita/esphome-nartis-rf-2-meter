@@ -20,12 +20,29 @@ void NartisRf2MeterComponent::setup() {
   }
 
   serial_to_bcd_le(this->address_.c_str(), this->serial_le_);
-  this->rf_frequency_hz_ =
-      (this->frequency_override_ != 0) ? this->frequency_override_ : frequency_from_serial(this->address_.c_str());
+  this->channel_ = (this->frequency_override_ != 0) ? channel_from_frequency(this->frequency_override_)
+                                                    : channel_from_serial(this->address_.c_str());
 
   this->hal_.set_pins(this->pin_sdio_, this->pin_sclk_, this->pin_csb_, this->pin_fcsb_, this->pin_gpio3_);
-  // Must precede init(): init() is what writes the computed frequency bank.
-  this->hal_.set_frequency(this->rf_frequency_hz_);
+
+  // Must precede init(): init() is what writes the frequency registers.
+  if (this->variant_ == VARIANT_2) {
+    // Base bank + FREQ_CHNL, as the newer display does it. The hop is quantised
+    // to the 0.7 MHz grid, so an off-grid `frequency:` override cannot be honoured
+    // exactly - say so rather than tuning somewhere the user did not ask for.
+    this->rf_frequency_hz_ = channel_frequency(this->channel_);
+    if (this->frequency_override_ != 0 && this->frequency_override_ != this->rf_frequency_hz_) {
+      ESP_LOGW(TAG, "variant 2 tunes by channel index: %.3f MHz rounded to channel %u (%.3f MHz)",
+               this->frequency_override_ / 1e6f, this->channel_, this->rf_frequency_hz_ / 1e6f);
+    }
+    this->hal_.set_frequency_mode(FreqMode::BASE_PLUS_CHANNEL);
+    this->hal_.set_channel(this->channel_);
+    this->hal_.set_frequency(this->rf_frequency_hz_);
+  } else {
+    this->rf_frequency_hz_ =
+        (this->frequency_override_ != 0) ? this->frequency_override_ : frequency_from_serial(this->address_.c_str());
+    this->hal_.set_frequency(this->rf_frequency_hz_);
+  }
 
   if (!this->hal_.init()) {
     ESP_LOGE(TAG, "CMT2300A initialization failed - check wiring");
@@ -38,21 +55,30 @@ void NartisRf2MeterComponent::setup() {
   this->hal_.go_standby();
   this->radio_ready_ = true;
 
-  // The diagnostic entity reports on a poll cycle, so it needs one to happen. With
-  // no value entities configured nothing would ever be polled and it would sit at
-  // its boot state forever, so ask for the status exchange - the shorter of the two.
-  if (this->last_read_ok_bs_ != nullptr && !this->need_data_ && !this->need_status_) {
-    this->need_status_ = true;
-    ESP_LOGI(TAG, "Only the last_read_ok entity is configured - polling the status page to exercise the link");
+  if (this->variant_ == VARIANT_2) {
+    // Nothing to resolve: variant 2 has one fixed request and no item parser.
+    if (!this->entries_.empty()) {
+      ESP_LOGW(TAG, "variant 2 cannot decode a reply yet - %zu configured entity(ies) will stay unavailable",
+               this->entries_.size());
+    }
+  } else {
+    // The diagnostic entity reports on a poll cycle, so it needs one to happen. With
+    // no value entities configured nothing would ever be polled and it would sit at
+    // its boot state forever, so ask for the status exchange - the shorter of the two.
+    // Variant 2 needs no such nudge: its single request is queued unconditionally.
+    if (this->last_read_ok_bs_ != nullptr && !this->need_data_ && !this->need_status_) {
+      this->need_status_ = true;
+      ESP_LOGI(TAG, "Only the last_read_ok entity is configured - polling the status page to exercise the link");
+    }
+
+    this->resolve_data_page_();
+    if (!this->need_data_ && !this->need_status_) {
+      ESP_LOGW(TAG, "No sensors configured - nothing will be polled");
+    }
   }
 
-  this->resolve_data_page_();
-
-  if (!this->need_data_ && !this->need_status_) {
-    ESP_LOGW(TAG, "No sensors configured - nothing will be polled");
-  }
-
-  ESP_LOGI(TAG, "CMT2300A ready at %.3f MHz (meter %s)", this->rf_frequency_hz_ / 1e6f, this->address_.c_str());
+  ESP_LOGI(TAG, "CMT2300A ready at %.3f MHz (variant %u, channel %u, meter %s)", this->rf_frequency_hz_ / 1e6f,
+           this->variant_, this->channel_, this->address_.c_str());
   this->set_state_(State::IDLE);
 }
 
@@ -113,16 +139,31 @@ void NartisRf2MeterComponent::maybe_escalate_data_page_() {
 void NartisRf2MeterComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Nartis RF-2 meter:");
   ESP_LOGCONFIG(TAG, "  Meter address: %s", this->address_.c_str());
-  ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s", this->rf_frequency_hz_ / 1e6f,
-                (this->frequency_override_ != 0) ? " (override)" : " (derived from address)");
+  ESP_LOGCONFIG(TAG, "  Variant: %u%s", this->variant_,
+                (this->variant_ == VARIANT_2) ? " (2026-08 display: 645-2007 request, FREQ_CHNL tuning)"
+                                              : " (D101-2 display)");
+  // The channel index is only meaningful where it is what actually tunes the
+  // radio; variant 1 can sit on an off-grid override, where printing a nearest
+  // channel would just be misleading.
+  if (this->variant_ == VARIANT_2) {
+    ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s (channel %u)", this->rf_frequency_hz_ / 1e6f,
+                  (this->frequency_override_ != 0) ? " (override)" : " (derived from address)", this->channel_);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s", this->rf_frequency_hz_ / 1e6f,
+                  (this->frequency_override_ != 0) ? " (override)" : " (derived from address)");
+  }
   ESP_LOGCONFIG(TAG, "  RX centre offset: %d codes (~%.1f kHz)", this->rx_center_offset_,
                 this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
   ESP_LOGCONFIG(TAG, "  RX timeout: %" PRIu32 " ms, retries: %u, request gap: %" PRIu32 " ms", this->rf_rx_timeout_ms_,
                 this->rf_retries_, this->request_gap_ms_);
-  ESP_LOGCONFIG(TAG, "  Data page: DI 0x%04X%s", this->data_page_,
-                (this->data_page_ == DI_PARAMS) ? " (energy + instantaneous)" : " (energy + clock)");
-  ESP_LOGCONFIG(TAG, "  Instantaneous values: %s", YESNO(this->data_page_ == DI_PARAMS));
-  ESP_LOGCONFIG(TAG, "  Polling: data %s, status %s", YESNO(this->need_data_), YESNO(this->need_status_));
+  if (this->variant_ == VARIANT_2) {
+    ESP_LOGCONFIG(TAG, "  Polling: the single variant-2 request (transmit and log only)");
+  } else {
+    ESP_LOGCONFIG(TAG, "  Data page: DI 0x%04X%s", this->data_page_,
+                  (this->data_page_ == DI_PARAMS) ? " (energy + instantaneous)" : " (energy + clock)");
+    ESP_LOGCONFIG(TAG, "  Instantaneous values: %s", YESNO(this->data_page_ == DI_PARAMS));
+    ESP_LOGCONFIG(TAG, "  Polling: data %s, status %s", YESNO(this->need_data_), YESNO(this->need_status_));
+  }
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
   LOG_PIN("  SDIO pin: ", this->pin_sdio_);
   LOG_PIN("  SCLK pin: ", this->pin_sclk_);
@@ -134,12 +175,18 @@ void NartisRf2MeterComponent::dump_config() {
   // Print the frames we will actually put on the air, so they can be compared
   // against a capture without having to catch a VERBOSE log line.
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> frame{};
-  for (const uint16_t di : {this->data_page_, DI_STATUS}) {
-    const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, di);
-    if (n == 0) {
-      ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: FAILED TO BUILD", di);
-    } else {
-      ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: %s", di, format_hex_pretty(frame.data(), n).c_str());
+  if (this->variant_ == VARIANT_2) {
+    const size_t n = build_v2_request(frame.data(), frame.size(), this->serial_le_);
+    ESP_LOGCONFIG(TAG, "  Variant-2 request: %s",
+                  (n == 0) ? "FAILED TO BUILD" : format_hex_pretty(frame.data(), n).c_str());
+  } else {
+    for (const uint16_t di : {this->data_page_, DI_STATUS}) {
+      const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, di);
+      if (n == 0) {
+        ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: FAILED TO BUILD", di);
+      } else {
+        ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: %s", di, format_hex_pretty(frame.data(), n).c_str());
+      }
     }
   }
 
@@ -234,11 +281,19 @@ void NartisRf2MeterComponent::start_cycle_() {
   // consumes is not worth waking the radio for.
   this->step_count_ = 0;
   this->step_idx_ = 0;
-  if (this->need_data_) {
-    this->steps_[this->step_count_++] = Step{StepKind::DATA, 0};
-  }
-  if (this->need_status_) {
-    this->steps_[this->step_count_++] = Step{StepKind::STATUS, 0};
+  if (this->variant_ == VARIANT_2) {
+    // One request, always sent: there are no entities to gate it on. The
+    // variant-1 polls are deliberately not queued - they are 645-1997 frames and
+    // this meter generation has not been seen answering them. Probes still run,
+    // so a hand-built read can be tried alongside.
+    this->steps_[this->step_count_++] = Step{StepKind::V2, 0};
+  } else {
+    if (this->need_data_) {
+      this->steps_[this->step_count_++] = Step{StepKind::DATA, 0};
+    }
+    if (this->need_status_) {
+      this->steps_[this->step_count_++] = Step{StepKind::STATUS, 0};
+    }
   }
   for (uint8_t i = 0; i < this->probe_count_; i++) {
     this->steps_[this->step_count_++] = Step{StepKind::PROBE, i};
@@ -258,6 +313,8 @@ uint16_t NartisRf2MeterComponent::current_di_() const {
       return DI_STATUS;
     case StepKind::PROBE:
       return this->probes_[step.probe_idx].di;
+    case StepKind::V2:
+      return V2_REQUEST_DI;
     default:
       return 0;
   }
@@ -306,7 +363,9 @@ bool NartisRf2MeterComponent::send_request_() {
   const uint16_t di = this->current_di_();
   this->attempt_++;
 
-  if (step.kind == StepKind::PROBE) {
+  if (step.kind == StepKind::V2) {
+    this->tx_len_ = build_v2_request(this->tx_buf_.data(), this->tx_buf_.size(), this->serial_le_);
+  } else if (step.kind == StepKind::PROBE) {
     const ProbeRequest &probe = this->probes_[step.probe_idx];
     this->tx_len_ = build_read_request(this->tx_buf_.data(), this->tx_buf_.size(), this->serial_le_, probe.di,
                                        probe.body, probe.body_len);
@@ -320,8 +379,15 @@ bool NartisRf2MeterComponent::send_request_() {
 
   // Logged at DEBUG alongside the RX dump, so a log excerpt always shows the
   // complete exchange - what we asked and what came back.
-  ESP_LOGD(TAG, "TX DI 0x%04X%s attempt %u: %s", di, (step.kind == StepKind::PROBE) ? " (probe)" : "", this->attempt_,
-           format_hex_pretty(this->tx_buf_.data(), this->tx_len_).c_str());
+  // Variant 2 is a bring-up path: show the frame at INFO so a plain log is enough
+  // to confirm what went on the air without turning DEBUG on.
+  if (step.kind == StepKind::V2) {
+    ESP_LOGI(TAG, "TX variant-2 request attempt %u: %s", this->attempt_,
+             format_hex_pretty(this->tx_buf_.data(), this->tx_len_).c_str());
+  } else {
+    ESP_LOGD(TAG, "TX DI 0x%04X%s attempt %u: %s", di, (step.kind == StepKind::PROBE) ? " (probe)" : "",
+             this->attempt_, format_hex_pretty(this->tx_buf_.data(), this->tx_len_).c_str());
+  }
 
   // transmit() is synchronous: it applies the TX profile, pads and bit-reverses,
   // fills the FIFO and blocks until TX_DONE. At 1.2 kbps a 28-byte frame is tens
@@ -378,6 +444,15 @@ void NartisRf2MeterComponent::handle_wait_() {
   if (this->poll_rx_() == RxPoll::COMPLETE) {
     // Read RSSI while still in RX - go_standby() would invalidate it.
     this->last_rssi_dbm_ = this->hal_.get_rssi_dbm();
+
+    if (step.kind == StepKind::V2) {
+      // Anything at all is a result here, so take it and stop: retrying would
+      // only overwrite the one capture we care about.
+      ESP_LOGI(TAG, "RX variant-2 reply, rssi=%d dBm, %zu byte(s)", this->last_rssi_dbm_, this->rx_len_);
+      this->log_v2_reply_();
+      this->finish_exchange_();
+      return;
+    }
 
     // Always show what came off the air, whether or not it decodes. This is the
     // primary record for working out an unfamiliar meter's indication set, so it
@@ -585,6 +660,55 @@ void NartisRf2MeterComponent::log_response_(uint16_t di, const ParsedResponse &r
     describe_item_(di, resp.items[i], line, sizeof(line), this->tag_width_);
     ESP_LOGD(TAG, "  %s", line);
   }
+}
+
+// The variant-2 response format is unknown - no reply to this request has ever
+// been captured, on the SPI bus of the real display or on air. So this reports
+// rather than decodes: the raw capture always, plus the DL/T 645 header fields
+// if the bytes happen to carry a length- and CRC-consistent envelope of the same
+// shape variant 1 uses. Payload bytes are shown with the +0x33 transmission
+// offset removed as well as raw, because that is the first thing you want to see
+// when working out what came back.
+void NartisRf2MeterComponent::log_v2_reply_() const {
+  ESP_LOGI(TAG, "  raw: %s", format_hex_pretty(this->rx_buf_.data(), this->rx_len_).c_str());
+
+  // Same carve as parse_response(): the chip strips 98 F3, so LEN should be at
+  // offset 0, but a mis-locked sync can shift it by a byte or three.
+  for (size_t off = 0; off < 4 && off < this->rx_len_; off++) {
+    const uint8_t *p = this->rx_buf_.data() + off;
+    const size_t avail = this->rx_len_ - off;
+    const size_t env_len = p[0];
+    const size_t total = 1 + env_len + 2;  // LEN + content + CRC
+    if (env_len < D101_HDR_AFTER_LEN + DLT645_OVERHEAD || total > avail) {
+      continue;
+    }
+    if (crc16_x25(p, env_len + 1) != static_cast<uint16_t>(p[env_len + 1] | (p[env_len + 2] << 8))) {
+      continue;
+    }
+
+    const uint8_t *f645 = p + 1 + D101_HDR_AFTER_LEN;
+    const size_t f645_len = env_len - D101_HDR_AFTER_LEN;
+    ESP_LOGI(TAG, "  envelope at offset %zu: LEN %zu, CRC OK", off, env_len);
+    if (f645[0] != DLT645_DELIM || f645[1 + SERIAL_BCD_SIZE] != DLT645_DELIM || f645[f645_len - 1] != DLT645_END) {
+      ESP_LOGI(TAG, "  but the DL/T 645 delimiters do not match - not a 645 frame");
+      return;
+    }
+    const uint8_t control = f645[8];
+    const uint8_t data_len = f645[9];
+    ESP_LOGI(TAG, "  address %s, control 0x%02X, data length %u",
+             format_hex_pretty(f645 + 1, SERIAL_BCD_SIZE).c_str(), control, data_len);
+    if (data_len > 0 && static_cast<size_t>(DLT645_OVERHEAD - 2 + data_len) <= f645_len) {
+      uint8_t plain[MAX_PAYLOAD];
+      const size_t n = (data_len > MAX_PAYLOAD) ? MAX_PAYLOAD : data_len;
+      for (size_t i = 0; i < n; i++) {
+        plain[i] = static_cast<uint8_t>(f645[10 + i] - DLT645_DATA_OFFSET);
+      }
+      ESP_LOGI(TAG, "  data raw:  %s", format_hex_pretty(f645 + 10, n).c_str());
+      ESP_LOGI(TAG, "  data -33h: %s", format_hex_pretty(plain, n).c_str());
+    }
+    return;
+  }
+  ESP_LOGI(TAG, "  no length- and CRC-consistent envelope found in the capture");
 }
 
 void NartisRf2MeterComponent::log_unknown_tag_(uint16_t di, const ParsedResponse &resp) const {

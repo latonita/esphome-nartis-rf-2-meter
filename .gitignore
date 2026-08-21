@@ -33,6 +33,7 @@ tools/frame_check/frame_check
 *.local.txt
 
 tools/frame_check/f202_check
+tools/frame_check/*.exe
 
 # Semgrep plugin scratch output
 .semgrep/

@@ -21,6 +21,21 @@
 
 namespace esphome::nartis_rf_2_meter {
 
+/// How the radio is tuned onto the 24-channel grid.
+///
+///   COMPUTED_BANK      - variant 1: compute the absolute 8-byte frequency bank
+///                        for this channel with AN199 and write it. Proven on air.
+///   BASE_PLUS_CHANNEL  - variant 2: write the fixed k=0 bank plus FREQ_OFS, then
+///                        select the channel with FREQ_CHNL, exactly as the newer
+///                        display does on its SPI bus. The bank is never rewritten.
+///
+/// Both land on the same nominal frequency; they differ in which registers carry
+/// it, which matters only if the meter's own tuning follows the display's.
+enum class FreqMode : uint8_t {
+  COMPUTED_BANK,
+  BASE_PLUS_CHANNEL,
+};
+
 class Cmt2300aHal {
  public:
   Cmt2300aHal() = default;
@@ -35,6 +50,23 @@ class Cmt2300aHal {
   /// via the AN199 formula. Call before init() (init() writes the computed bank).
   /// Defaults to 443.9 MHz if never called.
   void set_frequency(uint32_t freq_hz);
+
+  /// Choose how the channel is programmed. Must be called before init(), and
+  /// before set_channel() / set_frequency(). Defaults to COMPUTED_BANK.
+  void set_frequency_mode(FreqMode mode);
+
+  /// Select grid channel k for BASE_PLUS_CHANNEL mode (writes FREQ_CHNL = 2*k).
+  /// A no-op on the air in COMPUTED_BANK mode, where the channel is baked into
+  /// the bank by set_frequency() instead. Safe to call after init().
+  ///
+  /// This sets the register only; set_frequency() still supplies the nominal Hz
+  /// used for logging, so callers using this mode should call both.
+  void set_channel(uint8_t channel);
+
+  /// Nominal RF frequency currently programmed, for logging.
+  uint32_t frequency_hz() const { return this->rf_freq_hz_; }
+  FreqMode frequency_mode() const { return this->freq_mode_; }
+  uint8_t channel() const { return this->channel_; }
 
   /// Base init: soft reset, write the 6 register banks (computed frequency +
   /// narrow-TX resting profile) and the common post-config patches. Returns true
@@ -98,7 +130,8 @@ class Cmt2300aHal {
   void init_tx();               // narrow TX profile, sync blended to 0x55, FIFO -> TX
   void init_rx(int off_codes);  // wide RX profile, sync 19 CF, chip bit-order, FIFO -> RX
   void set_rx_center(int off_codes);  // shift the RX-half LO by off_codes (TX-half untouched)
-  void compute_freq_bank_();          // fill freq_bank_ from rf_freq_hz_ (AN199)
+  void compute_freq_bank_();          // fill freq_bank_ from rf_freq_hz_ (AN199) or the base bank
+  void write_channel_regs_();         // BASE_PLUS_CHANNEL: FREQ_OFS + FREQ_CHNL
 
   esphome::InternalGPIOPin *sdio_pin_{nullptr};
   esphome::InternalGPIOPin *sclk_pin_{nullptr};
@@ -115,6 +148,8 @@ class Cmt2300aHal {
 
   // Per-channel frequency: rf_freq_hz_ -> freq_bank_ (8 bytes: [RX-LO 4B][TX-LO 4B]).
   uint32_t rf_freq_hz_{443900000};
+  FreqMode freq_mode_{FreqMode::COMPUTED_BANK};
+  uint8_t channel_{12};  // k for 443.9 MHz, matching the rf_freq_hz_ default
   uint8_t freq_bank_[FREQUENCY_BANK_SIZE]{};
 };
 

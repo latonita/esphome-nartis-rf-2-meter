@@ -48,6 +48,8 @@ static constexpr uint8_t REG_PKT29 = 0x54;  // FIFO threshold
 
 static constexpr uint8_t REG_MODE_CTL = 0x60;
 static constexpr uint8_t REG_MODE_STA = 0x61;
+static constexpr uint8_t REG_FREQ_CHNL = 0x63;  // channel index (fast frequency hopping)
+static constexpr uint8_t REG_FREQ_OFS = 0x64;   // channel spacing for REG_FREQ_CHNL
 static constexpr uint8_t REG_IO_SEL = 0x65;
 static constexpr uint8_t REG_INT2_CTL = 0x67;
 static constexpr uint8_t REG_INT_EN = 0x68;
@@ -192,6 +194,31 @@ static constexpr uint8_t TX_BANK[11] = {  // +20 dBm (4 kHz dev ramp)
 static constexpr uint8_t FREQ_443M9[8] = {
     0x44, 0x60, 0x5F, 0x15,  0x44, 0x4A, 0xAD, 0x14
 };
+
+/* ----------------------------------------------------------------
+ * Variant-2 frequency method: fixed base bank + FREQ_CHNL hop.
+ *
+ * The newer display never computes a per-channel bank. In all six SPI dumps of
+ * it the frequency bank is written once with the k=0 value below, FREQ_OFS is
+ * set to 0x8C, and the channel is then selected with FREQ_CHNL = 2*k - k=12
+ * gives 0x18 (meter ...271060, 443.9 MHz confirmed on air) and k=13 gives 0x1A
+ * (meter ...209637, 444.6 MHz). The bank is never rewritten, not even between
+ * TX and RX.
+ *
+ * Decoding the base bank with AN199 gives exactly 435.500000 MHz on BOTH halves,
+ * so FREQ_CHNL shifts RX and TX together and the grid comes out as
+ * 435.5 + 2k * 350 kHz = 435.5 + k * 0.7 MHz.
+ *
+ * The 350 kHz per FREQ_CHNL unit is inferred: it is the only step consistent
+ * with the two observed (k, FREQ_CHNL) pairs and the confirmed 443.9 MHz, but
+ * the datasheet text we have does not document FREQ_CHNL/FREQ_OFS, so treat the
+ * grid edges (k=0, k=23) as unverified until one is checked on an SDR.
+ * ---------------------------------------------------------------- */
+static constexpr uint8_t FREQ_BASE_BANK[8] = {  // 435.500 MHz, RX half == TX half
+    0x43, 0x16, 0xB2, 0x10,  0x43, 0x00, 0x00, 0x10
+};
+static constexpr uint8_t FREQ_OFS_VALUE = 0x8C;      // 350 kHz per FREQ_CHNL unit
+static constexpr uint8_t FREQ_CHNL_PER_CHANNEL = 2;  // FREQ_CHNL = 2 * k
 // clang-format on
 
 }  // namespace esphome::nartis_rf_2_meter

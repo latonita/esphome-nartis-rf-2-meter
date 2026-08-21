@@ -55,6 +55,17 @@ namespace esphome::nartis_rf_2_meter {
 /// `data_page` value meaning "work it out from the configured entities".
 static constexpr uint16_t DATA_PAGE_AUTO = 0;
 
+/// Which display generation to emulate.
+///
+///   1 - the original Д101-2: two constant DL/T 645-1997 read requests, an
+///       AN199-computed frequency bank. Fully decoded, drives entities.
+///   2 - the newer display seen in the 2026-08 SPI capture: one DL/T 645-2007
+///       request (control 0x11) and the base-bank + FREQ_CHNL tuning method.
+///       Transmit-and-log only - no reply has ever been captured, so there is
+///       nothing to parse against and no entity is driven.
+static constexpr uint8_t VARIANT_D101_2 = 1;
+static constexpr uint8_t VARIANT_2 = 2;
+
 /// Which field of the DI 0xF201 status block an entity reads.
 /// NONE => the entity reads a DI 0xF200 item selected by its TAG instead.
 enum class StatusField : uint8_t {
@@ -94,6 +105,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Override the channel frequency instead of deriving it from the serial.
   /// 0 = derive (the normal case).
   void set_frequency_override(uint32_t hz) { this->frequency_override_ = hz; }
+  /// Display generation to emulate - VARIANT_D101_2 or VARIANT_2.
+  void set_variant(uint8_t v) { this->variant_ = v; }
 
   /// Diagnostic entity: true when the last poll cycle got everything it asked for.
   /// Optional - nullptr when the YAML declares no binary sensor.
@@ -180,6 +193,11 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// WARN breakdown of a response stopped by an unrecognised TAG - everything
   /// needed to work out the missing width by hand.
   void log_unknown_tag_(uint16_t di, const ParsedResponse &resp) const;
+  /// Variant 2: dump whatever came back. The reply format is unknown, so this
+  /// only carves out a length- and CRC-consistent envelope if one is there and
+  /// prints its DL/T 645 fields; otherwise it prints the raw capture. It never
+  /// interprets the payload and never drives an entity.
+  void log_v2_reply_() const;
 
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);
@@ -202,6 +220,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint8_t serial_le_[SERIAL_BCD_SIZE]{};
   uint32_t frequency_override_{0};
   uint32_t rf_frequency_hz_{0};
+  uint8_t variant_{VARIANT_D101_2};
+  uint8_t channel_{0};
   uint16_t data_page_{DATA_PAGE_AUTO};
   /// True when data_page_ was chosen by resolve_data_page_() rather than set in
   /// YAML. An explicit choice is never second-guessed.
@@ -238,12 +258,12 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// One poll cycle is a list of exchanges: the energy poll, the status poll, then
   /// each probe. Built at the start of every cycle so the state machine is just
   /// "transmit step, await reply, advance" regardless of how many there are.
-  enum class StepKind : uint8_t { DATA, STATUS, PROBE };
+  enum class StepKind : uint8_t { DATA, STATUS, PROBE, V2 };
   struct Step {
     StepKind kind{StepKind::DATA};
     uint8_t probe_idx{0};
   };
-  std::array<Step, 2 + MAX_PROBES> steps_{};
+  std::array<Step, 3 + MAX_PROBES> steps_{};
   uint8_t step_count_{0};
   uint8_t step_idx_{0};
 

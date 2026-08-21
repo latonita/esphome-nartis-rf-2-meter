@@ -230,7 +230,7 @@ void serial_to_bcd_le(const char *digits12, uint8_t out[SERIAL_BCD_SIZE]) {
   }
 }
 
-uint32_t frequency_from_serial(const char *digits12) {
+uint8_t channel_from_serial(const char *digits12) {
   uint32_t n3 = 0;
   if (digits12 != nullptr) {
     const size_t len = std::strlen(digits12);
@@ -242,25 +242,52 @@ uint32_t frequency_from_serial(const char *digits12) {
       }
     }
   }
-  const uint32_t k = n3 % 24;
+  return static_cast<uint8_t>(n3 % CHANNEL_COUNT);
+}
+
+uint8_t channel_from_frequency(uint32_t freq_hz) {
+  if (freq_hz <= CHANNEL_BASE_HZ) {
+    return 0;
+  }
+  // Round to the nearest grid point rather than truncating, so a frequency given
+  // as e.g. 444.6 MHz lands on its own channel and not the one below it.
+  const uint32_t k = (freq_hz - CHANNEL_BASE_HZ + CHANNEL_STEP_HZ / 2) / CHANNEL_STEP_HZ;
+  return static_cast<uint8_t>((k >= CHANNEL_COUNT) ? (CHANNEL_COUNT - 1) : k);
+}
+
+uint32_t channel_frequency(uint8_t channel) {
+  const uint8_t k = (channel >= CHANNEL_COUNT) ? static_cast<uint8_t>(CHANNEL_COUNT - 1) : channel;
+  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ;
+}
+
+uint32_t frequency_from_serial(const char *digits12) {
   // Uniform 0.7 MHz step across the whole grid. There used to be a +100 kHz
   // special case for k > 18; SPI captures of a real display disprove it. Three
   // adjacent serials with the same frequency bank step FREQ_CHNL by exactly +8
   // per k (k=17 -> 0x00, k=18 -> 0x08, k=19 -> 0x10) with FREQ_OFS constant, and
   // a uniform channel step means a uniform frequency step. An extra 100 kHz at
   // k=19 would have needed FREQ_CHNL ~17, not 16.
-  return 435500000u + k * 700000u;
+  return channel_frequency(channel_from_serial(digits12));
 }
 
 const uint8_t ENERGY_REQUEST_BODY[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
 const uint8_t STATUS_REQUEST_BODY[1] = {0x00};
+// Variant 2: DI 0x0020 + this body = DATA 20 00 20 0E, which the +0x33 offset
+// puts on air as 53 33 53 41 - byte-for-byte the captured request.
+const uint8_t V2_REQUEST_BODY[V2_REQUEST_BODY_SIZE] = {0x20, 0x0E};
 
 size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di,
-                          const uint8_t *body, size_t body_len) {
+                          const uint8_t *body, size_t body_len, uint8_t control) {
   if (out == nullptr || serial_le == nullptr || body_len > MAX_REQUEST_BODY) {
     return 0;
   }
   if (body == nullptr && body_len != 0) {
+    return 0;
+  }
+  // The read codes are the only control codes this builder will ever emit. This
+  // is what keeps the component read-only by construction, so it is enforced
+  // here rather than trusted to the callers.
+  if (control != DLT645_C_READ_REQ && control != DLT645_C_READ_REQ_2007) {
     return 0;
   }
 
@@ -293,8 +320,8 @@ size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERI
   std::memcpy(out + p, serial_le, SERIAL_BCD_SIZE);
   p += SERIAL_BCD_SIZE;
   out[p++] = DLT645_DELIM;
-  // Hard-wired: this builder emits reads and nothing else.
-  out[p++] = DLT645_C_READ_REQ;
+  // Checked above: this builder emits reads and nothing else.
+  out[p++] = control;
   out[p++] = static_cast<uint8_t>(data_len);
   for (size_t i = 0; i < data_len; i++) {
     out[p++] = static_cast<uint8_t>(data[i] + DLT645_DATA_OFFSET);
@@ -328,6 +355,11 @@ size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BC
     return build_read_request(out, cap, serial_le, di, STATUS_REQUEST_BODY, sizeof(STATUS_REQUEST_BODY));
   }
   return 0;
+}
+
+size_t build_v2_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE]) {
+  return build_read_request(out, cap, serial_le, V2_REQUEST_DI, V2_REQUEST_BODY, V2_REQUEST_BODY_SIZE,
+                            DLT645_C_READ_REQ_2007);
 }
 
 /// Smallest LEN that could hold a 645 frame with an empty DATA field.

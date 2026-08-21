@@ -211,3 +211,29 @@ text_sensor:
 binary_sensor:
   - platform: nartis_rf_2_meter
     name: "Last read OK"                 # Последний опрос успешен
+
+# ---------------------------------------------------------------------------
+# Variant 2 - the newer display (bring-up / diagnostic)
+# ---------------------------------------------------------------------------
+# Sends the single DL/T 645-2007 request captured off a real display's SPI bus
+# and logs whatever comes back. No reply to it has ever been captured, so this
+# drives no sensors - watch the log.
+#
+# Meter 023250209637: 637 % 24 = channel 13 = 444.6 MHz. That is what the serial
+# derives on its own, so `frequency:` below is redundant and only there to make
+# the channel explicit; drop it and nothing changes.
+#
+#   nartis_rf_2_meter:
+#     - id: nartis_v2
+#       variant: 2
+#       address: "023250209637"
+#       frequency: 444.6MHz
+#       update_interval: 60s
+#       pin_sdio: GPIO23
+#       pin_sclk: GPIO18
+#       pin_csb: GPIO5
+#       pin_fcsb: GPIO17
+#       pin_gpio3: GPIO16
+#
+#   logger:
+#     level: INFO      # the variant-2 TX frame and RX dump are both at INFO

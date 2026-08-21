@@ -46,6 +46,11 @@ static constexpr uint8_t DLT645_DELIM = 0x68;
 static constexpr uint8_t DLT645_END = 0x16;
 static constexpr uint8_t DLT645_C_READ_REQ = 0x01;  // display -> meter
 static constexpr uint8_t DLT645_C_READ_RSP = 0x81;  // meter -> display
+/// DL/T 645-2007 read-data control code. Variant 2 uses this where variant 1
+/// uses the 1997 0x01; both are reads, and build_read_request() accepts no other
+/// control code than these two.
+static constexpr uint8_t DLT645_C_READ_REQ_2007 = 0x11;
+static constexpr uint8_t DLT645_C_READ_RSP_2007 = 0x91;  // meter -> display
 /// Every DATA byte carries this transmission offset so payload bytes cannot
 /// imitate the 0x68 / 0x16 delimiters.
 static constexpr uint8_t DLT645_DATA_OFFSET = 0x33;
@@ -71,6 +76,32 @@ extern const uint8_t ENERGY_REQUEST_BODY[6];
 extern const uint8_t STATUS_REQUEST_BODY[1];
 /// Longest request body a probe may carry.
 static constexpr size_t MAX_REQUEST_BODY = 8;
+
+/* ================================================================
+ * Variant 2
+ * ================================================================
+ * A second request shape, taken from an SPI capture of a newer display polling
+ * meter 023250209637. The frame it puts on the air is
+ *
+ *   98 f3 13 00 01 12 68 37 96 20 50 32 02 68 11 04 53 33 53 41 70 16 1e ea
+ *
+ * Same radio envelope and same DL/T 645 shell as variant 1 - only the control
+ * code, the length and the DATA bytes differ. The four DATA bytes 53 33 53 41
+ * are 20 00 20 0E once the +0x33 transmission offset is removed, which this
+ * builder emits as DI 0x0020 followed by a 2-byte body 20 0E.
+ *
+ * Whether the meter reads that as a 645-1997 2-byte DI plus body, or as the
+ * 4-byte DI 0x0E200020 that control code 0x11 (645-2007) would imply, is not
+ * established. The bytes on air are identical either way, so the split below is
+ * a construction convenience and nothing should be inferred from it.
+ *
+ * No reply to this request has ever been captured - not on the SPI bus of the
+ * real display and not on air - so the response format is entirely unknown.
+ * Variant 2 therefore only transmits and logs whatever comes back.
+ */
+static constexpr uint16_t V2_REQUEST_DI = 0x0020;
+static constexpr size_t V2_REQUEST_BODY_SIZE = 2;
+extern const uint8_t V2_REQUEST_BODY[V2_REQUEST_BODY_SIZE];
 
 /// Widest item value we can hold (the 9-byte status blob).
 static constexpr size_t MAX_ITEM_WIDTH = 9;
@@ -227,8 +258,29 @@ uint16_t crc16_x25(const uint8_t *data, size_t len);
 /// Writes zeroes if `digits12` is not 12 digits long.
 void serial_to_bcd_le(const char *digits12, uint8_t out[SERIAL_BCD_SIZE]);
 
+/* ---------------- channel grid ----------------
+ * Both variants use the same 24-channel grid; they differ only in how the radio
+ * is tuned onto it (variant 1 computes an absolute frequency bank, variant 2
+ * writes a fixed k=0 bank and hops with FREQ_CHNL - see the HAL).
+ */
+static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
+static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
+static constexpr uint8_t CHANNEL_COUNT = 24;
+
+/// Channel index from the last three digits of the meter serial: k = last3 % 24.
+/// e.g. "...060" -> 60 % 24 = 12;  "...637" -> 637 % 24 = 13.
+uint8_t channel_from_serial(const char *digits12);
+
+/// Nearest channel index to an explicit frequency, clamped to the grid. Lets a
+/// YAML `frequency:` override drive the variant-2 channel hop, which has no way
+/// to express an off-grid frequency.
+uint8_t channel_from_frequency(uint32_t freq_hz);
+
+/// Channel centre frequency in Hz.
+uint32_t channel_frequency(uint8_t channel);
+
 /// Channel frequency (Hz) from the last three digits of the meter serial:
-///   k = last3 % 24;  f = 435.5 MHz + k*0.7 MHz, +100 kHz when k > 18.
+///   k = last3 % 24;  f = 435.5 MHz + k*0.7 MHz.
 /// e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz.
 uint32_t frequency_from_serial(const char *digits12);
 
@@ -254,8 +306,16 @@ size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BC
 /// known. The control code is always DLT645_C_READ_REQ; there is deliberately no
 /// way to build anything but a read, because this link also carries a
 /// relay-close command and a write must never be constructible here.
+/// `control` selects the read code: DLT645_C_READ_REQ (1997, variant 1) or
+/// DLT645_C_READ_REQ_2007 (variant 2). Any other value returns 0 - the two read
+/// codes are the only control codes this builder will emit, so no caller can
+/// turn it into a write.
 size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di,
-                          const uint8_t *body, size_t body_len);
+                          const uint8_t *body, size_t body_len, uint8_t control = DLT645_C_READ_REQ);
+
+/// Build the variant-2 request for `serial_le` - the captured frame above, with
+/// the address, checksum and CRC recomputed for this meter.
+size_t build_v2_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE]);
 
 /// Carve, verify and decode one response.
 ///

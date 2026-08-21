@@ -185,6 +185,9 @@ bool Cmt2300aHal::init() {
   this->write_bank(BASEBAND_BANK_ADDR, BASEBAND_BANK, BASEBAND_BANK_SIZE);
   this->write_bank(TX_BANK_ADDR, TX_BANK, TX_BANK_SIZE);
   this->update_reg(REG_CMT10, 0x07, 0x02);
+  // Variant 2 leaves the bank at k=0 and hops with FREQ_CHNL, so the channel
+  // registers have to go in after the bank write (which does not touch them).
+  this->write_channel_regs_();
 
   // Common post-config patches:
   this->update_reg(REG_SYS2, 0xE0, 0x00);                                 // select TX-half of the freq bank
@@ -196,13 +199,27 @@ bool Cmt2300aHal::init() {
   this->update_reg(REG_INT2_CTL, MASK_INT_POLAR, 0x00);                   // INT2 active-high
 
   this->initialized_ = true;
-  ESP_LOGI(TAG, "CMT2300A initialized (%.3f MHz)", this->rf_freq_hz_ / 1e6f);
+  if (this->freq_mode_ == FreqMode::BASE_PLUS_CHANNEL) {
+    ESP_LOGI(TAG, "CMT2300A initialized (%.3f MHz: base bank + FREQ_CHNL 0x%02X, FREQ_OFS 0x%02X)",
+             this->rf_freq_hz_ / 1e6f, (unsigned) (this->channel_ * FREQ_CHNL_PER_CHANNEL), FREQ_OFS_VALUE);
+  } else {
+    ESP_LOGI(TAG, "CMT2300A initialized (%.3f MHz: computed bank)", this->rf_freq_hz_ / 1e6f);
+  }
   return true;
 }
 
 // Compute the 8-byte frequency bank for rf_freq_hz_ per CMOSTEK AN199 (see
 // cmt2300a_defs.h). TX LO = f_rf; RX LO = f_rf + IF. Matches RFPDK byte-for-byte.
 void Cmt2300aHal::compute_freq_bank_() {
+  if (this->freq_mode_ == FreqMode::BASE_PLUS_CHANNEL) {
+    // The bank is a constant here - the channel lives in FREQ_CHNL instead.
+    // Copying it into freq_bank_ still matters: set_rx_center() nudges the RX
+    // half relative to whatever is in this buffer.
+    for (size_t i = 0; i < FREQUENCY_BANK_SIZE; i++) {
+      this->freq_bank_[i] = FREQ_BASE_BANK[i];
+    }
+    return;
+  }
   auto word = [](uint32_t lo_hz) -> uint32_t {
     // word = floor(FREQ_LO * DIVIDER / XTAL * 2^20); N = word>>20, K = low 20 bits.
     return (uint32_t) ((((uint64_t) lo_hz * FREQ_DIVIDER) << 20) / XTAL_HZ);
@@ -226,6 +243,38 @@ void Cmt2300aHal::compute_freq_bank_() {
 void Cmt2300aHal::set_frequency(uint32_t freq_hz) {
   this->rf_freq_hz_ = freq_hz;
   this->compute_freq_bank_();
+}
+
+void Cmt2300aHal::set_frequency_mode(FreqMode mode) {
+  this->freq_mode_ = mode;
+  this->compute_freq_bank_();
+}
+
+void Cmt2300aHal::set_channel(uint8_t channel) {
+  // FREQ_CHNL is one byte and holds FREQ_CHNL_PER_CHANNEL * k, so that product is
+  // the only bound the radio itself imposes. Which channels actually exist is the
+  // protocol layer's business (channel_from_serial), and it clamps to the grid.
+  const uint8_t max_channel = (uint8_t) (0xFF / FREQ_CHNL_PER_CHANNEL);
+  if (channel > max_channel) {
+    ESP_LOGW(TAG, "channel %u exceeds FREQ_CHNL range - clamped to %u", channel, max_channel);
+    channel = max_channel;
+  }
+  this->channel_ = channel;
+  if (this->initialized_) {
+    this->write_channel_regs_();  // no-op unless BASE_PLUS_CHANNEL
+  }
+}
+
+// FREQ_OFS sets the spacing of one FREQ_CHNL step and FREQ_CHNL picks the
+// channel; together with the fixed k=0 bank that is the whole tuning mechanism
+// of the newer display. Only written in BASE_PLUS_CHANNEL mode - leaving these
+// registers at their reset value is what keeps variant 1 byte-identical.
+void Cmt2300aHal::write_channel_regs_() {
+  if (this->freq_mode_ != FreqMode::BASE_PLUS_CHANNEL) {
+    return;
+  }
+  this->spi_write_reg(REG_FREQ_OFS, FREQ_OFS_VALUE);
+  this->spi_write_reg(REG_FREQ_CHNL, (uint8_t) (this->channel_ * FREQ_CHNL_PER_CHANNEL));
 }
 
 bool Cmt2300aHal::is_chip_connected() {

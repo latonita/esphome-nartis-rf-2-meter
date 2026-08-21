@@ -147,6 +147,49 @@ int main() {
   }
   check(true, "page selection: energy and clock on either page, instantaneous only on 0xF202");
 
+  // ---------------------------------------------------------------------
+  // Variant 2
+  // ---------------------------------------------------------------------
+  // The frame below is the FIFO content of a real display's variant-2 request,
+  // recovered from an SPI capture (channels CSB / FCSB / SDIO, 2026-08) while it
+  // polled meter 023250209637, with the chip-generated 98 f3 sync prepended.
+  // Both of its checksums were verified independently against the capture: the
+  // DL/T 645 sum 0x70 and the CRC-16/X.25 EA1E.
+  uint8_t v2_serial[SERIAL_BCD_SIZE];
+  serial_to_bcd_le("023250209637", v2_serial);
+  const uint8_t want_v2_serial[6] = {0x37, 0x96, 0x20, 0x50, 0x32, 0x02};
+  check(std::memcmp(v2_serial, want_v2_serial, 6) == 0, "v2 serial -> 37 96 20 50 32 02");
+
+  check(channel_from_serial("023250209637") == 13, "...637 -> channel 13");
+  check(channel_frequency(13) == 444600000u, "channel 13 = 444.600 MHz");
+  check(channel_from_serial("023240271060") == 12, "...060 -> channel 12");
+  check(channel_from_frequency(444600000u) == 13, "444.6 MHz -> channel 13");
+  check(channel_from_frequency(444500000u) == 13, "an off-grid frequency rounds to the nearest channel");
+  check(channel_from_frequency(400000000u) == 0, "below the grid clamps to channel 0");
+  check(channel_from_frequency(999000000u) == CHANNEL_COUNT - 1, "above the grid clamps to the last channel");
+
+  const uint8_t want_v2[] = {0x98, 0xF3, 0x13, 0x00, 0x01, 0x12, 0x68, 0x37, 0x96, 0x20, 0x50, 0x32,
+                             0x02, 0x68, 0x11, 0x04, 0x53, 0x33, 0x53, 0x41, 0x70, 0x16, 0x1E, 0xEA};
+  uint8_t v2[MAX_REQUEST_FRAME_SIZE];
+  const size_t v2_len = build_v2_request(v2, sizeof(v2), v2_serial);
+  hex("v2 built", v2, v2_len);
+  hex("v2 capture", want_v2, sizeof(want_v2));
+  check(v2_len == sizeof(want_v2) && std::memcmp(v2, want_v2, sizeof(want_v2)) == 0,
+        "variant-2 request matches the SPI capture exactly");
+
+  // The read codes are the only control codes the builder will emit. This is the
+  // guarantee that keeps the component read-only, so assert it rather than trust it.
+  uint8_t reject[MAX_REQUEST_FRAME_SIZE];
+  check(build_read_request(reject, sizeof(reject), v2_serial, V2_REQUEST_DI, V2_REQUEST_BODY,
+                           V2_REQUEST_BODY_SIZE, 0x14) == 0,
+        "a write control code is refused (0x14)");
+  check(build_read_request(reject, sizeof(reject), v2_serial, V2_REQUEST_DI, V2_REQUEST_BODY,
+                           V2_REQUEST_BODY_SIZE, 0x04) == 0,
+        "a non-read control code is refused (0x04)");
+  check(build_read_request(reject, sizeof(reject), serial, DI_ENERGY, ENERGY_REQUEST_BODY,
+                           sizeof(ENERGY_REQUEST_BODY)) != 0,
+        "the default control code is still accepted");
+
   std::printf("\n%s (%d failure(s))\n", failures == 0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", failures);
   return failures == 0 ? 0 : 1;
 }

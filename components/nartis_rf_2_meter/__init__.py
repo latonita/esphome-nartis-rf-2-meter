@@ -30,6 +30,7 @@ CONF_PIN_CSB = "pin_csb"
 CONF_PIN_FCSB = "pin_fcsb"
 CONF_PIN_GPIO3 = "pin_gpio3"
 
+CONF_VARIANT = "variant"
 CONF_REQUEST_GAP = "request_gap"
 CONF_RF_RX_TIMEOUT = "rf_rx_timeout"
 CONF_RF_RETRIES = "rf_retries"
@@ -39,6 +40,27 @@ CONF_DATA_PAGE = "data_page"
 CONF_PROBE = "probe"
 CONF_DI = "di"
 CONF_BODY = "body"
+
+# Which display generation to emulate.
+#
+#   1 (default) - the НАРТИС-Д101-2 display. Two constant DL/T 645-1997 read
+#       requests, an AN199-computed frequency bank. Fully decoded, drives
+#       entities. Unchanged by the addition of variant 2.
+#
+#   2 - the newer display captured on its SPI bus in 2026-08 while polling meter
+#       023250209637. Two things differ, and only two:
+#
+#         * one request instead of two, using the DL/T 645-2007 read code 0x11:
+#             98 f3 13 00 01 12 68 <addr> 68 11 04 53 33 53 41 <cs> 16 <crc>
+#         * the radio is tuned by writing a fixed k=0 frequency bank plus
+#           FREQ_OFS, then hopping with FREQ_CHNL = 2*k - the bank itself is
+#           never rewritten, not even between TX and RX.
+#
+#       No reply to that request has ever been captured, on the display's SPI bus
+#       or on air, so there is nothing to parse against: variant 2 transmits and
+#       logs whatever comes back. It drives no entity. Use it to find out whether
+#       this meter generation answers at all.
+VARIANTS = {1, 2}
 
 # --- Platform configuration keys -------------------------------------------
 CONF_NARTIS_RF_2_METER_ID = "nartis_rf_2_meter_id"
@@ -217,8 +239,14 @@ CONFIG_SCHEMA = cv.Schema(
         # Meter serial: becomes the DL/T 645 address, and its last 3 digits select
         # the channel frequency.
         cv.Required(CONF_ADDRESS): validate_address,
+        # Display generation to emulate - see VARIANTS above.
+        cv.Optional(CONF_VARIANT, default=1): cv.one_of(*sorted(VARIANTS), int=True),
         # Override the derived channel frequency. Only needed if the meter turns
         # out to sit somewhere other than the serial-derived channel.
+        #
+        # Variant 2 tunes by channel index, so an override there is rounded to the
+        # nearest point of the 435.5 + k*0.7 MHz grid and a warning is logged if it
+        # was not already on it.
         cv.Optional(CONF_FREQUENCY): cv.All(
             cv.frequency, cv.Range(min=430000000, max=460000000)
         ),
@@ -283,6 +311,7 @@ async def to_code(config):
         cg.add(setter(pin))
 
     cg.add(var.set_address(config[CONF_ADDRESS]))
+    cg.add(var.set_variant(config[CONF_VARIANT]))
     if CONF_FREQUENCY in config:
         cg.add(var.set_frequency_override(int(config[CONF_FREQUENCY])))
 
