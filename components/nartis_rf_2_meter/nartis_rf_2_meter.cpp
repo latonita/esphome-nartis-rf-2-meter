@@ -14,6 +14,7 @@ void NartisRf2MeterComponent::setup() {
   if (this->pin_sdio_ == nullptr || this->pin_sclk_ == nullptr || this->pin_csb_ == nullptr ||
       this->pin_fcsb_ == nullptr || this->pin_gpio3_ == nullptr) {
     ESP_LOGE(TAG, "CMT2300A pins are not configured");
+    this->publish_cycle_outcome_(false);
     this->mark_failed();
     return;
   }
@@ -28,11 +29,22 @@ void NartisRf2MeterComponent::setup() {
 
   if (!this->hal_.init()) {
     ESP_LOGE(TAG, "CMT2300A initialization failed - check wiring");
+    // Fail safe: a radio that never came up must not leave the entity unknown, or a
+    // dashboard shows a blank where it should show a fault.
+    this->publish_cycle_outcome_(false);
     this->mark_failed();
     return;
   }
   this->hal_.go_standby();
   this->radio_ready_ = true;
+
+  // The diagnostic entity reports on a poll cycle, so it needs one to happen. With
+  // no value entities configured nothing would ever be polled and it would sit at
+  // its boot state forever, so ask for the status exchange - the shorter of the two.
+  if (this->last_read_ok_bs_ != nullptr && !this->need_data_ && !this->need_status_) {
+    this->need_status_ = true;
+    ESP_LOGI(TAG, "Only the last_read_ok entity is configured - polling the status page to exercise the link");
+  }
 
   this->resolve_data_page_();
 
@@ -111,6 +123,7 @@ void NartisRf2MeterComponent::dump_config() {
                 (this->data_page_ == DI_PARAMS) ? " (energy + instantaneous)" : " (energy + clock)");
   ESP_LOGCONFIG(TAG, "  Instantaneous values: %s", YESNO(this->data_page_ == DI_PARAMS));
   ESP_LOGCONFIG(TAG, "  Polling: data %s, status %s", YESNO(this->need_data_), YESNO(this->need_status_));
+  LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
   LOG_PIN("  SDIO pin: ", this->pin_sdio_);
   LOG_PIN("  SCLK pin: ", this->pin_sclk_);
   LOG_PIN("  CSB pin: ", this->pin_csb_);
@@ -501,6 +514,19 @@ void NartisRf2MeterComponent::handle_publish_() {
            millis() - this->cycle_start_ms_, YESNO(this->data_ok_), YESNO(this->status_ok_));
   ESP_LOGV(TAG, "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", retries %" PRIu32 ", give-ups %" PRIu32,
            this->no_reply_count_, this->bad_frame_count_, this->retry_count_, this->giveup_count_);
+
+  // A cycle counts as successful only if every exchange it needed came back. A
+  // partial cycle is reported as a failure on purpose: it left some entity holding
+  // a stale value, which is the thing this entity exists to expose.
+  this->publish_cycle_outcome_((!this->need_data_ || this->data_ok_) &&
+                               (!this->need_status_ || this->status_ok_));
+}
+
+void NartisRf2MeterComponent::publish_cycle_outcome_(bool ok) {
+  if (this->last_read_ok_bs_ == nullptr) {
+    return;
+  }
+  this->last_read_ok_bs_->publish_state(ok);
 }
 
 void NartisRf2MeterComponent::describe_item_(uint16_t di, const ParsedItem &item, char *out, size_t cap,

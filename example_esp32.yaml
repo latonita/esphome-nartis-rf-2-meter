@@ -204,3 +204,10 @@ text_sensor:
     tag: 0x29
     icon: mdi:clock-outline
     entity_category: diagnostic
+
+# Diagnostic: false when the last poll cycle did not get everything it asked for.
+# The value entities publish nothing on a failed cycle and hold their previous
+# reading, so this is what distinguishes fresh data from hours-old data.
+binary_sensor:
+  - platform: nartis_rf_2_meter
+    name: "Last read OK"                 # Последний опрос успешен

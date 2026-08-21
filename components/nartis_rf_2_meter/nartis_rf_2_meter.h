@@ -37,6 +37,7 @@
 
 #pragma once
 
+#include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
@@ -93,6 +94,10 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Override the channel frequency instead of deriving it from the serial.
   /// 0 = derive (the normal case).
   void set_frequency_override(uint32_t hz) { this->frequency_override_ = hz; }
+
+  /// Diagnostic entity: true when the last poll cycle got everything it asked for.
+  /// Optional - nullptr when the YAML declares no binary sensor.
+  void set_last_read_ok_binary_sensor(esphome::binary_sensor::BinarySensor *s) { this->last_read_ok_bs_ = s; }
 
   /// Which data page the TAG entities are read from: DI 0xF200 (energy registers
   /// and clock) or DI 0xF202 (those plus the instantaneous values).
@@ -160,6 +165,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Leave the current exchange and move to the next step of the cycle.
   void finish_exchange_();
   void handle_publish_();
+  /// Report the finished cycle on the `last_read_ok` entity, if one is configured.
+  void publish_cycle_outcome_(bool ok);
   /// DI of the step currently in flight, for logging.
   uint16_t current_di_() const;
 
@@ -181,6 +188,9 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void warn_unconfirmed_tag_once_(uint8_t tag, TagConfidence conf);
 
   Cmt2300aHal hal_;
+
+  /// Optional diagnostic entity; nullptr unless the YAML declares one.
+  esphome::binary_sensor::BinarySensor *last_read_ok_bs_{nullptr};
 
   esphome::InternalGPIOPin *pin_sdio_{nullptr};
   esphome::InternalGPIOPin *pin_sclk_{nullptr};

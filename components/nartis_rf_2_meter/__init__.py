@@ -17,7 +17,9 @@ import esphome.config_validation as cv
 from esphome.const import CONF_ADDRESS, CONF_FREQUENCY, CONF_ID
 
 CODEOWNERS = ["@latonita"]
-AUTO_LOAD = ["sensor", "text_sensor"]
+# binary_sensor is auto-loaded even though the platform is optional: the component
+# header includes its type unconditionally, so the sources must always be present.
+AUTO_LOAD = ["binary_sensor", "sensor", "text_sensor"]
 MULTI_CONF = True
 
 # --- Hub configuration keys -------------------------------------------------
