@@ -32,9 +32,6 @@ tools/frame_check/frame_check
 *.local.md
 *.local.txt
 
-# Keep the README local for now
-README.md
-
 tools/frame_check/f202_check
 
 # Semgrep plugin scratch output
