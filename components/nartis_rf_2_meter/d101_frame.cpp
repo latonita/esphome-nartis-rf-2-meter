@@ -427,30 +427,47 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ParseResult::MALFORMED;  // longer than anything this protocol should send
     }
 
-    // Control code. Bit 7 marks the reply direction; bit 6 means the meter
-    // refused. On a refusal DATA carries error bytes, not items, so stop here
-    // with the payload kept for the caller to log.
-    if (f[8] != DLT645_C_READ_RSP) {
-      return ((f[8] & 0x80) != 0) ? ParseResult::ERROR_RESPONSE : ParseResult::NOT_RESPONSE;
+    // Control code. Two read responses are accepted: 0x81 (DL/T 645-1997,
+    // variant 1) and 0x91 (DL/T 645-2007, variant 2). They differ only in the DI
+    // width that precedes COUNT - 2 bytes for 1997, 4 for 2007 - after which both
+    // carry the same COUNT + {TAG, value} item list. Bit 6 set means the meter
+    // refused; DATA then holds error bytes, not items, so stop here with the
+    // payload kept for the caller to log.
+    const bool is_2007 = (f[8] == DLT645_C_READ_RSP_2007);
+    const bool is_1997 = (f[8] == DLT645_C_READ_RSP);
+    if (!is_1997 && !is_2007) {
+      return ((f[8] & 0x40) != 0) ? ParseResult::ERROR_RESPONSE : ParseResult::NOT_RESPONSE;
     }
 
-    if (data_len < 3) {
+    const size_t di_bytes = is_2007 ? 4 : 2;
+    if (data_len < di_bytes + 1) {
       return ParseResult::MALFORMED;  // need at least DI + COUNT
     }
-    out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
-    const uint8_t count = payload[2];
+    uint32_t di_full = 0;
+    for (size_t i = 0; i < di_bytes; i++) {
+      di_full |= static_cast<uint32_t>(payload[i]) << (8 * i);
+    }
+    out->di32 = di_full;
+    out->di = static_cast<uint16_t>(di_full & 0xFFFF);
+
+    // A 2007 display block reuses the 1997 params-page TAG numbering (block 0xF2
+    // is that page re-wrapped), so decode its items with the DI 0xF202 table
+    // regardless of which block index came back.
+    const uint16_t lookup_di = is_2007 ? DI_PARAMS : out->di;
+
+    const uint8_t count = payload[di_bytes];
     if (count > MAX_ITEMS) {
       return ParseResult::TOO_MANY_ITEMS;
     }
 
-    size_t pos = 3;
+    size_t pos = di_bytes + 1;
     for (uint8_t i = 0; i < count; i++) {
       if (pos >= data_len) {
         return ParseResult::MALFORMED;
       }
       const uint8_t tag = payload[pos++];
       TagInfo info{};
-      if (!tag_info(out->di, tag, &info, tag_width_overrides)) {
+      if (!tag_info(lookup_di, tag, &info, tag_width_overrides)) {
         // No width => no way to find the next item, so everything after this
         // point is unparseable. Abort and hand the caller enough context to work
         // the width out by hand.

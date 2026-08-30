@@ -90,18 +90,33 @@ static constexpr size_t MAX_REQUEST_BODY = 8;
  * are 20 00 20 0E once the +0x33 transmission offset is removed, which this
  * builder emits as DI 0x0020 followed by a 2-byte body 20 0E.
  *
- * Whether the meter reads that as a 645-1997 2-byte DI plus body, or as the
- * 4-byte DI 0x0E200020 that control code 0x11 (645-2007) would imply, is not
- * established. The bytes on air are identical either way, so the split below is
- * a construction convenience and nothing should be inferred from it.
+ * The meter reads this as the 4-byte DL/T 645-2007 DI 0x0E200020 that control
+ * code 0x11 implies - a Wasion vendor "display block" DI, family 0x0E2000XX with
+ * XX a block index (firmware DTSD341-MB530, dispatch table at 0x08075c68). The
+ * split below (2-byte DI 0x0020 + a 2-byte body 20 0E) is only a construction
+ * convenience: it puts the identical four bytes on air, low-byte first, so
+ * build_v2_request() reproduces the capture without build_read_request() needing
+ * a 4-byte-DI form.
  *
- * No reply to this request has ever been captured - not on the SPI bus of the
- * real display and not on air - so the response format is entirely unknown.
- * Variant 2 therefore only transmits and logs whatever comes back.
+ * No reply to this request has been captured on air. The firmware shows what its
+ * shape must be, though: control 0x91 (0x11 | 0x80), the 4-byte DI echoed back,
+ * then the same COUNT + {TAG, value} item list the 1997 pages carry - block 0xF2
+ * (DI 0x0E2000F2) is literally the old 0xF2 params page re-wrapped as a 2007 DI,
+ * so the same TAG table decodes a block reply. parse_response() handles that
+ * layout; because it is firmware-derived and not yet field-confirmed, the
+ * component falls back to a raw diagnostic dump if a real reply does not fit it.
  */
 static constexpr uint16_t V2_REQUEST_DI = 0x0020;
 static constexpr size_t V2_REQUEST_BODY_SIZE = 2;
 extern const uint8_t V2_REQUEST_BODY[V2_REQUEST_BODY_SIZE];
+
+/// DL/T 645-2007 vendor "display block" data identifiers (4 bytes). The newer
+/// display (variant 2) reads these instead of the 1997 2-byte page DIs. Family
+/// base is 0x0E200000; the low byte is a block/screen index. The captured
+/// variant-2 poll reads block 0x20; block 0xF2 is the old 0xF2 params page.
+static constexpr uint32_t DI_2007_BLOCK_BASE = 0x0E200000u;
+static constexpr uint8_t DI_2007_BLOCK_DATA = 0x20;
+static constexpr uint32_t DI_2007_DATA = DI_2007_BLOCK_BASE | DI_2007_BLOCK_DATA;  // 0x0E200020
 
 /// Widest item value we can hold (the 9-byte status blob).
 static constexpr size_t MAX_ITEM_WIDTH = 9;
@@ -193,11 +208,16 @@ struct ParsedItem {
 static constexpr size_t MAX_PAYLOAD = 128;
 
 struct ParsedResponse {
-  /// DL/T 645 control code as received. 0x81 = normal read response; anything
-  /// else with bit 7 set is the meter refusing, and `payload` then holds the
-  /// error bytes rather than items.
+  /// DL/T 645 control code as received. 0x81 = 1997 read response (variant 1),
+  /// 0x91 = 2007 read response (variant 2); anything else with bit 6 set is the
+  /// meter refusing, and `payload` then holds the error bytes rather than items.
   uint8_t control{0};
+  /// DI as received: for a 1997 (0x81) reply the 2-byte page DI, for a 2007
+  /// (0x91) reply the low 16 bits of the 4-byte DI. `di32` carries the full value.
   uint16_t di{0};
+  /// Full DI. Equals `di` for a 1997 reply; the 4-byte 0x0E2000XX block DI for a
+  /// 2007 reply.
+  uint32_t di32{0};
   uint8_t count{0};
   ParsedItem items[MAX_ITEMS]{};
 
@@ -224,7 +244,7 @@ enum class ParseResult : uint8_t {
   BAD_CHECKSUM,    // 645 sum checksum mismatch
   MALFORMED,       // 645 delimiters / length fields inconsistent
   WRONG_ADDRESS,   // a valid frame, but not from our meter
-  NOT_RESPONSE,    // control code is not 0x81 (0xC1 = the meter refused the read)
+  NOT_RESPONSE,    // control code is not a read response (0x81 or 0x91)
   UNKNOWN_TAG,     // item TAG of unknown width - framing lost, aborted
   TOO_MANY_ITEMS,  // COUNT exceeds MAX_ITEMS
 };
@@ -323,6 +343,11 @@ size_t build_v2_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL
 /// be LEN, and because RX runs in fixed-length mode the real frame is followed
 /// by capture noise. Start offsets 0..3 are tried, and a candidate is accepted
 /// only when its LEN and CRC agree. Header byte 5 is not checked.
+///
+/// Both read dialects decode through here, told apart by the control code: 0x81
+/// (1997, variant 1) has a 2-byte DI before COUNT, 0x91 (2007, variant 2) a
+/// 4-byte DI; the item list after COUNT is identical, and a 2007 block reply is
+/// decoded with the DI 0xF202 TAG table (see the Variant 2 note above).
 ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_le[SERIAL_BCD_SIZE],
                            ParsedResponse *out, const uint8_t *tag_width_overrides = nullptr);
 

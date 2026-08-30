@@ -213,11 +213,15 @@ binary_sensor:
     name: "Last read OK"                 # Последний опрос успешен
 
 # ---------------------------------------------------------------------------
-# Variant 2 - the newer display (bring-up / diagnostic)
+# Variant 2 - the newer display
 # ---------------------------------------------------------------------------
 # Sends the single DL/T 645-2007 request captured off a real display's SPI bus
-# and logs whatever comes back. No reply to it has ever been captured, so this
-# drives no sensors - watch the log.
+# (the 4-byte block DI 0x0E200020, control 0x11) and decodes the reply the same
+# way variant 1 decodes its data page: the same `tag`/`bytes` sensors below work
+# unchanged. The reply layout is derived from the meter firmware and has not yet
+# been confirmed against a captured reply - if the meter answers in some other
+# shape the component dumps it raw to the log (at INFO) instead of failing, so
+# keep the logger at INFO on first bring-up and report any such dump.
 #
 # Meter 023250209637: 637 % 24 = channel 13 = 444.6 MHz. That is what the serial
 # derives on its own, so `frequency:` below is redundant and only there to make
@@ -235,5 +239,15 @@ binary_sensor:
 #       pin_fcsb: GPIO17
 #       pin_gpio3: GPIO16
 #
+#   # Same sensors as variant 1 - selected by TAG, decoded with the same table.
+#   sensor:
+#     - platform: nartis_rf_2_meter
+#       nartis_rf_2_meter_id: nartis_v2
+#       tag: 0x00
+#       name: "Active energy import total"
+#       unit_of_measurement: kWh
+#       accuracy_decimals: 3
+#       filters: [multiply: 0.001]
+#
 #   logger:
-#     level: INFO      # the variant-2 TX frame and RX dump are both at INFO
+#     level: INFO      # the variant-2 TX frame and any raw RX dump are at INFO

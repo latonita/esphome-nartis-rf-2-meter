@@ -190,6 +190,65 @@ int main() {
                            sizeof(ENERGY_REQUEST_BODY)) != 0,
         "the default control code is still accepted");
 
+  // --- variant-2 reply (firmware-derived): control 0x91, a 4-byte block DI
+  // echoed, then the same COUNT + {TAG, value} item list variant 1 uses. No such
+  // reply has been captured on air; this assembles the layout the DTSD341-MB530
+  // firmware implies and checks parse_response() decodes it and drives the same
+  // TAGs. If a real capture ever contradicts this, replace the bytes below.
+  {
+    const uint8_t data[] = {
+        0x20, 0x00, 0x20, 0x0E,                          // DI 0x0E200020, low byte first
+        0x03,                                            // COUNT = 3
+        0x00, 0x4E, 0x61, 0xBC, 0x00,                    // TAG 0x00 energy = 12345678 (u32 LE)
+        0x15, 0x01, 0x23, 0x00, 0x00,                    // TAG 0x15 voltage = 2301 -> 230.1 V (BCD)
+        0x29, 0x00, 0x30, 0x14, 0x05, 0x28, 0x08, 0x26,  // TAG 0x29 clock 2026-08-28 14:30:00
+    };
+    const uint8_t data_len = static_cast<uint8_t>(sizeof(data));
+    uint8_t buf[128];
+    size_t p = 0;
+    const uint8_t env_len = static_cast<uint8_t>(D101_HDR_AFTER_LEN + DLT645_OVERHEAD + data_len);
+    buf[p++] = env_len;
+    buf[p++] = 0x00;
+    buf[p++] = 0x01;
+    buf[p++] = static_cast<uint8_t>(env_len ^ 1);  // HLEN, not checked on receive
+    const size_t f645 = p;
+    buf[p++] = DLT645_DELIM;
+    std::memcpy(buf + p, v2_serial, SERIAL_BCD_SIZE);
+    p += SERIAL_BCD_SIZE;
+    buf[p++] = DLT645_DELIM;
+    buf[p++] = DLT645_C_READ_RSP_2007;  // 0x91
+    buf[p++] = data_len;
+    for (size_t i = 0; i < data_len; i++)
+      buf[p++] = static_cast<uint8_t>(data[i] + DLT645_DATA_OFFSET);
+    uint8_t cs = 0;
+    for (size_t i = f645; i < p; i++)
+      cs = static_cast<uint8_t>(cs + buf[i]);
+    buf[p++] = cs;
+    buf[p++] = DLT645_END;
+    const uint16_t crc = crc16_x25(buf, env_len + 1);
+    buf[p++] = static_cast<uint8_t>(crc & 0xFF);
+    buf[p++] = static_cast<uint8_t>(crc >> 8);
+    hex("v2 reply", buf, p);
+
+    ParsedResponse resp;
+    const ParseResult r = parse_response(buf, p, v2_serial, &resp, nullptr);
+    check(r == ParseResult::OK, "variant-2 (0x91) reply parses OK");
+    check(resp.control == DLT645_C_READ_RSP_2007, "variant-2 control is 0x91");
+    check(resp.di32 == DI_2007_DATA, "variant-2 full DI is 0x0E200020");
+    check(resp.di == 0x0020, "variant-2 low-16 DI is 0x0020");
+    check(resp.count == 3, "variant-2 reply has 3 items");
+    const ParsedItem *e0 = resp.find(0x00);
+    check(e0 != nullptr && item_as_u32(*e0) == 12345678u, "variant-2 TAG 0x00 energy = 12345678");
+    const ParsedItem *volt = resp.find(0x15);
+    uint32_t vb = 0;
+    check(volt != nullptr && item_as_bcd(*volt, &vb) && vb == 2301u, "variant-2 TAG 0x15 voltage = 2301 (230.1 V)");
+    char cbuf[24];
+    const ParsedItem *clk = resp.find(0x29);
+    check(clk != nullptr && item_clock_to_string(*clk, cbuf, sizeof(cbuf)) &&
+              std::strcmp(cbuf, "2026-08-28 14:30:00") == 0,
+          "variant-2 TAG 0x29 clock = 2026-08-28 14:30:00");
+  }
+
   std::printf("\n%s (%d failure(s))\n", failures == 0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", failures);
   return failures == 0 ? 0 : 1;
 }

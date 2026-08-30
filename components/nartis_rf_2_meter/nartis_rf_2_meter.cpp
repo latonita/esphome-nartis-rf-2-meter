@@ -56,10 +56,16 @@ void NartisRf2MeterComponent::setup() {
   this->radio_ready_ = true;
 
   if (this->variant_ == VARIANT_2) {
-    // Nothing to resolve: variant 2 has one fixed request and no item parser.
-    if (!this->entries_.empty()) {
-      ESP_LOGW(TAG, "variant 2 cannot decode a reply yet - %zu configured entity(ies) will stay unavailable",
-               this->entries_.size());
+    // Variant 2 reads one DL/T 645-2007 display block (DI 0x0E200020). Its reply
+    // carries the same item list as the 1997 params page, so decode it with the
+    // DI 0xF202 TAG table; there is no page to auto-select. Status-block fields
+    // (DI 0xF201) have no known variant-2 equivalent.
+    this->data_page_ = DI_PARAMS;
+    this->data_page_auto_ = false;
+    for (const auto &e : this->entries_) {
+      if (e.reads_status()) {
+        ESP_LOGW(TAG, "variant 2 has no status block - the status entity will stay unavailable");
+      }
     }
   } else {
     // The diagnostic entity reports on a poll cycle, so it needs one to happen. With
@@ -157,7 +163,8 @@ void NartisRf2MeterComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  RX timeout: %" PRIu32 " ms, retries: %u, request gap: %" PRIu32 " ms", this->rf_rx_timeout_ms_,
                 this->rf_retries_, this->request_gap_ms_);
   if (this->variant_ == VARIANT_2) {
-    ESP_LOGCONFIG(TAG, "  Polling: the single variant-2 request (transmit and log only)");
+    ESP_LOGCONFIG(TAG, "  Polling: one DL/T 645-2007 block request (DI 0x%08lX); reply decoded, layout firmware-derived",
+                  DI_2007_DATA);
   } else {
     ESP_LOGCONFIG(TAG, "  Data page: DI 0x%04X%s", this->data_page_,
                   (this->data_page_ == DI_PARAMS) ? " (energy + instantaneous)" : " (energy + clock)");
@@ -446,11 +453,38 @@ void NartisRf2MeterComponent::handle_wait_() {
     this->last_rssi_dbm_ = this->hal_.get_rssi_dbm();
 
     if (step.kind == StepKind::V2) {
-      // Anything at all is a result here, so take it and stop: retrying would
-      // only overwrite the one capture we care about.
-      ESP_LOGI(TAG, "RX variant-2 reply, rssi=%d dBm, %zu byte(s)", this->last_rssi_dbm_, this->rx_len_);
-      this->log_v2_reply_();
-      this->finish_exchange_();
+      ESP_LOGD(TAG, "RX rssi=%d dBm: %s", this->last_rssi_dbm_,
+               format_hex_pretty(this->rx_buf_.data(), this->rx_len_).c_str());
+
+      // Try the firmware-derived 2007 block layout first (control 0x91, 4-byte
+      // DI echo, then the 1997 item list). If it decodes, drive entities from it
+      // exactly like variant 1's data page.
+      ParsedResponse resp{};
+      const ParseResult r =
+          parse_response(this->rx_buf_.data(), this->rx_len_, this->serial_le_, &resp, this->tag_width_);
+      if (r == ParseResult::OK) {
+        this->data_ = resp;
+        this->data_ok_ = true;
+        ESP_LOGI(TAG, "variant-2 block DI 0x%08" PRIX32 ": %u item(s), rssi %d dBm", resp.di32, resp.count,
+                 this->last_rssi_dbm_);
+        this->log_response_(DI_PARAMS, resp);
+        this->finish_exchange_();
+        return;
+      }
+
+      // The predicted layout did not fit. Keep the bring-up diagnostic so an
+      // unexpected reply shape is still fully visible, then retry like any other
+      // step (the reply layout is not field-confirmed, so a mismatch is expected
+      // to happen and must not be silent).
+      this->bad_frame_count_++;
+      if (r == ParseResult::UNKNOWN_TAG) {
+        this->log_unknown_tag_(DI_PARAMS, resp);
+      } else {
+        ESP_LOGI(TAG, "variant-2 reply did not decode as a 2007 block (%s) - raw dump follows",
+                 parse_result_to_string(r));
+        this->log_v2_reply_();
+      }
+      this->retry_or_finish_();
       return;
     }
 

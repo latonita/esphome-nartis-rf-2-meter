@@ -48,18 +48,22 @@ CONF_BODY = "body"
 #       entities. Unchanged by the addition of variant 2.
 #
 #   2 - the newer display captured on its SPI bus in 2026-08 while polling meter
-#       023250209637. Two things differ, and only two:
+#       023250209637. Two things differ from variant 1, and only two:
 #
-#         * one request instead of two, using the DL/T 645-2007 read code 0x11:
+#         * one request instead of two, using the DL/T 645-2007 read code 0x11
+#           with the 4-byte block DI 0x0E200020:
 #             98 f3 13 00 01 12 68 <addr> 68 11 04 53 33 53 41 <cs> 16 <crc>
 #         * the radio is tuned by writing a fixed k=0 frequency bank plus
 #           FREQ_OFS, then hopping with FREQ_CHNL = 2*k - the bank itself is
 #           never rewritten, not even between TX and RX.
 #
-#       No reply to that request has ever been captured, on the display's SPI bus
-#       or on air, so there is nothing to parse against: variant 2 transmits and
-#       logs whatever comes back. It drives no entity. Use it to find out whether
-#       this meter generation answers at all.
+#       The reply is decoded and drives entities the same way variant 1's data
+#       page does: the meter firmware shows a 2007 block reply is control 0x91,
+#       the 4-byte DI echoed, then the same TAG item list the 1997 pages use, so
+#       the same `tag`/`bytes` entities work. That layout is derived from the
+#       firmware and has not yet been confirmed against a captured reply, so a
+#       reply that does not fit it is dumped raw to the log instead of failing -
+#       report such a dump so the decoding can be corrected.
 VARIANTS = {1, 2}
 
 # --- Platform configuration keys -------------------------------------------

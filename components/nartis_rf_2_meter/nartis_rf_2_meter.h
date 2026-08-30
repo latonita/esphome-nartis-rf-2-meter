@@ -60,9 +60,12 @@ static constexpr uint16_t DATA_PAGE_AUTO = 0;
 ///   1 - the original Д101-2: two constant DL/T 645-1997 read requests, an
 ///       AN199-computed frequency bank. Fully decoded, drives entities.
 ///   2 - the newer display seen in the 2026-08 SPI capture: one DL/T 645-2007
-///       request (control 0x11) and the base-bank + FREQ_CHNL tuning method.
-///       Transmit-and-log only - no reply has ever been captured, so there is
-///       nothing to parse against and no entity is driven.
+///       request (control 0x11, the 4-byte block DI 0x0E200020) and the
+///       base-bank + FREQ_CHNL tuning method. The reply is decoded with the same
+///       TAG table as variant 1 and drives entities. Its layout (control 0x91,
+///       4-byte DI echo, then the 1997 item list) is derived from the meter
+///       firmware and not yet field-confirmed, so a reply that does not fit falls
+///       back to a raw diagnostic dump instead of failing.
 static constexpr uint8_t VARIANT_D101_2 = 1;
 static constexpr uint8_t VARIANT_2 = 2;
 
