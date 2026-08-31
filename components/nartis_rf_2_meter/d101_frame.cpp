@@ -246,27 +246,27 @@ uint8_t channel_from_serial(const char *digits12) {
 }
 
 uint8_t channel_from_frequency(uint32_t freq_hz) {
-  if (freq_hz <= CHANNEL_BASE_HZ) {
-    return 0;
+  // The grid is not uniform (see channel_frequency()), so invert it by search
+  // rather than by division - 24 comparisons, once, at setup.
+  uint8_t best = 0;
+  uint32_t best_err = UINT32_MAX;
+  for (uint8_t k = 0; k < CHANNEL_COUNT; k++) {
+    const uint32_t f = channel_frequency(k);
+    const uint32_t err = (f > freq_hz) ? (f - freq_hz) : (freq_hz - f);
+    if (err < best_err) {
+      best_err = err;
+      best = k;
+    }
   }
-  // Round to the nearest grid point rather than truncating, so a frequency given
-  // as e.g. 444.6 MHz lands on its own channel and not the one below it.
-  const uint32_t k = (freq_hz - CHANNEL_BASE_HZ + CHANNEL_STEP_HZ / 2) / CHANNEL_STEP_HZ;
-  return static_cast<uint8_t>((k >= CHANNEL_COUNT) ? (CHANNEL_COUNT - 1) : k);
+  return best;
 }
 
 uint32_t channel_frequency(uint8_t channel) {
   const uint8_t k = (channel >= CHANNEL_COUNT) ? static_cast<uint8_t>(CHANNEL_COUNT - 1) : channel;
-  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ;
+  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ + (k > CHANNEL_STEP_BREAK ? CHANNEL_STEP_EXTRA_HZ : 0u);
 }
 
 uint32_t frequency_from_serial(const char *digits12) {
-  // Uniform 0.7 MHz step across the whole grid. There used to be a +100 kHz
-  // special case for k > 18; SPI captures of a real display disprove it. Three
-  // adjacent serials with the same frequency bank step FREQ_CHNL by exactly +8
-  // per k (k=17 -> 0x00, k=18 -> 0x08, k=19 -> 0x10) with FREQ_OFS constant, and
-  // a uniform channel step means a uniform frequency step. An extra 100 kHz at
-  // k=19 would have needed FREQ_CHNL ~17, not 16.
   return channel_frequency(channel_from_serial(digits12));
 }
 

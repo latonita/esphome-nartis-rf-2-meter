@@ -35,7 +35,20 @@ void NartisRf2MeterComponent::setup() {
       ESP_LOGW(TAG, "variant 2 tunes by channel index: %.3f MHz rounded to channel %u (%.3f MHz)",
                this->frequency_override_ / 1e6f, this->channel_, this->rf_frequency_hz_ / 1e6f);
     }
-    this->hal_.set_frequency_mode(FreqMode::BASE_PLUS_CHANNEL);
+    if (channel_needs_computed_bank(this->channel_)) {
+      // Above the grid break the channel carries an extra 100 kHz, which is not a
+      // whole number of FREQ_CHNL hops - a channel hop would land 100 kHz low. No
+      // SPI dump of a real display on such a channel exists, so rather than invent
+      // register values, tune these the way variant 1 does: an absolute computed
+      // bank on the right frequency. Everything above the radio is unchanged.
+      ESP_LOGW(TAG,
+               "channel %u is above the +100 kHz grid break - tuning %.3f MHz with a computed "
+               "bank instead of a FREQ_CHNL hop (a hop cannot express the offset)",
+               this->channel_, this->rf_frequency_hz_ / 1e6f);
+      this->hal_.set_frequency_mode(FreqMode::COMPUTED_BANK);
+    } else {
+      this->hal_.set_frequency_mode(FreqMode::BASE_PLUS_CHANNEL);
+    }
     this->hal_.set_channel(this->channel_);
     this->hal_.set_frequency(this->rf_frequency_hz_);
   } else {
@@ -152,8 +165,10 @@ void NartisRf2MeterComponent::dump_config() {
   // radio; variant 1 can sit on an off-grid override, where printing a nearest
   // channel would just be misleading.
   if (this->variant_ == VARIANT_2) {
-    ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s (channel %u)", this->rf_frequency_hz_ / 1e6f,
-                  (this->frequency_override_ != 0) ? " (override)" : " (derived from address)", this->channel_);
+    ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s (channel %u, %s)", this->rf_frequency_hz_ / 1e6f,
+                  (this->frequency_override_ != 0) ? " (override)" : " (derived from address)", this->channel_,
+                  channel_needs_computed_bank(this->channel_) ? "computed bank - above the +100 kHz grid break"
+                                                              : "FREQ_CHNL hop");
   } else {
     ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s", this->rf_frequency_hz_ / 1e6f,
                   (this->frequency_override_ != 0) ? " (override)" : " (derived from address)");

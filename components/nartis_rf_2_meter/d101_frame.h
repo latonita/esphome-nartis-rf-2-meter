@@ -282,10 +282,43 @@ void serial_to_bcd_le(const char *digits12, uint8_t out[SERIAL_BCD_SIZE]);
  * Both variants use the same 24-channel grid; they differ only in how the radio
  * is tuned onto it (variant 1 computes an absolute frequency bank, variant 2
  * writes a fixed k=0 bank and hops with FREQ_CHNL - see the HAL).
+ *
+ *   f(k) = 435.5 MHz + k * 0.7 MHz,  plus 100 kHz once k > 18
+ *
+ * so every step is 700 kHz except k=18 -> k=19, which is 800 kHz.
+ *
+ * The +100 kHz was removed in an earlier revision and is now back. The reasoning
+ * that removed it: SPI dumps of a real display write a constant FREQ_OFS and
+ * FREQ_CHNL = 2k, and a constant channel step can only make a uniform grid.
+ * That is sound, but the dumps only ever covered k=12 and k=13 - both below the
+ * break, where the two rules agree.
+ *
+ * The first look at a channel above the break contradicts it. An RTL-SDR capture
+ * of a real CIU polling meter 023240275596 (k = 596 mod 24 = 20) puts both the
+ * CIU and the meter at ~449.60 MHz, not the 449.50 MHz a uniform grid predicts;
+ * calibrating the dongle against a 450.000 MHz carrier in the same recording puts
+ * them at 449.604 and 449.597 MHz. The two devices are only 7.6 kHz apart, so
+ * they are certainly on one channel, and that channel is ~100 kHz above uniform.
+ * Full working: fw/rf-alex-bel/RF_FINDINGS_449M6.md.
+ *
+ * One data point above the break, from an uncalibrated dongle, so k=19 and
+ * k=21..23 are still inferred rather than measured. What is NOT explained is how
+ * the real display reaches the offset channels at all: with FREQ_OFS = 0x8C the
+ * FREQ_CHNL hop is 350 kHz and 100 kHz is not a whole number of hops, so above
+ * the break it must be doing something the k=12/k=13 dumps cannot show. Until a
+ * k > 18 dump exists, variant 2 tunes those channels with a computed bank
+ * instead of a channel hop (see the component's setup()).
  */
 static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
 static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
 static constexpr uint8_t CHANNEL_COUNT = 24;
+/// Last channel on the plain 0.7 MHz grid; every k above this carries
+/// CHANNEL_STEP_EXTRA_HZ on top.
+static constexpr uint8_t CHANNEL_STEP_BREAK = 18;
+static constexpr uint32_t CHANNEL_STEP_EXTRA_HZ = 100000u;
+/// True when channel `k` sits above the break, i.e. FREQ_CHNL tuning cannot
+/// reach it (100 kHz is not a whole number of 350 kHz hops).
+inline bool channel_needs_computed_bank(uint8_t k) { return k > CHANNEL_STEP_BREAK; }
 
 /// Channel index from the last three digits of the meter serial: k = last3 % 24.
 /// e.g. "...060" -> 60 % 24 = 12;  "...637" -> 637 % 24 = 13.
@@ -293,15 +326,16 @@ uint8_t channel_from_serial(const char *digits12);
 
 /// Nearest channel index to an explicit frequency, clamped to the grid. Lets a
 /// YAML `frequency:` override drive the variant-2 channel hop, which has no way
-/// to express an off-grid frequency.
+/// to express an off-grid frequency. Searches the grid rather than dividing,
+/// because the grid is not uniform.
 uint8_t channel_from_frequency(uint32_t freq_hz);
 
 /// Channel centre frequency in Hz.
 uint32_t channel_frequency(uint8_t channel);
 
 /// Channel frequency (Hz) from the last three digits of the meter serial:
-///   k = last3 % 24;  f = 435.5 MHz + k*0.7 MHz.
-/// e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz.
+///   k = last3 % 24;  f = 435.5 MHz + k*0.7 MHz, +100 kHz when k > 18.
+/// e.g. "...060" -> k=12 -> 443.900 MHz;  "...596" -> k=20 -> 449.600 MHz.
 uint32_t frequency_from_serial(const char *digits12);
 
 /* ================================================================
