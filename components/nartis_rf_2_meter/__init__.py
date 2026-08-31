@@ -243,7 +243,7 @@ CONFIG_SCHEMA = cv.Schema(
         # ~735 ms into the RX window with real spread above it. 1000 ms cut into
         # that spread; 1500 ms is the value proven in the field.
         cv.Optional(
-            CONF_RF_RX_TIMEOUT, default="1500ms"
+            CONF_RF_RX_TIMEOUT, default="1800ms"
         ): cv.positive_time_period_milliseconds,
         # Retransmissions per exchange on no-reply or a bad frame. Total on-air
         # attempts = 1 + rf_retries.
