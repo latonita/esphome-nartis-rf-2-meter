@@ -34,28 +34,31 @@ int main() {
   std::printf("frequency      %.3f MHz\n", f / 1e6);
   check(f == 443900000u, "frequency 443.900 MHz for ...060 (k=12, confirmed on air)");
 
-  // The channel grid is uniform: 435.5 MHz + k * 0.7 MHz, with no special step.
-  // A +100 kHz jump above k=18 used to be applied here; SPI captures of a real
-  // display disprove it - FREQ_CHNL advances by exactly +8 per k right across
-  // k=17..19, and a uniform channel step cannot produce a non-uniform frequency
-  // step. These assertions exist so that step cannot creep back in.
+  // The grid steps 0.7 MHz per k, with one extra 100 kHz above k=18. The break
+  // is on-air evidence: serial ...596 (k=20) answers on 449.600 and is silent on
+  // 449.500, and k=12/k=13 pin the base below it. A reading of the display's own
+  // SPI capture suggested a uniform grid - FREQ_CHNL advancing by exactly +8 per
+  // k across k=17..19 - but where the meter actually transmits settles it, so
+  // these assertions exist to stop the uniform grid creeping back in.
   auto freq_for_k = [](unsigned k) {
     char serial[13];
     std::snprintf(serial, sizeof(serial), "000000000%03u", k);  // last 3 digits = k, k < 24
     return frequency_from_serial(serial);
   };
-  bool uniform = true;
+  bool grid_ok = true;
   for (unsigned k = 1; k < 24; k++) {
-    if (freq_for_k(k) - freq_for_k(k - 1) != 700000u) {
-      std::printf("FAIL  step k=%u -> %u is %u Hz, expected 700000\n", k - 1, k,
-                  freq_for_k(k) - freq_for_k(k - 1));
-      uniform = false;
+    const uint32_t want = (k == 19) ? 800000u : 700000u;  // the one-off +100 kHz lands on k=19
+    const uint32_t got = freq_for_k(k) - freq_for_k(k - 1);
+    if (got != want) {
+      std::printf("FAIL  step k=%u -> %u is %u Hz, expected %u\n", k - 1, k, got, want);
+      grid_ok = false;
     }
   }
-  check(uniform, "channel grid steps a uniform 0.7 MHz for all k (no +100 kHz above k=18)");
-  check(freq_for_k(17) == 447400000u, "k=17 -> 447.400 MHz (confirmed on air)");
-  check(freq_for_k(19) == 448800000u, "k=19 -> 448.800 MHz (was 448.900 before the fix)");
-  check(freq_for_k(23) == 451600000u, "k=23 -> 451.600 MHz");
+  check(grid_ok, "channel grid steps 0.7 MHz per k, +100 kHz once above k=18");
+  check(freq_for_k(17) == 447400000u, "k=17 -> 447.400 MHz (below the break, not itself verified)");
+  check(freq_for_k(20) == 449600000u, "k=20 -> 449.600 MHz (confirmed on air, serial ...596)");
+  check(freq_for_k(19) == 448900000u, "k=19 -> 448.900 MHz");
+  check(freq_for_k(23) == 451700000u, "k=23 -> 451.700 MHz (the top of the documented band)");
 
   // --- energy request: must match the doc byte-for-byte (LEN 0x17 is odd, so
   //     HLEN = LEN-1 and LEN^1 agree) ---

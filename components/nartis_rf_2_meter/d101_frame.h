@@ -167,7 +167,12 @@ struct ParsedResponse {
   /// error bytes rather than items.
   uint8_t control{0};
   uint16_t di{0};
+  /// Records actually decoded - the length of `items`.
   uint8_t count{0};
+  /// The COUNT byte as received. Meters announce the full record set and then
+  /// send only what fits the frame, so this can exceed `count`; a difference is
+  /// normal truncation, not an error.
+  uint8_t announced_count{0};
   ParsedItem items[MAX_ITEMS]{};
 
   /// The application payload with the +0x33 transmission offset removed, kept
@@ -195,7 +200,7 @@ enum class ParseResult : uint8_t {
   WRONG_ADDRESS,   // a valid frame, but not from our meter
   NOT_RESPONSE,    // control code is not 0x81 (0xC1 = the meter refused the read)
   UNKNOWN_TAG,     // item TAG of unknown width - framing lost, aborted
-  TOO_MANY_ITEMS,  // COUNT exceeds MAX_ITEMS
+  TOO_MANY_ITEMS,  // more records present than MAX_ITEMS
 };
 
 const char *parse_result_to_string(ParseResult r);
@@ -227,9 +232,18 @@ uint16_t crc16_x25(const uint8_t *data, size_t len);
 /// Writes zeroes if `digits12` is not 12 digits long.
 void serial_to_bcd_le(const char *digits12, uint8_t out[SERIAL_BCD_SIZE]);
 
+// Meter channel grid: k = last3(serial) % 24, freq = BASE + k * STEP, plus EXTRA
+// once k > BREAK. The k=18 -> 19 step is 800 kHz; every other step is 700 kHz.
+// Kept here rather than in cmt2300a_defs.h so this protocol layer stays free of
+// the HAL headers - the host-side frame checks build it on its own.
+static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
+static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
+static constexpr uint32_t CHANNEL_STEP_BREAK = 18u;
+static constexpr uint32_t CHANNEL_STEP_EXTRA_HZ = 100000u;
+
 /// Channel frequency (Hz) from the last three digits of the meter serial:
 ///   k = last3 % 24;  f = 435.5 MHz + k*0.7 MHz, +100 kHz when k > 18.
-/// e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz.
+/// e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz; "...596" -> 20 -> 449.600 MHz.
 uint32_t frequency_from_serial(const char *digits12);
 
 /* ================================================================

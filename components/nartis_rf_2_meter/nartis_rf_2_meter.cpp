@@ -580,6 +580,10 @@ void NartisRf2MeterComponent::describe_item_(uint16_t di, const ParsedItem &item
 
 void NartisRf2MeterComponent::log_response_(uint16_t di, const ParsedResponse &resp) const {
   ESP_LOGVV(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
+  if (resp.announced_count > resp.count) {
+    // Normal: the meter announces its whole record set and sends what fits.
+    ESP_LOGV(TAG, "  page holds %u of the %u record(s) the meter announced", resp.count, resp.announced_count);
+  }
   char line[96];
   for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
     describe_item_(di, resp.items[i], line, sizeof(line), this->tag_width_);

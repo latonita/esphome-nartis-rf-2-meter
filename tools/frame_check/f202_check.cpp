@@ -23,6 +23,11 @@ static void check(bool ok, const char *what) {
 }
 
 // Captured page, from the LEN byte onwards, as the radio hands it over.
+static const char *const SHORT_PAGE_HEX =
+    "620001636896552740320268815335254B3348523B34347CBEEA3335FFC68333383333333339333333333A333333334898"
+    "543333499C5433334ACB5433334FA77C3333504887333351756C333352BA6A333353375B333354843B333355B43C33339D"
+    "16BCB3";
+
 static const char *const FRAME_HEX = "6000016168601027403202688151352542335CFDFF33349099C03335FF967233383333333339333333333A333333334864563333494A5633334A695633334FA74A333350B9453333514A44333353C83A33335BCC7C33335C683C47345A3A59C6161E55";
 
 static size_t unhex(const char *hex, uint8_t *out, size_t cap) {
@@ -125,6 +130,30 @@ int main() {
   // captured, and it must be rejected rather than half-parsed.
   ParsedResponse trunc{};
   check(parse_response(frame, 90, serial, &trunc) != ParseResult::OK, "a 90-byte truncation is rejected");
+
+  // A live page off the air from a second meter, complete and CRC-valid, whose
+  // COUNT byte says 24 while DATA holds 16 records (0x53 = 83 = 3 + 16*5). The
+  // meter announces its whole record set and sends what fits, so COUNT is an
+  // upper bound; taking it literally used to reject the page as malformed.
+  std::printf("\n-- live page, COUNT 24 / 16 records sent --\n");
+  uint8_t serial2[SERIAL_BCD_SIZE];
+  serial_to_bcd_le("023240275596", serial2);
+  uint8_t frame2[256];
+  const size_t len2 = unhex(SHORT_PAGE_HEX, frame2, sizeof(frame2));
+  ParsedResponse r2{};
+  const ParseResult pr2 = parse_response(frame2, len2, serial2, &r2);
+  std::printf("parse: %s, DI 0x%04X, count %u of %u announced, payload %u B\n", parse_result_to_string(pr2), r2.di,
+              r2.count, r2.announced_count, r2.payload_len);
+  check(pr2 == ParseResult::OK, "short page parses");
+  check(r2.di == DI_PARAMS, "DI is 0xF202");
+  check(r2.count == 16, "16 records decoded");
+  check(r2.announced_count == 24, "COUNT byte reported as announced_count");
+  check(r2.payload_len == 0x53, "DATA length is 0x53 = 83");
+  const ParsedItem *v2 = r2.find(0x15);
+  uint32_t v2_raw = 0;
+  check(v2 != nullptr && item_as_bcd(*v2, &v2_raw) && v2_raw == 2165, "last-but-one family still aligned (215... V)");
+  check(r2.find(0x22) != nullptr, "the final record, TAG 0x22, is present");
+  check(r2.find(0x28) == nullptr, "records the meter did not send are absent");
 
   std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202 PAGE DECODES CORRECTLY" : "FAILURES", fail);
   return fail ? 1 : 0;

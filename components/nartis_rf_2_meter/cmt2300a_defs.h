@@ -131,7 +131,7 @@ static constexpr float RX_CODE_HZ = 6.199f;
 /* ================================================================
  * Frequency-bank computation (CMOSTEK AN199).
  *
- * Every meter channel (435.5-451.7 MHz; see frequency_from_address_) lies in
+ * Every meter channel (435.5-451.7 MHz; see frequency_from_serial) lies in
  * the 420-510 MHz PLL band, so the divider / VCO-bank selection AND all modem
  * banks (incl. AFC_OVF_TH) are constant across channels - only FREQ_RX_N/K and
  * FREQ_TX_N/K change. Verified byte-for-byte against RFPDK exports at

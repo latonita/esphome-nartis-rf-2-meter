@@ -243,13 +243,7 @@ uint32_t frequency_from_serial(const char *digits12) {
     }
   }
   const uint32_t k = n3 % 24;
-  // Uniform 0.7 MHz step across the whole grid. There used to be a +100 kHz
-  // special case for k > 18; SPI captures of a real display disprove it. Three
-  // adjacent serials with the same frequency bank step FREQ_CHNL by exactly +8
-  // per k (k=17 -> 0x00, k=18 -> 0x08, k=19 -> 0x10) with FREQ_OFS constant, and
-  // a uniform channel step means a uniform frequency step. An extra 100 kHz at
-  // k=19 would have needed FREQ_CHNL ~17, not 16.
-  return 435500000u + k * 700000u;
+  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ + (k > CHANNEL_STEP_BREAK ? CHANNEL_STEP_EXTRA_HZ : 0u);
 }
 
 const uint8_t ENERGY_REQUEST_BODY[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
@@ -406,15 +400,19 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ParseResult::MALFORMED;  // need at least DI + COUNT
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
+    // COUNT is how many records the meter has, not how many it sent. A live
+    // DI 0xF202 page announces COUNT = 24 and then stops after 16 records
+    // (DATA length 83 = 3 + 16*5), ending on a valid checksum and a valid
+    // envelope CRC - the meter fits what it can and does not correct COUNT.
+    // So COUNT is only an upper bound; the record list ends where DATA does.
     const uint8_t count = payload[2];
-    if (count > MAX_ITEMS) {
-      return ParseResult::TOO_MANY_ITEMS;
-    }
+    out->announced_count = count;
 
     size_t pos = 3;
-    for (uint8_t i = 0; i < count; i++) {
-      if (pos >= data_len) {
-        return ParseResult::MALFORMED;
+    uint8_t i = 0;
+    for (; i < count && pos < data_len; i++) {
+      if (i >= MAX_ITEMS) {
+        return ParseResult::TOO_MANY_ITEMS;
       }
       const uint8_t tag = payload[pos++];
       TagInfo info{};
@@ -428,6 +426,9 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
         return ParseResult::UNKNOWN_TAG;
       }
       if (pos + info.width > data_len) {
+        // Cut mid-record. Unlike the short-by-whole-records case above this is
+        // not something a meter does deliberately, so it is a framing error.
+        out->count = i;
         return ParseResult::MALFORMED;
       }
       out->items[i].tag = tag;
@@ -435,7 +436,7 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       std::memcpy(out->items[i].raw, payload + pos, info.width);
       pos += info.width;
     }
-    out->count = count;
+    out->count = i;
     return ParseResult::OK;
   }
 
