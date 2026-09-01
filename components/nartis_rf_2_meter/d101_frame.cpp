@@ -41,9 +41,9 @@ bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_o
     return true;
   }
 
-  // DI 0xF202 is a larger page over the same TAG numbering, so the same table
-  // serves both.
-  if (di != DI_ENERGY && di != DI_PARAMS) {
+  // DI 0xF202 is a larger page over the same TAG numbering, and DI 0xF203 is the
+  // tail of that same list, so one table serves all three.
+  if (di != DI_ENERGY && di != DI_PARAMS && di != DI_PARAMS_CONT) {
     return false;
   }
 
@@ -153,12 +153,6 @@ bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_o
   return false;
 }
 
-bool tag_needs_params_page(uint8_t tag) {
-  // 0x14..0x28 instantaneous, 0x2A temperature, 0x2B LCD test. TAG 0x29 is the
-  // clock, which DI 0xF200 carries too.
-  return (tag >= 0x14 && tag <= 0x28) || tag == 0x2A || tag == 0x2B;
-}
-
 const char *parse_result_to_string(ParseResult r) {
   switch (r) {
     case ParseResult::OK:
@@ -246,7 +240,7 @@ uint32_t frequency_from_serial(const char *digits12) {
   return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ + (k > CHANNEL_STEP_BREAK ? CHANNEL_STEP_EXTRA_HZ : 0u);
 }
 
-const uint8_t ENERGY_REQUEST_BODY[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
+const uint8_t PAGE_REQUEST_BODY[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
 const uint8_t STATUS_REQUEST_BODY[1] = {0x00};
 
 size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di,
@@ -311,12 +305,14 @@ size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERI
 }
 
 size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di) {
-  // The two polls the display itself sends, with their captured bodies. Both are
+  // The polls the display itself sends, with their captured bodies. All are
   // constant; the meter answers with whatever its indication set holds.
-  // DI 0xF202 takes the same 6-byte body as DI 0xF200. With the 1-byte body it is
-  // silently dropped - not even an error response.
-  if (di == DI_ENERGY || di == DI_PARAMS) {
-    return build_read_request(out, cap, serial_le, di, ENERGY_REQUEST_BODY, sizeof(ENERGY_REQUEST_BODY));
+  // DI 0xF202 takes the same 6-byte body as DI 0xF200 - with the 1-byte body it is
+  // silently dropped, not even an error response - and DI 0xF203 is given the same
+  // one, since it selects nothing: which records it returns comes from the cursor
+  // the meter saved, not from the request.
+  if (di == DI_ENERGY || di == DI_PARAMS || di == DI_PARAMS_CONT) {
+    return build_read_request(out, cap, serial_le, di, PAGE_REQUEST_BODY, sizeof(PAGE_REQUEST_BODY));
   }
   if (di == DI_STATUS) {
     return build_read_request(out, cap, serial_le, di, STATUS_REQUEST_BODY, sizeof(STATUS_REQUEST_BODY));
@@ -330,6 +326,59 @@ static constexpr size_t MIN_ENV_LEN = D101_HDR_AFTER_LEN + DLT645_OVERHEAD;
 /// back a buffer starting exactly at LEN; a couple of slipped bytes at the head
 /// of a weak capture are common enough to be worth scanning for.
 static constexpr size_t MAX_START_SCAN = 3;
+
+namespace {
+
+/// Outcome of walking a {TAG, value} record stream.
+struct ItemWalk {
+  uint8_t count{0};                       ///< records written to `out`
+  size_t end{0};                          ///< payload offset just past the last one
+  ParseResult result{ParseResult::OK};    ///< why the walk stopped, if it stopped early
+  uint8_t unknown_tag{0};                 ///< valid when result == UNKNOWN_TAG
+  uint8_t unknown_offset{0};
+};
+
+/// Decode records from `payload[start .. payload_len)`, at most `max_records` of
+/// them, into `out` (which must hold MAX_ITEMS entries).
+///
+/// Records carry no length field, so a TAG of unknown width ends the walk: there
+/// is no way to find where the next record starts. `count` and `end` then describe
+/// how far it got, which is what the caller needs in order to log the rest.
+ItemWalk walk_items(uint16_t di, const uint8_t *payload, size_t payload_len, size_t start, size_t max_records,
+                    ParsedItem *out, const uint8_t *tag_width_overrides) {
+  ItemWalk w{};
+  w.end = start;
+  size_t pos = start;
+  while (w.count < max_records && pos < payload_len) {
+    if (w.count >= MAX_ITEMS) {
+      w.result = ParseResult::TOO_MANY_ITEMS;
+      return w;
+    }
+    const uint8_t tag = payload[pos];
+    TagInfo info{};
+    if (!tag_info(di, tag, &info, tag_width_overrides)) {
+      w.result = ParseResult::UNKNOWN_TAG;
+      w.unknown_tag = tag;
+      w.unknown_offset = static_cast<uint8_t>(pos);
+      return w;
+    }
+    if (pos + 1 + info.width > payload_len) {
+      // Cut mid-record. Unlike stopping short by whole records this is not
+      // something a meter does deliberately, so it is a framing error.
+      w.result = ParseResult::MALFORMED;
+      return w;
+    }
+    out[w.count].tag = tag;
+    out[w.count].len = info.width;
+    std::memcpy(out[w.count].raw, payload + pos + 1, info.width);
+    w.count++;
+    pos += 1 + info.width;
+    w.end = pos;
+  }
+  return w;
+}
+
+}  // namespace
 
 ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_le[SERIAL_BCD_SIZE],
                            ParsedResponse *out, const uint8_t *tag_width_overrides) {
@@ -396,47 +445,73 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ((f[8] & 0x80) != 0) ? ParseResult::ERROR_RESPONSE : ParseResult::NOT_RESPONSE;
     }
 
-    if (data_len < 3) {
-      return ParseResult::MALFORMED;  // need at least DI + COUNT
+    if (data_len < 2) {
+      return ParseResult::MALFORMED;  // need at least the echoed DI
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
-    // COUNT is how many records the meter has, not how many it sent. A live
-    // DI 0xF202 page announces COUNT = 24 and then stops after 16 records
-    // (DATA length 83 = 3 + 16*5), ending on a valid checksum and a valid
-    // envelope CRC - the meter fits what it can and does not correct COUNT.
-    // So COUNT is only an upper bound; the record list ends where DATA does.
-    const uint8_t count = payload[2];
-    out->announced_count = count;
 
-    size_t pos = 3;
-    uint8_t i = 0;
-    for (; i < count && pos < data_len; i++) {
-      if (i >= MAX_ITEMS) {
-        return ParseResult::TOO_MANY_ITEMS;
+    /* Records arrive in one of two shapes.
+     *
+     * A fresh page starts with a COUNT byte:  DI | COUNT | {TAG,value}...
+     * COUNT is how many records the meter *has*, not how many it sent: a live
+     * DI 0xF202 page announces 24 and then stops after 16 (DATA length 83 =
+     * 3 + 16*5), ending on a valid checksum and a valid envelope CRC. The meter
+     * fits what it can and does not correct COUNT, so COUNT is only an upper
+     * bound and the record list ends where DATA does.
+     *
+     * A continuation page has no COUNT byte at all:  DI | {TAG,value}...
+     * The list resumes from the cursor its DI 0xF202 left behind; with no cursor
+     * set DATA is just the echoed DI, which reads as zero records.
+     *
+     * The echoed DI says which shape to expect, but only probably - whether a
+     * resume echoes 0xF203 or the 0xF202 it continues has not been captured. What
+     * is certain is that a page stops on a record boundary, so the right reading
+     * consumes DATA exactly, and that is the tie-breaker: try the shape the DI
+     * implies, fall back to the other, and if neither lands on the last DATA byte
+     * report the expected shape's own failure, whose diagnostics are the ones a
+     * reader can act on.
+     */
+    const auto try_shape = [&](bool as_continuation) -> ItemWalk {
+      // A record is at least 2 bytes, so data_len is an upper bound that never
+      // truncates a real list - the MAX_ITEMS check inside the walk is what
+      // reports an over-long one.
+      if (as_continuation) {
+        return walk_items(out->di, payload, data_len, 2, data_len, out->items, tag_width_overrides);
       }
-      const uint8_t tag = payload[pos++];
-      TagInfo info{};
-      if (!tag_info(out->di, tag, &info, tag_width_overrides)) {
-        // No width => no way to find the next item, so everything after this
-        // point is unparseable. Abort and hand the caller enough context to work
-        // the width out by hand.
-        out->count = i;
-        out->unknown_tag = tag;
-        out->unknown_offset = static_cast<uint8_t>(pos - 1);
-        return ParseResult::UNKNOWN_TAG;
+      if (data_len < 3) {
+        return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};  // no room for a COUNT byte
       }
-      if (pos + info.width > data_len) {
-        // Cut mid-record. Unlike the short-by-whole-records case above this is
-        // not something a meter does deliberately, so it is a framing error.
-        out->count = i;
-        return ParseResult::MALFORMED;
+      return walk_items(out->di, payload, data_len, 3, payload[2], out->items, tag_width_overrides);
+    };
+    const auto fits = [&](const ItemWalk &w) { return w.result == ParseResult::OK && w.end == data_len; };
+
+    bool as_continuation = (out->di == DI_PARAMS_CONT);
+    ItemWalk walk = try_shape(as_continuation);
+    if (!fits(walk)) {
+      const ItemWalk alt = try_shape(!as_continuation);
+      if (fits(alt)) {
+        walk = alt;
+        as_continuation = !as_continuation;
+      } else {
+        walk = try_shape(as_continuation);  // re-run so out->items matches what we report
       }
-      out->items[i].tag = tag;
-      out->items[i].len = info.width;
-      std::memcpy(out->items[i].raw, payload + pos, info.width);
-      pos += info.width;
     }
-    out->count = i;
+
+    out->count = walk.count;
+    out->continuation = as_continuation;
+    out->announced_count = (as_continuation || data_len < 3) ? 0 : payload[2];
+    if (walk.result == ParseResult::UNKNOWN_TAG) {
+      out->unknown_tag = walk.unknown_tag;
+      out->unknown_offset = walk.unknown_offset;
+    }
+    if (walk.result != ParseResult::OK) {
+      return walk.result;
+    }
+    if (walk.end != data_len) {
+      // Every record read cleanly, yet bytes are left over: DATA holds a whole
+      // record neither shape accounted for, so a width above must be wrong.
+      return ParseResult::MALFORMED;
+    }
     return ParseResult::OK;
   }
 

@@ -40,6 +40,47 @@ static size_t unhex(const char *hex, uint8_t *out, size_t cap) {
   return n;
 }
 
+/// Wrap `data` (the de-offset application payload) in a DL/T 645 read response
+/// and a radio envelope, exactly as parse_response() expects to receive it: from
+/// the LEN byte onwards. Returns the length written.
+///
+/// This lives in the test rather than in d101_frame.cpp on purpose - the component
+/// has no business constructing frames the meter is supposed to send.
+static size_t build_response(uint8_t *out, size_t cap, const uint8_t serial[SERIAL_BCD_SIZE], const uint8_t *data,
+                             size_t data_len) {
+  const size_t env_len = D101_HDR_AFTER_LEN + DLT645_OVERHEAD + data_len;
+  if (out == nullptr || cap < env_len + 3) {
+    return 0;
+  }
+  size_t p = 0;
+  out[p++] = (uint8_t) env_len;
+  out[p++] = 0x00;
+  out[p++] = 0x01;
+  out[p++] = (uint8_t) (env_len ^ 1);  // HLEN
+
+  const size_t f645 = p;
+  out[p++] = DLT645_DELIM;
+  std::memcpy(out + p, serial, SERIAL_BCD_SIZE);
+  p += SERIAL_BCD_SIZE;
+  out[p++] = DLT645_DELIM;
+  out[p++] = DLT645_C_READ_RSP;
+  out[p++] = (uint8_t) data_len;
+  for (size_t i = 0; i < data_len; i++) {
+    out[p++] = (uint8_t) (data[i] + DLT645_DATA_OFFSET);
+  }
+  uint8_t cs = 0;
+  for (size_t i = f645; i < p; i++) {
+    cs = (uint8_t) (cs + out[i]);
+  }
+  out[p++] = cs;
+  out[p++] = DLT645_END;
+
+  const uint16_t crc = crc16_x25(out, env_len + 1);
+  out[p++] = (uint8_t) (crc & 0xFF);
+  out[p++] = (uint8_t) ((crc >> 8) & 0xFF);
+  return p;
+}
+
 struct Expect {
   uint8_t tag;
   uint8_t width;
@@ -155,6 +196,87 @@ int main() {
   check(r2.find(0x22) != nullptr, "the final record, TAG 0x22, is present");
   check(r2.find(0x28) == nullptr, "records the meter did not send are absent");
 
-  std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202 PAGE DECODES CORRECTLY" : "FAILURES", fail);
+  // --- DI 0xF203, the tail of that list ---------------------------------
+  //
+  // Not captured: this is the shape the meter firmware builds for a resume - the
+  // records stream out with no COUNT byte in front of them - assembled here so the
+  // parser is exercised against it. The records chosen are the eight the reference
+  // page announced but did not send (reactive power and the billing-period
+  // mirrors), each 1 + 4 bytes, so DATA is 2 + 8*5 = 42.
+  std::printf("\n-- DI 0xF203 continuation, no COUNT byte --\n");
+  {
+    static const uint8_t TAIL_TAGS[] = {0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33};
+    uint8_t data[2 + 8 * 5];
+    size_t n = 0;
+    data[n++] = 0x03;  // DI little-endian: 0xF203
+    data[n++] = 0xF2;
+    for (uint8_t tag : TAIL_TAGS) {
+      data[n++] = tag;
+      data[n++] = 0x11;
+      data[n++] = 0x00;
+      data[n++] = 0x00;
+      data[n++] = 0x00;
+    }
+    uint8_t frame3[256];
+    const size_t len3 = build_response(frame3, sizeof(frame3), serial, data, n);
+    ParsedResponse r3{};
+    const ParseResult pr3 = parse_response(frame3, len3, serial, &r3);
+    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, continuation %d, payload %u B\n",
+                parse_result_to_string(pr3), r3.di, r3.count, r3.announced_count, (int) r3.continuation,
+                r3.payload_len);
+    check(pr3 == ParseResult::OK, "continuation page parses");
+    check(r3.di == DI_PARAMS_CONT, "DI is 0xF203");
+    check(r3.continuation, "read as a continuation - no COUNT byte");
+    check(r3.count == 8, "all 8 tail records decoded");
+    check(r3.announced_count == 0, "no COUNT byte to announce anything");
+    check(r3.find(0x24) != nullptr && r3.find(0x33) != nullptr, "first and last tail records present");
+  }
+
+  // With no cursor set the meter answers with the echoed DI and nothing else. That
+  // is a valid response holding zero records, not a malformed frame.
+  std::printf("\n-- DI 0xF203 with nothing pending --\n");
+  {
+    const uint8_t data[2] = {0x03, 0xF2};
+    uint8_t frame4[64];
+    const size_t len4 = build_response(frame4, sizeof(frame4), serial, data, sizeof(data));
+    ParsedResponse r4{};
+    const ParseResult pr4 = parse_response(frame4, len4, serial, &r4);
+    std::printf("parse: %s, DI 0x%04X, count %u\n", parse_result_to_string(pr4), r4.di, r4.count);
+    check(pr4 == ParseResult::OK, "an empty tail parses");
+    check(r4.di == DI_PARAMS_CONT, "DI is 0xF203");
+    check(r4.count == 0, "zero records");
+  }
+
+  // The fallback in the other direction: should a resume turn out to carry a COUNT
+  // byte after all, the exact-fit tie-breaker has to find it rather than read the
+  // COUNT as a TAG. Same eight records, this time with COUNT = 8 in front.
+  std::printf("\n-- DI 0xF203 that does carry a COUNT byte --\n");
+  {
+    static const uint8_t TAIL_TAGS[] = {0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33};
+    uint8_t data[3 + 8 * 5];
+    size_t n = 0;
+    data[n++] = 0x03;
+    data[n++] = 0xF2;
+    data[n++] = 8;  // COUNT
+    for (uint8_t tag : TAIL_TAGS) {
+      data[n++] = tag;
+      data[n++] = 0x11;
+      data[n++] = 0x00;
+      data[n++] = 0x00;
+      data[n++] = 0x00;
+    }
+    uint8_t frame5[256];
+    const size_t len5 = build_response(frame5, sizeof(frame5), serial, data, n);
+    ParsedResponse r5{};
+    const ParseResult pr5 = parse_response(frame5, len5, serial, &r5);
+    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, continuation %d\n", parse_result_to_string(pr5),
+                r5.di, r5.count, r5.announced_count, (int) r5.continuation);
+    check(pr5 == ParseResult::OK, "the COUNT-byte form parses too");
+    check(!r5.continuation, "recognised as a counted page, not a continuation");
+    check(r5.count == 8, "all 8 records decoded");
+    check(r5.find(0x24) != nullptr && r5.find(0x33) != nullptr, "records are aligned, so COUNT was not read as a TAG");
+  }
+
+  std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202/0xF203 PAGES DECODE CORRECTLY" : "FAILURES", fail);
   return fail ? 1 : 0;
 }

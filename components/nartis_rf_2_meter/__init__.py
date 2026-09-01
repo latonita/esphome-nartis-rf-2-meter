@@ -5,10 +5,16 @@ a CMT2300A 443 MHz radio by emulating the НАРТИС-Д101-2 display. The link
 a DL/T 645-1997 frame with no encryption, no session and no password, so this
 component talks to the meter on its own - no UART bridge and no dlms_cosem.
 
-Only a fixed set of values is available: the meter answers two constant requests
+Only a fixed set of values is available: the meter answers four constant requests
 and returns whatever its configured indication set contains. Entities therefore
-select a value by its 1-byte item TAG (DI 0xF200) or by a field of the status
-block (DI 0xF201) - there is no way to ask for something else.
+select a value by its 1-byte item TAG or by a field of the status block
+(DI 0xF201) - there is no way to ask for something else.
+
+Every cycle reads all four data identifiers: DI 0xF200 (energy registers and
+clock), DI 0xF201 (status), DI 0xF202 (the same registers plus the instantaneous
+values) and DI 0xF203 (the tail of the DI 0xF202 record list, which announces more
+records than one frame can carry). The three TAG-bearing pages are merged, so a
+`tag` entity does not care which one carried its value.
 """
 
 from esphome import pins
@@ -35,7 +41,6 @@ CONF_RF_RX_TIMEOUT = "rf_rx_timeout"
 CONF_RF_RETRIES = "rf_retries"
 CONF_RX_CENTER_OFFSET = "rx_center_offset"
 
-CONF_DATA_PAGE = "data_page"
 CONF_PROBE = "probe"
 CONF_DI = "di"
 CONF_BODY = "body"
@@ -103,7 +108,7 @@ TAG_MAX_WIDTH = 9
 
 
 def validate_tag(value):
-    """An item TAG of the DI 0xF200 response (6-bit index, 0x00-0x3F)."""
+    """An item TAG of a data-page response (6-bit index, 0x00-0x3F)."""
     tag = cv.hex_int(value)
     if not TAG_MIN <= tag <= TAG_MAX:
         raise cv.Invalid(
@@ -137,32 +142,16 @@ def validate_tag_entity(config):
     )
 
 
-# Data identifiers the display itself polls, with the request body each one
-# carries. Note the body length is per-DI, not fixed - 6 bytes for 0xF200, 1 byte
-# for 0xF201 - so the body of an unknown DI has to be guessed.
-KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6}
+# Data identifiers the component polls every cycle, with the request body each one
+# carries. Note the body length is per-DI, not fixed - 6 bytes for the pages, 1
+# byte for 0xF201 - so the body of an unknown DI has to be guessed.
+#
+#   0xF200  energy registers + clock
+#   0xF201  status block
+#   0xF202  the same registers plus voltages, currents, power, frequency
+#   0xF203  the tail of the 0xF202 record list, resumed from the meter's cursor
+KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6}
 
-# Pages the TAG entities can be read from.
-#   0xF200  energy registers + clock                      answered by every meter
-#   0xF202  the same plus voltages, currents, power, freq  a superset, where present
-DATA_PAGES = {0xF200: "energy + clock", 0xF202: "energy + instantaneous"}
-# Sentinel for "decide in setup() from the TAGs actually configured".
-DATA_PAGE_AUTO = 0
-
-
-def validate_data_page(value):
-    """`auto`, or one of the pages known to exist."""
-    if isinstance(value, str) and value.strip().lower() == "auto":
-        return DATA_PAGE_AUTO
-    di = cv.hex_int(value)
-    if di not in DATA_PAGES:
-        known = ", ".join(f"0x{d:04X} ({what})" for d, what in DATA_PAGES.items())
-        raise cv.Invalid(
-            f"data_page must be `auto` or one of {known}; got 0x{di:04X}. Only those "
-            f"two data identifiers are known to return a parameter page - use `probe:` "
-            f"to test another before relying on it."
-        )
-    return di
 MAX_REQUEST_BODY = 8
 
 PROBE_SCHEMA = cv.Schema(
@@ -222,18 +211,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_FREQUENCY): cv.All(
             cv.frequency, cv.Range(min=430000000, max=460000000)
         ),
-        # Pause between the energy and the status exchange.
-        # Which page the `tag` entities are read from.
-        #
-        # `auto` (the default) picks it from the entities you configured: DI 0xF202
-        # if any TAG only exists there - the instantaneous values - and DI 0xF200
-        # otherwise. Only ever one page: 0xF202 also carries the energy registers
-        # and the clock, so a mixed set never needs both, and polling both would
-        # double the airtime for nothing.
-        #
-        # Set it explicitly to force one, e.g. if a meter turns out to answer
-        # 0xF200 but not 0xF202. `probe:` is the way to find out which it answers.
-        cv.Optional(CONF_DATA_PAGE, default="auto"): validate_data_page,
+        # Pause between exchanges. It also separates DI 0xF202 from the DI 0xF203
+        # that continues it, and the meter's resume cursor is what has to survive
+        # that pause - so if the tail comes back empty on a working link, a shorter
+        # gap is the first thing to try.
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,
@@ -286,7 +267,6 @@ async def to_code(config):
     if CONF_FREQUENCY in config:
         cg.add(var.set_frequency_override(int(config[CONF_FREQUENCY])))
 
-    cg.add(var.set_data_page(config[CONF_DATA_PAGE]))
     cg.add(var.set_request_gap_ms(config[CONF_REQUEST_GAP]))
     cg.add(var.set_rf_rx_timeout_ms(config[CONF_RF_RX_TIMEOUT]))
     cg.add(var.set_rf_retries(config[CONF_RF_RETRIES]))

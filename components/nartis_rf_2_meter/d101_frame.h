@@ -4,7 +4,7 @@
  * This is the display link: the same 443 MHz CMT2300A PHY the DLMS-HDLC bridge
  * uses, but carrying a DL/T 645-1997 frame directly instead of a type-0x5A
  * envelope. Nothing is encrypted, there is no session, no password and no
- * sequence number - the two request frames are constant for a given meter.
+ * sequence number - the four request frames are constant for a given meter.
  *
  * Three nested layers:
  *
@@ -63,22 +63,42 @@ static constexpr uint16_t DI_STATUS = 0xF201;  // status block
 /// Takes the same 6-byte body as DI 0xF200 - with the 1-byte body of DI 0xF201 it
 /// is silently dropped, no error response at all.
 static constexpr uint16_t DI_PARAMS = 0xF202;
+/// Continuation of the DI 0xF202 record list.
+///
+/// The instantaneous page announces more records than one DL/T 645 frame can
+/// carry - COUNT 24 against the 16 that fit - and the meter keeps a cursor at the
+/// point where it ran out. DI 0xF203 asks for the same list from that cursor and
+/// returns the tail. Two consequences:
+///
+///   * the cursor is shared state. DI 0xF200 and DI 0xF202 both restart their
+///     list and clear it, so DI 0xF203 has to follow its DI 0xF202 immediately -
+///     anything in between makes it answer as if nothing were pending.
+///   * a resumed frame carries no COUNT byte: the records follow the echoed DI
+///     directly. With no cursor set the meter answers with the DI and nothing
+///     else, which parses as a valid response holding zero records.
+static constexpr uint16_t DI_PARAMS_CONT = 0xF203;
 
 /// The request body that follows the DI. Its length is per-DI, not fixed: the
-/// energy poll carries six bytes, the status poll one. Both are constant in every
-/// captured request - there is no parameter selector in either.
-extern const uint8_t ENERGY_REQUEST_BODY[6];
+/// page polls carry six bytes, the status poll one. Both are constant in every
+/// captured request - there is no parameter selector in either. In particular the
+/// DI 0xF203 cursor is state the meter keeps for itself; nothing in the request
+/// says where to resume from, which is why the ordering rule above matters.
+/// Body of the three page polls: DI 0xF200, DI 0xF202 and DI 0xF203.
+extern const uint8_t PAGE_REQUEST_BODY[6];
 extern const uint8_t STATUS_REQUEST_BODY[1];
 /// Longest request body a probe may carry.
 static constexpr size_t MAX_REQUEST_BODY = 8;
 
 /// Widest item value we can hold (the 9-byte status blob).
 static constexpr size_t MAX_ITEM_WIDTH = 9;
-/// Items in one response. The DI 0xF200 automatic cycle sends 4, but the DI
-/// 0xF202 page sends 15, so this is sized from the payload instead of from what
-/// a particular page happens to use: the smallest possible item is 3 bytes (TAG
-/// plus a 2-byte value), so a MAX_PAYLOAD-byte payload cannot hold more than
+/// Items in ONE response. The DI 0xF200 automatic cycle sends 4 and the DI 0xF202
+/// page 15-16, so this is sized from the payload instead of from what a particular
+/// page happens to use: the smallest possible item is 3 bytes (TAG plus a 2-byte
+/// value), so a MAX_PAYLOAD-byte payload cannot hold more than
 /// (MAX_PAYLOAD - 3) / 3 of them.
+///
+/// This is per-response, not per-cycle: the DI 0xF202 + DI 0xF203 pair delivers
+/// one list across two frames and the component merges them itself.
 static constexpr size_t MAX_ITEMS = 32;
 /// Longest request we build (the energy poll is 28 bytes on air).
 static constexpr size_t MAX_REQUEST_FRAME_SIZE = 40;
@@ -139,16 +159,6 @@ const char *tag_confidence_to_string(TagConfidence c);
 /// width there is no way to find the next item.
 bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides = nullptr);
 
-/// True when a TAG can only come from the DI 0xF202 page: the instantaneous
-/// values and temperature. The cumulative energy registers and the clock appear
-/// on DI 0xF200 as well, so they do not force the larger page.
-///
-/// This is a statement about what the two pages *mean*, not about any particular
-/// meter's configuration - which page actually carries a given TAG is set with the
-/// vendor tool. A TAG missing from whichever page is polled just leaves its entity
-/// unavailable and says so in the log.
-bool tag_needs_params_page(uint8_t tag);
-
 struct ParsedItem {
   uint8_t tag{0};
   uint8_t len{0};
@@ -171,8 +181,12 @@ struct ParsedResponse {
   uint8_t count{0};
   /// The COUNT byte as received. Meters announce the full record set and then
   /// send only what fits the frame, so this can exceed `count`; a difference is
-  /// normal truncation, not an error.
+  /// normal truncation, not an error, and means a DI 0xF203 read will return the
+  /// rest. Zero on a continuation frame, which carries no COUNT byte.
   uint8_t announced_count{0};
+  /// True when the records were read as a continuation - no COUNT byte, the list
+  /// resuming from the meter's cursor. Set for a DI 0xF203 reply.
+  bool continuation{false};
   ParsedItem items[MAX_ITEMS]{};
 
   /// The application payload with the +0x33 transmission offset removed, kept
@@ -250,8 +264,9 @@ uint32_t frequency_from_serial(const char *digits12);
  * Build / parse
  * ================================================================ */
 
-/// Build the complete on-air request frame for `di` (DI_ENERGY or DI_STATUS).
-/// Returns the number of bytes written, or 0 on error.
+/// Build the complete on-air request frame for `di` - one of DI_ENERGY,
+/// DI_STATUS, DI_PARAMS or DI_PARAMS_CONT. Returns the number of bytes written,
+/// or 0 on error.
 ///
 /// Header byte 5 is HLEN = LEN ^ 1. The two candidate rules, LEN ^ 1 and
 /// LEN - 1, agree for odd LEN and differ for even, and every even-length frame

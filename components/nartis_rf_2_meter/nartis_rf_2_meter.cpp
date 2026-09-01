@@ -5,6 +5,7 @@
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 
 namespace esphome::nartis_rf_2_meter {
 
@@ -46,8 +47,6 @@ void NartisRf2MeterComponent::setup() {
     ESP_LOGI(TAG, "Only the last_read_ok entity is configured - polling the status page to exercise the link");
   }
 
-  this->resolve_data_page_();
-
   if (!this->need_data_ && !this->need_status_) {
     ESP_LOGW(TAG, "No sensors configured - nothing will be polled");
   }
@@ -56,58 +55,81 @@ void NartisRf2MeterComponent::setup() {
   this->set_state_(State::IDLE);
 }
 
-void NartisRf2MeterComponent::resolve_data_page_() {
-  // Does anything configured live only on the larger page?
-  const SensorEntry *reason = nullptr;
-  for (const auto &e : this->entries_) {
-    if (!e.reads_status() && tag_needs_params_page(e.tag)) {
-      reason = &e;
-      break;
-    }
-  }
-
-  if (this->data_page_ != DATA_PAGE_AUTO) {
-    // Explicit choice: honour it, but say so if it asks for more than is needed.
-    if (this->data_page_ == DI_PARAMS && reason == nullptr && this->need_data_) {
-      ESP_LOGI(TAG,
-               "Data page DI 0x%04X is configured, but no TAG needs it - DI 0x%04X would "
-               "be a shorter exchange",
-               DI_PARAMS, DI_ENERGY);
-    }
-    return;
-  }
-
-  // DI 0xF202 is a superset of DI 0xF200 - it carries the energy registers and
-  // the clock as well - so a mixed set never needs both pages polled. Ask for the
-  // larger page only when something on it is actually wanted.
-  this->data_page_ = (reason != nullptr) ? DI_PARAMS : DI_ENERGY;
-  this->data_page_auto_ = true;
-  if (reason != nullptr) {
-    ESP_LOGI(TAG, "Data page: DI 0x%04X, chosen because TAG 0x%02X is only on that page", this->data_page_,
-             reason->tag);
-  } else {
-    ESP_LOGI(TAG, "Data page: DI 0x%04X, no configured TAG needs the larger page", this->data_page_);
+uint8_t NartisRf2MeterComponent::page_bit_of_(StepKind kind) {
+  switch (kind) {
+    case StepKind::ENERGY:
+      return PAGE_BIT_ENERGY;
+    case StepKind::PARAMS:
+      return PAGE_BIT_PARAMS;
+    case StepKind::PARAMS_CONT:
+      return PAGE_BIT_PARAMS_CONT;
+    default:
+      return 0;  // the status poll and the probes are not part of the merged set
   }
 }
 
-void NartisRf2MeterComponent::maybe_escalate_data_page_() {
-  // Which TAGs a page actually carries is set with the vendor tool, so the
-  // range-based choice in resolve_data_page_() can be too optimistic: on the
-  // reference meter the DI 0xF200 page holds only TAGs 0x00-0x02 and 0x29, so a
-  // cumulative register such as export energy 0x05 is absent from it even though
-  // nothing about the TAG says it should be. Rather than leave those entities
-  // permanently unavailable, move up to the superset page once and stay there.
-  //
-  // Upwards only, and only for an auto-selected page, so this cannot oscillate -
-  // a TAG the meter never sends at all is simply missing on 0xF202 too.
-  if (!this->data_page_auto_ || this->data_page_ != DI_ENERGY || !this->data_ok_ || this->missing_tags_ == 0) {
+void NartisRf2MeterComponent::merge_page_(const ParsedResponse &resp) {
+  for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
+    const ParsedItem &item = resp.items[i];
+    const ParsedItem *seen = this->find_merged_(item.tag);
+    if (seen != nullptr) {
+      // DI 0xF202 repeats what DI 0xF200 carried, so duplicates are expected and
+      // the first copy is kept. They have to agree, though: a disagreement means
+      // one of the two decodes is wrong, which is worth saying out loud.
+      if (seen->len != item.len || std::memcmp(seen->raw, item.raw, item.len) != 0) {
+        ESP_LOGW(TAG, "TAG 0x%02X differs between pages: kept %s, DI 0x%04X sent %s", item.tag,
+                 format_hex_pretty(seen->raw, seen->len).c_str(), resp.di,
+                 format_hex_pretty(item.raw, item.len).c_str());
+      }
+      continue;
+    }
+    if (this->merged_count_ >= MAX_MERGED_ITEMS) {
+      // Unreachable for 6-bit TAGs, since duplicates are folded above and there
+      // are only 64 of them. Bounded anyway rather than trusted.
+      ESP_LOGE(TAG, "More than %u distinct TAGs in one cycle - TAG 0x%02X dropped",
+               static_cast<unsigned>(MAX_MERGED_ITEMS), item.tag);
+      return;
+    }
+    this->merged_[this->merged_count_++] = item;
+  }
+}
+
+const ParsedItem *NartisRf2MeterComponent::find_merged_(uint8_t tag) const {
+  for (uint8_t i = 0; i < this->merged_count_; i++) {
+    if (this->merged_[i].tag == tag) {
+      return &this->merged_[i];
+    }
+  }
+  return nullptr;
+}
+
+void NartisRf2MeterComponent::report_silent_pages_() {
+  // Every cycle asks for all three TAG pages. A meter configured without one of
+  // them answers nothing at all to it, which for a cycle or two looks exactly like
+  // a bad link - so wait a few, then say it once.
+  if (this->warned_silent_pages_ || this->cycles_ < PAGE_SILENT_WARN_CYCLES) {
     return;
   }
-  ESP_LOGW(TAG,
-           "%u configured TAG(s) are not on the DI 0x%04X page - switching to DI 0x%04X, "
-           "which carries the same registers plus more",
-           this->missing_tags_, DI_ENERGY, DI_PARAMS);
-  this->data_page_ = DI_PARAMS;
+  const uint8_t silent = static_cast<uint8_t>(this->pages_polled_ & ~this->pages_seen_);
+  if (silent == 0) {
+    return;
+  }
+  this->warned_silent_pages_ = true;
+
+  struct PageName {
+    uint8_t bit;
+    uint16_t di;
+  };
+  static const PageName PAGES[] = {
+      {PAGE_BIT_ENERGY, DI_ENERGY}, {PAGE_BIT_PARAMS, DI_PARAMS}, {PAGE_BIT_PARAMS_CONT, DI_PARAMS_CONT}};
+  for (const PageName &page : PAGES) {
+    if ((silent & page.bit) != 0) {
+      ESP_LOGW(TAG,
+               "DI 0x%04X has not answered once in %" PRIu32 " cycle(s) - most likely this meter does not "
+               "implement it. It still costs one exchange per cycle",
+               page.di, this->cycles_);
+    }
+  }
 }
 
 void NartisRf2MeterComponent::dump_config() {
@@ -119,10 +141,7 @@ void NartisRf2MeterComponent::dump_config() {
                 this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
   ESP_LOGCONFIG(TAG, "  RX timeout: %" PRIu32 " ms, retries: %u, request gap: %" PRIu32 " ms", this->rf_rx_timeout_ms_,
                 this->rf_retries_, this->request_gap_ms_);
-  ESP_LOGCONFIG(TAG, "  Data page: DI 0x%04X%s", this->data_page_,
-                (this->data_page_ == DI_PARAMS) ? " (energy + instantaneous)" : " (energy + clock)");
-  ESP_LOGCONFIG(TAG, "  Instantaneous values: %s", YESNO(this->data_page_ == DI_PARAMS));
-  ESP_LOGCONFIG(TAG, "  Polling: data %s, status %s", YESNO(this->need_data_), YESNO(this->need_status_));
+  ESP_LOGCONFIG(TAG, "  Polling: data pages %s, status %s", YESNO(this->need_data_), YESNO(this->need_status_));
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
   LOG_PIN("  SDIO pin: ", this->pin_sdio_);
   LOG_PIN("  SCLK pin: ", this->pin_sclk_);
@@ -134,7 +153,7 @@ void NartisRf2MeterComponent::dump_config() {
   // Print the frames we will actually put on the air, so they can be compared
   // against a capture without having to catch a VERBOSE log line.
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> frame{};
-  for (const uint16_t di : {this->data_page_, DI_STATUS}) {
+  for (const uint16_t di : {DI_ENERGY, DI_STATUS, DI_PARAMS, DI_PARAMS_CONT}) {
     const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, di);
     if (n == 0) {
       ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: FAILED TO BUILD", di);
@@ -225,20 +244,32 @@ void NartisRf2MeterComponent::update() {
 void NartisRf2MeterComponent::start_cycle_() {
   this->cycles_++;
   this->cycle_start_ms_ = millis();
-  this->data_ok_ = false;
+  this->merged_count_ = 0;
+  this->energy_ok_ = false;
   this->status_ok_ = false;
+  this->params_ok_ = false;
+  this->params_cont_ok_ = false;
+  this->params_complete_ = false;
   this->attempt_ = 0;
-  this->missing_tags_ = 0;
 
   // Build this cycle's exchange list. Capability-gated: an exchange nobody
   // consumes is not worth waking the radio for.
+  //
+  // The order is not free. DI 0xF203 resumes the DI 0xF202 list from a cursor the
+  // meter holds, and DI 0xF200 and DI 0xF202 both reset it, so the continuation
+  // has to sit immediately after its DI 0xF202 - the status poll and the probes go
+  // either side of the pair, never between them.
   this->step_count_ = 0;
   this->step_idx_ = 0;
   if (this->need_data_) {
-    this->steps_[this->step_count_++] = Step{StepKind::DATA, 0};
+    this->steps_[this->step_count_++] = Step{StepKind::ENERGY, 0};
   }
   if (this->need_status_) {
     this->steps_[this->step_count_++] = Step{StepKind::STATUS, 0};
+  }
+  if (this->need_data_) {
+    this->steps_[this->step_count_++] = Step{StepKind::PARAMS, 0};
+    this->steps_[this->step_count_++] = Step{StepKind::PARAMS_CONT, 0};
   }
   for (uint8_t i = 0; i < this->probe_count_; i++) {
     this->steps_[this->step_count_++] = Step{StepKind::PROBE, i};
@@ -252,10 +283,14 @@ void NartisRf2MeterComponent::start_cycle_() {
 uint16_t NartisRf2MeterComponent::current_di_() const {
   const Step &step = this->steps_[this->step_idx_];
   switch (step.kind) {
-    case StepKind::DATA:
-      return this->data_page_;
+    case StepKind::ENERGY:
+      return DI_ENERGY;
     case StepKind::STATUS:
       return DI_STATUS;
+    case StepKind::PARAMS:
+      return DI_PARAMS;
+    case StepKind::PARAMS_CONT:
+      return DI_PARAMS_CONT;
     case StepKind::PROBE:
       return this->probes_[step.probe_idx].di;
     default:
@@ -317,6 +352,7 @@ bool NartisRf2MeterComponent::send_request_() {
     ESP_LOGE(TAG, "Failed to build request for DI 0x%04X", di);
     return false;
   }
+  this->pages_polled_ |= page_bit_of_(step.kind);
 
   // Logged at DEBUG alongside the RX dump, so a log excerpt always shows the
   // complete exchange - what we asked and what came back.
@@ -389,21 +425,60 @@ void NartisRf2MeterComponent::handle_wait_() {
     const ParseResult r = parse_response(this->rx_buf_.data(), this->rx_len_, this->serial_le_, &resp,
                                          this->tag_width_);
 
-    if (r == ParseResult::OK && resp.di == di) {
+    // A DI 0xF203 reply may echo either its own data identifier or the DI 0xF202
+    // list it continues - it has never been captured, and both are this exchange
+    // answering.
+    const bool di_matches = (resp.di == di) || (step.kind == StepKind::PARAMS_CONT && resp.di == DI_PARAMS);
+
+    if (r == ParseResult::OK && di_matches) {
       if (is_probe) {
         // Nothing consumes a probe; the log is the whole point.
         ESP_LOGI(TAG, "PROBE DI 0x%04X ANSWERED: %u item(s)", di, resp.count);
         this->log_response_(di, resp);
-      } else if (step.kind == StepKind::DATA) {
-        this->data_ = resp;
-        this->data_ok_ = true;
-        ESP_LOGV(TAG, "DI 0x%04X: %u item(s), rssi %d dBm", di, resp.count, this->last_rssi_dbm_);
-        this->log_response_(di, resp);
       } else {
-        this->status_ = resp;
-        this->status_ok_ = true;
         ESP_LOGV(TAG, "DI 0x%04X: %u item(s), rssi %d dBm", di, resp.count, this->last_rssi_dbm_);
         this->log_response_(di, resp);
+        this->pages_seen_ |= page_bit_of_(step.kind);
+        switch (step.kind) {
+          case StepKind::STATUS:
+            this->status_ = resp;
+            this->status_ok_ = true;
+            break;
+          case StepKind::ENERGY:
+            this->energy_ok_ = true;
+            this->merge_page_(resp);
+            break;
+          case StepKind::PARAMS:
+            this->params_ok_ = true;
+            this->merge_page_(resp);
+            // COUNT is what the meter holds; the frame carries what fits. Ask
+            // DI 0xF203 for a tail only when there is one to fetch.
+            this->params_complete_ = (resp.announced_count <= resp.count);
+            if (this->params_complete_) {
+              ESP_LOGV(TAG, "DI 0x%04X delivered all %u announced record(s) - skipping DI 0x%04X", DI_PARAMS,
+                       resp.announced_count, DI_PARAMS_CONT);
+            }
+            break;
+          case StepKind::PARAMS_CONT:
+            this->params_cont_ok_ = true;
+            if (!resp.continuation) {
+              // parse_response() fell back to the COUNT shape, so the tail is not
+              // framed the way the firmware read suggested. Either way the widths
+              // had to line up for it to parse at all, so this is a note, not a
+              // fault.
+              ESP_LOGD(TAG, "DI 0x%04X reply carries a COUNT byte after all (%u announced)", di,
+                       resp.announced_count);
+            }
+            if (resp.count == 0) {
+              // Nothing was pending: the cursor got cleared before we asked, or the
+              // meter had already sent its whole list.
+              ESP_LOGD(TAG, "DI 0x%04X returned an empty tail", di);
+            }
+            this->merge_page_(resp);
+            break;
+          default:
+            break;
+        }
       }
       this->finish_exchange_();
       return;
@@ -470,11 +545,18 @@ void NartisRf2MeterComponent::retry_or_finish_() {
   this->finish_exchange_();
 }
 
+bool NartisRf2MeterComponent::skip_step_(const Step &step) const {
+  return step.kind == StepKind::PARAMS_CONT && this->params_complete_;
+}
+
 void NartisRf2MeterComponent::finish_exchange_() {
   this->hal_.go_standby();
   this->rx_len_ = 0;
 
   this->step_idx_++;
+  while (this->step_idx_ < this->step_count_ && this->skip_step_(this->steps_[this->step_idx_])) {
+    this->step_idx_++;
+  }
   if (this->step_idx_ < this->step_count_) {
     this->set_state_(State::GAP);
     return;
@@ -483,7 +565,6 @@ void NartisRf2MeterComponent::finish_exchange_() {
 }
 
 void NartisRf2MeterComponent::handle_publish_() {
-  this->missing_tags_ = 0;
   for (const auto &e : this->entries_) {
     if (e.reads_status()) {
       this->publish_from_status_(e);
@@ -495,10 +576,10 @@ void NartisRf2MeterComponent::handle_publish_() {
   // Free self-check: the sum register must equal the two tariff registers. This
   // held on every response in the reference capture, so a mismatch means the
   // decode is wrong rather than the meter being odd.
-  if (this->data_ok_) {
-    const ParsedItem *total = this->data_.find(0x00);
-    const ParsedItem *t1 = this->data_.find(0x01);
-    const ParsedItem *t2 = this->data_.find(0x02);
+  if (this->merged_count_ > 0) {
+    const ParsedItem *total = this->find_merged_(0x00);
+    const ParsedItem *t1 = this->find_merged_(0x01);
+    const ParsedItem *t2 = this->find_merged_(0x02);
     if (total != nullptr && t1 != nullptr && t2 != nullptr) {
       const uint32_t sum = item_as_u32(*t1) + item_as_u32(*t2);
       if (item_as_u32(*total) != sum) {
@@ -508,17 +589,26 @@ void NartisRf2MeterComponent::handle_publish_() {
     }
   }
 
-  this->maybe_escalate_data_page_();
+  this->report_silent_pages_();
 
-  ESP_LOGD(TAG, "Cycle %" PRIu32 " finished in %" PRIu32 " ms (data %s, status %s)", this->cycles_,
-           millis() - this->cycle_start_ms_, YESNO(this->data_ok_), YESNO(this->status_ok_));
+  ESP_LOGD(TAG,
+           "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); F200 %s, F201 %s, F202 %s, F203 %s)",
+           this->cycles_, millis() - this->cycle_start_ms_, this->merged_count_, YESNO(this->energy_ok_),
+           YESNO(this->status_ok_), YESNO(this->params_ok_),
+           this->params_complete_ ? "skipped" : YESNO(this->params_cont_ok_));
   ESP_LOGV(TAG, "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", retries %" PRIu32 ", give-ups %" PRIu32,
            this->no_reply_count_, this->bad_frame_count_, this->retry_count_, this->giveup_count_);
 
   // A cycle counts as successful only if every exchange it needed came back. A
   // partial cycle is reported as a failure on purpose: it left some entity holding
   // a stale value, which is the thing this entity exists to expose.
-  this->publish_cycle_outcome_((!this->need_data_ || this->data_ok_) &&
+  //
+  // "Needed" is per-kind, not per-page. DI 0xF202 is a superset of DI 0xF200, so a
+  // meter that implements only one of them is fully read by whichever answers, and
+  // demanding both would peg this entity to false forever. The DI 0xF203 tail is
+  // not required either: it is skipped when nothing is pending, and an empty tail
+  // is a valid answer.
+  this->publish_cycle_outcome_((!this->need_data_ || this->energy_ok_ || this->params_ok_) &&
                                (!this->need_status_ || this->status_ok_));
 }
 
@@ -641,21 +731,22 @@ void NartisRf2MeterComponent::warn_unconfirmed_tag_once_(uint8_t tag, TagConfide
 }
 
 void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
-  if (!this->data_ok_) {
+  if (this->merged_count_ == 0) {
     return;  // nothing arrived this cycle; leave the entity at its previous state
   }
 
-  const ParsedItem *item = this->data_.find(e.tag);
+  const ParsedItem *item = this->find_merged_(e.tag);
   if (item == nullptr) {
-    ESP_LOGD(TAG, "TAG 0x%02X is not on the DI 0x%04X page", e.tag, this->data_page_);
-    if (this->missing_tags_ < 0xFF) {
-      this->missing_tags_++;
-    }
+    // No longer a page-selection question - all three were asked for, so this TAG
+    // is simply not in the meter's indication set.
+    ESP_LOGD(TAG, "TAG 0x%02X is not in this meter's indication set", e.tag);
     return;
   }
 
   TagInfo info{};
-  if (!tag_info(this->data_page_, e.tag, &info, this->tag_width_)) {
+  // Any of the three pages resolves the same table, so the DI here only picks the
+  // TAG-page family rather than a specific page.
+  if (!tag_info(DI_PARAMS, e.tag, &info, this->tag_width_)) {
     return;  // cannot happen: the parser would have aborted on an unknown TAG
   }
   if (info.conf != TagConfidence::OBSERVED) {

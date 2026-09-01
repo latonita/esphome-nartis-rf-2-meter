@@ -37,14 +37,14 @@ nartis_rf_2_meter:
   update_interval: 300s
   # Optional, shown with their defaults:
   # frequency: 443.9MHz     # default: derived from `address`
-  # data_page: auto         # auto | 0xF200 | 0xF202
-  # request_gap: 500ms
-  # rf_rx_timeout: 1500ms
+  # request_gap: 500ms      # also separates DI 0xF202 from its DI 0xF203 tail
+  # rf_rx_timeout: 1800ms
   # rf_retries: 2
   # rx_center_offset: 758
 
 # Values arrive raw, so each entity states its own scaling with a `multiply` filter.
-# A TAG your meter's page does not carry simply stays unavailable.
+# Every cycle reads DI 0xF200, 0xF201, 0xF202 and 0xF203 and merges them, so a TAG
+# stays unavailable only if the meter's indication set has no such parameter.
 sensor:
   # Active energy, import (A+)
   - platform: nartis_rf_2_meter
