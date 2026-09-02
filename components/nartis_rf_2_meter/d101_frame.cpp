@@ -74,8 +74,8 @@ constexpr TagRange TAG_TABLE[] = {
     {0x18, 0x1A, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
 
     // Currents: 0x1B single-phase, 0x1C neutral, 0x1D..0x1F per phase.
-    {0x1B, 0x1C, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.01f, "A"},
-    {0x1D, 0x1F, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.01f, "A"},
+    {0x1B, 0x1C, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "A"},
+    {0x1D, 0x1F, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.001f, "A"},
 
     // Power, total then per phase. Reactive is the only signed BCD on the wire.
     {0x20, 0x23, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 10.0f, "W"},
