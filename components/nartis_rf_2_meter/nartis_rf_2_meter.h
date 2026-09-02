@@ -26,6 +26,7 @@
  * exchanges and no guessing. The order is fixed and load-bearing:
  *
  *   DI 0xF202 -> DI 0xF203 -> DI 0xF200 -> DI 0xF201 -> DI 0xF102
+ *              -> DI 0xF101 -> DI 0xF104
  *
  * DI 0xF203 resumes the DI 0xF202 record list from a cursor the meter keeps, and
  * both DI 0xF200 and DI 0xF202 clear that cursor, so DI 0xF203 must follow its
@@ -36,11 +37,17 @@
  * DI 0xF203 is skipped altogether when DI 0xF202 already delivered every record
  * it announced.
  *
- * DI 0xF102 goes last, and is the odd one out: it answers with a fixed block of
- * TAG-less values rather than records, so it joins no merged set and feeds no
- * entity - it is decoded into the log and nothing more. See DI_F102 in
- * d101_frame.h. Last also means it cannot disturb anything ahead of it, which is
- * where it started before the block was understood.
+ * The DI 0xF1xx tail goes last and feeds no entity at all:
+ *
+ *   - DI 0xF102 answers with a fixed block of TAG-less values rather than
+ *     records, so it joins no merged set - it is decoded into the log and there
+ *     it stops.
+ *   - DI 0xF101 and DI 0xF104 are not decoded even that far. Their frames are
+ *     verified and their payloads logged, nothing more; see DI_F101 in
+ *     d101_frame.h for why guessing at them would be worse than not.
+ *
+ * Being last also means none of the three can disturb anything ahead of it, which
+ * is where DI 0xF102 started before its block was understood.
  *
  * SAFETY: this component is read-only by construction. Every frame it can build
  * comes from build_read_request(), which hard-wires the DL/T 645 control code to
@@ -207,6 +214,9 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// select and no way yet to route them to one. Logging them is what makes the
   /// page worth polling until that mechanism exists.
   void log_f102_block_(const ParsedResponse &resp) const;
+  /// Log an undecoded page's payload - the whole result of that exchange. Not
+  /// const: the first answer from each such page is announced once at INFO.
+  void log_raw_page_(uint16_t di, uint8_t idx, const ParsedResponse &resp);
 
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);
@@ -257,15 +267,23 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   std::array<ProbeRequest, MAX_PROBES> probes_{};
   uint8_t probe_count_{0};
 
-  /// One poll cycle is a list of exchanges: the energy poll, the status poll, then
-  /// each probe. Built at the start of every cycle so the state machine is just
-  /// "transmit step, await reply, advance" regardless of how many there are.
-  enum class StepKind : uint8_t { ENERGY, STATUS, PARAMS, PARAMS_CONT, F102, PROBE };
+  /// Pages read without being decoded: DI 0xF101 and DI 0xF104. One RAW_PAGE step
+  /// kind covers both, told apart by Step::idx, so adding another undecoded page is
+  /// a line in raw_page_di_() and raw_page_bit_() rather than a new step kind.
+  static constexpr uint8_t RAW_PAGE_COUNT = 2;
+
+  /// One poll cycle is a list of exchanges: the pages, the status poll, the
+  /// undecoded pages, then each probe. Built at the start of every cycle so the
+  /// state machine is just "transmit step, await reply, advance" regardless of how
+  /// many there are.
+  enum class StepKind : uint8_t { ENERGY, STATUS, PARAMS, PARAMS_CONT, F102, RAW_PAGE, PROBE };
   struct Step {
     StepKind kind{StepKind::ENERGY};
-    uint8_t probe_idx{0};
+    /// Index into probes_ for PROBE and into the raw-page list for RAW_PAGE;
+    /// unused by the rest, which are one exchange each.
+    uint8_t idx{0};
   };
-  std::array<Step, 5 + MAX_PROBES> steps_{};
+  std::array<Step, 5 + RAW_PAGE_COUNT + MAX_PROBES> steps_{};
   uint8_t step_count_{0};
   uint8_t step_idx_{0};
 
@@ -273,7 +291,11 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// continuation, once DI 0xF202 has delivered its whole record set.
   bool skip_step_(const Step &step) const;
   /// PAGE_BIT_* this step maintains, or 0 for steps outside the merged TAG set.
-  static uint8_t page_bit_of_(StepKind kind);
+  static uint8_t page_bit_of_(const Step &step);
+  /// The DI and the page bit of undecoded page `idx`. Two lists, kept adjacent in
+  /// the implementation, because they must stay in step with each other.
+  static uint16_t raw_page_di_(uint8_t idx);
+  static uint8_t raw_page_bit_(uint8_t idx);
 
   /// YAML-declared value widths, indexed by TAG; 0 = none. Consulted by the
   /// parser only after every built-in width has been ruled out.
@@ -295,6 +317,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   bool params_ok_{false};
   bool params_cont_ok_{false};
   bool f102_ok_{false};
+  /// Bit per undecoded page that answered this cycle, indexed as Step::idx.
+  uint8_t raw_ok_{0};
   /// Set when DI 0xF202 delivered every record it announced, so there is no tail
   /// for DI 0xF203 to fetch and the exchange can be dropped from this cycle.
   bool params_complete_{false};
@@ -314,6 +338,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   static constexpr uint8_t PAGE_BIT_PARAMS = 1 << 1;
   static constexpr uint8_t PAGE_BIT_PARAMS_CONT = 1 << 2;
   static constexpr uint8_t PAGE_BIT_F102 = 1 << 3;
+  static constexpr uint8_t PAGE_BIT_F101 = 1 << 4;
+  static constexpr uint8_t PAGE_BIT_F104 = 1 << 5;
   /// Cycles to allow before deciding a page is not coming - enough that a marginal
   /// link burning its retry budget is not mistaken for an unimplemented page.
   static constexpr uint32_t PAGE_SILENT_WARN_CYCLES = 3;
@@ -324,6 +350,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// report rather than an error to spam.
   bool warned_params_cont_shape_{false};
   bool reported_f102_shape_{false};
+  /// Bit per undecoded page whose first answer has been announced at INFO.
+  uint8_t reported_raw_pages_{0};
   /// Bit per TAG (0x00..0x3F) already warned about; keeps the unconfirmed-width
   /// warning to one line per TAG per boot.
   uint64_t warned_tags_{0};

@@ -169,6 +169,8 @@ const char *payload_shape_to_string(PayloadShape s) {
       return "counted page holding a status block";
     case PayloadShape::FIXED_BLOCK:
       return "fixed positional block, no TAGs";
+    case PayloadShape::RAW:
+      return "frame verified, DATA not decoded";
     default:
       return "unknown";
   }
@@ -379,7 +381,12 @@ size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BC
   // silently dropped, not even an error response - and DI 0xF203 is given the same
   // one, since it selects nothing: which records it returns comes from the cursor
   // the meter saved, not from the request.
-  if (di == DI_ENERGY || di == DI_PARAMS || di == DI_PARAMS_CONT || di == DI_F102) {
+  // DI 0xF101 and DI 0xF104 get the same body on the assumption that the DI 0xF1xx
+  // pages share one, DI 0xF102 having answered to it. That is a guess, and a wrong
+  // body draws silence rather than a complaint - which is what the silent-page
+  // warning exists to catch.
+  if (di == DI_ENERGY || di == DI_PARAMS || di == DI_PARAMS_CONT || di == DI_F102 || di == DI_F101 ||
+      di == DI_F104) {
     return build_read_request(out, cap, serial_le, di, PAGE_REQUEST_BODY, sizeof(PAGE_REQUEST_BODY));
   }
   if (di == DI_STATUS) {
@@ -532,6 +539,17 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
         out->shape = PayloadShape::FIXED_BLOCK;
         return ParseResult::OK;
       }
+    }
+
+    // DI 0xF101 and DI 0xF104 are read to see what comes back and nothing more, so
+    // the decoding stops at the application layer: the frame is known good and DATA
+    // is handed over untouched. Anything cleverer would mean inventing a record
+    // layout for a page nobody has decoded.
+    if (out->di == DI_F101 || out->di == DI_F104) {
+      out->count = 0;
+      out->announced_count = 0;
+      out->shape = PayloadShape::RAW;
+      return ParseResult::OK;
     }
 
     /* Which PayloadShape is this? The echoed DI narrows it down but does not

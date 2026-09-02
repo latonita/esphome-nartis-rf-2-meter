@@ -55,8 +55,20 @@ void NartisRf2MeterComponent::setup() {
   this->set_state_(State::IDLE);
 }
 
-uint8_t NartisRf2MeterComponent::page_bit_of_(StepKind kind) {
-  switch (kind) {
+// These two lists are the definition of the undecoded pages, and they are indexed
+// in lockstep by Step::idx - keep them adjacent and the same length.
+uint16_t NartisRf2MeterComponent::raw_page_di_(uint8_t idx) {
+  static const uint16_t DIS[RAW_PAGE_COUNT] = {DI_F101, DI_F104};
+  return (idx < RAW_PAGE_COUNT) ? DIS[idx] : 0;
+}
+
+uint8_t NartisRf2MeterComponent::raw_page_bit_(uint8_t idx) {
+  static const uint8_t BITS[RAW_PAGE_COUNT] = {PAGE_BIT_F101, PAGE_BIT_F104};
+  return (idx < RAW_PAGE_COUNT) ? BITS[idx] : 0;
+}
+
+uint8_t NartisRf2MeterComponent::page_bit_of_(const Step &step) {
+  switch (step.kind) {
     case StepKind::ENERGY:
       return PAGE_BIT_ENERGY;
     case StepKind::PARAMS:
@@ -65,6 +77,8 @@ uint8_t NartisRf2MeterComponent::page_bit_of_(StepKind kind) {
       return PAGE_BIT_PARAMS_CONT;
     case StepKind::F102:
       return PAGE_BIT_F102;
+    case StepKind::RAW_PAGE:
+      return raw_page_bit_(step.idx);
     default:
       return 0;  // the status poll and the probes are not part of the merged set
   }
@@ -126,7 +140,9 @@ void NartisRf2MeterComponent::report_silent_pages_() {
   static const PageName PAGES[] = {{PAGE_BIT_PARAMS, DI_PARAMS},
                                    {PAGE_BIT_PARAMS_CONT, DI_PARAMS_CONT},
                                    {PAGE_BIT_ENERGY, DI_ENERGY},
-                                   {PAGE_BIT_F102, DI_F102}};
+                                   {PAGE_BIT_F102, DI_F102},
+                                   {PAGE_BIT_F101, DI_F101},
+                                   {PAGE_BIT_F104, DI_F104}};
   for (const PageName &page : PAGES) {
     if ((silent & page.bit) != 0) {
       ESP_LOGW(TAG,
@@ -158,7 +174,7 @@ void NartisRf2MeterComponent::dump_config() {
   // Print the frames we will actually put on the air, so they can be compared
   // against a capture without having to catch a VERBOSE log line.
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> frame{};
-  for (const uint16_t di : {DI_PARAMS, DI_PARAMS_CONT, DI_ENERGY, DI_STATUS, DI_F102}) {
+  for (const uint16_t di : {DI_PARAMS, DI_PARAMS_CONT, DI_ENERGY, DI_STATUS, DI_F102, DI_F101, DI_F104}) {
     const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, di);
     if (n == 0) {
       ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: FAILED TO BUILD", di);
@@ -255,6 +271,7 @@ void NartisRf2MeterComponent::start_cycle_() {
   this->params_ok_ = false;
   this->params_cont_ok_ = false;
   this->f102_ok_ = false;
+  this->raw_ok_ = 0;
   this->params_complete_ = false;
   this->attempt_ = 0;
 
@@ -279,6 +296,12 @@ void NartisRf2MeterComponent::start_cycle_() {
   }
   if (this->need_data_) {
     this->steps_[this->step_count_++] = Step{StepKind::F102, 0};
+    // Read but not decoded. They publish nothing, so they are gated on need_data_
+    // like the rest: worth the airtime while the radio is up for real readings,
+    // not worth waking it on their own.
+    for (uint8_t i = 0; i < RAW_PAGE_COUNT; i++) {
+      this->steps_[this->step_count_++] = Step{StepKind::RAW_PAGE, i};
+    }
   }
   for (uint8_t i = 0; i < this->probe_count_; i++) {
     this->steps_[this->step_count_++] = Step{StepKind::PROBE, i};
@@ -302,8 +325,10 @@ uint16_t NartisRf2MeterComponent::current_di_() const {
       return DI_PARAMS_CONT;
     case StepKind::F102:
       return DI_F102;
+    case StepKind::RAW_PAGE:
+      return raw_page_di_(step.idx);
     case StepKind::PROBE:
-      return this->probes_[step.probe_idx].di;
+      return this->probes_[step.idx].di;
     default:
       return 0;
   }
@@ -353,7 +378,7 @@ bool NartisRf2MeterComponent::send_request_() {
   this->attempt_++;
 
   if (step.kind == StepKind::PROBE) {
-    const ProbeRequest &probe = this->probes_[step.probe_idx];
+    const ProbeRequest &probe = this->probes_[step.idx];
     this->tx_len_ = build_read_request(this->tx_buf_.data(), this->tx_buf_.size(), this->serial_le_, probe.di,
                                        probe.body, probe.body_len);
   } else {
@@ -363,7 +388,7 @@ bool NartisRf2MeterComponent::send_request_() {
     ESP_LOGE(TAG, "Failed to build request for DI 0x%04X", di);
     return false;
   }
-  this->pages_polled_ |= page_bit_of_(step.kind);
+  this->pages_polled_ |= page_bit_of_(step);
 
   // Logged at DEBUG alongside the RX dump, so a log excerpt always shows the
   // complete exchange - what we asked and what came back.
@@ -449,7 +474,7 @@ void NartisRf2MeterComponent::handle_wait_() {
       } else {
         ESP_LOGV(TAG, "DI 0x%04X: %u item(s), rssi %d dBm", di, resp.count, this->last_rssi_dbm_);
         this->log_response_(di, resp);
-        this->pages_seen_ |= page_bit_of_(step.kind);
+        this->pages_seen_ |= page_bit_of_(step);
         switch (step.kind) {
           case StepKind::STATUS:
             this->status_ = resp;
@@ -535,6 +560,10 @@ void NartisRf2MeterComponent::handle_wait_() {
             this->merge_page_(resp);
             break;
           }
+          case StepKind::RAW_PAGE:
+            this->raw_ok_ |= static_cast<uint8_t>(1u << step.idx);
+            this->log_raw_page_(di, step.idx, resp);
+            break;
           default:
             break;
         }
@@ -657,10 +686,11 @@ void NartisRf2MeterComponent::handle_publish_() {
 
   ESP_LOGD(TAG,
            "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); "
-           "F202 %s, F203 %s, F200 %s, F201 %s, F102 %s)",
+           "F202 %s, F203 %s, F200 %s, F201 %s, F102 %s, F101 %s, F104 %s)",
            this->cycles_, millis() - this->cycle_start_ms_, this->merged_count_, YESNO(this->params_ok_),
            this->params_complete_ ? "skipped" : YESNO(this->params_cont_ok_), YESNO(this->energy_ok_),
-           YESNO(this->status_ok_), YESNO(this->f102_ok_));
+           YESNO(this->status_ok_), YESNO(this->f102_ok_), YESNO((this->raw_ok_ & raw_page_bit_(0)) != 0),
+           YESNO((this->raw_ok_ & raw_page_bit_(1)) != 0));
   ESP_LOGV(TAG, "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", retries %" PRIu32 ", give-ups %" PRIu32,
            this->no_reply_count_, this->bad_frame_count_, this->retry_count_, this->giveup_count_);
 
@@ -830,6 +860,26 @@ void NartisRf2MeterComponent::log_f102_block_(const ParsedResponse &resp) const 
     // The one byte of the block nothing is known about. Worth a line if it ever
     // differs from the value every observed reply carries.
     ESP_LOGD(TAG, "DI 0x%04X: marker 0x%02X, not the 0x01 seen so far", DI_F102, b.marker);
+  }
+}
+
+void NartisRf2MeterComponent::log_raw_page_(uint16_t di, uint8_t idx, const ParsedResponse &resp) {
+  const uint8_t bit = static_cast<uint8_t>(1u << idx);
+  const bool first = (this->reported_raw_pages_ & bit) == 0;
+  this->reported_raw_pages_ |= bit;
+
+  // The payload IS the result of this exchange - nothing else is done with it - so
+  // it goes in the log every cycle. The first answer gets INFO instead of DEBUG:
+  // that a page nobody has decoded answers at all is the finding, and it should
+  // not take a DEBUG log to notice. The control code was already checked, so a
+  // refusal never reaches here; it goes through the error path with its hint.
+  if (first) {
+    ESP_LOGI(TAG, "DI 0x%04X answered: %u byte(s) of DATA, not decoded (there is no known layout for it):", di,
+             resp.payload_len);
+    ESP_LOGI(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
+  } else {
+    ESP_LOGD(TAG, "DI 0x%04X: %u byte(s) not decoded, payload: %s", di, resp.payload_len,
+             format_hex_pretty(resp.payload, resp.payload_len).c_str());
   }
 }
 

@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 using namespace esphome::nartis_rf_2_meter;
 
@@ -371,6 +372,35 @@ int main() {
     check(!parse_f102_block(bad, sizeof(bad) - 1, &junk), "a partial trailing value is rejected");
     bad[4] = 0x0A;  // low nibble 0x0A is not a BCD digit
     check(!parse_f102_block(bad, sizeof(bad), &junk), "a non-BCD nibble is rejected");
+  }
+
+  // DI 0xF101 and DI 0xF104 are read but never decoded, so what is worth checking
+  // is that they are asked at all and that the answer stops at the frame layer.
+  // Built rather than captured: the point is the parser's contract, and no reply
+  // from either has been seen yet.
+  std::printf("\n-- the undecoded pages --\n");
+  for (uint16_t di : {DI_F101, DI_F104}) {
+    uint8_t data[3 + 9];
+    data[0] = static_cast<uint8_t>(di & 0xFF);
+    data[1] = static_cast<uint8_t>(di >> 8);
+    // Bytes that are not a valid record list under any width table, which is the
+    // whole point: an undecoded page must not depend on them making sense.
+    for (size_t i = 2; i < sizeof(data); i++) {
+      data[i] = static_cast<uint8_t>(0xA0 + i);
+    }
+    uint8_t frame[MAX_REQUEST_FRAME_SIZE];
+    check(build_request(frame, sizeof(frame), serial, di) > 0, "the poll builds");
+
+    uint8_t rsp[64];
+    const size_t rsp_len = build_response(rsp, sizeof(rsp), serial, data, sizeof(data));
+    ParsedResponse r{};
+    const ParseResult pr = parse_response(rsp, rsp_len, serial, &r);
+    std::printf("DI 0x%04X: %s, shape '%s', %u item(s), payload %u B\n", di, parse_result_to_string(pr),
+                payload_shape_to_string(r.shape), r.count, r.payload_len);
+    check(pr == ParseResult::OK, "a payload no width table can walk still parses");
+    check(r.shape == PayloadShape::RAW, "reported as verified-but-not-decoded");
+    check(r.count == 0, "no items are invented");
+    check(r.payload_len == sizeof(data), "the whole payload is handed over");
   }
 
   std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202/0xF203 PAGES DECODE CORRECTLY" : "FAILURES", fail);

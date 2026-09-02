@@ -96,6 +96,25 @@ static constexpr uint16_t DI_PARAMS_CONT = 0xF203;
 /// dumped for inspection instead of being read as garbage.
 static constexpr uint16_t DI_F102 = 0xF102;
 
+/// Two more of the DI 0xF1xx family, read every cycle and deliberately NOT
+/// interpreted.
+///
+/// DI 0xF102 turning out to hold something useful is the whole argument for
+/// asking these: they are its immediate neighbours, so whatever numbering scheme
+/// put the instantaneous block at 0xF102 probably put something at 0xF101 and
+/// 0xF104 too. Nothing is known about either - not the contents, not whether the
+/// values carry TAGs, not even whether the 6-byte page body is the one they want.
+///
+/// So the frame is verified to the DL/T 645 layer and its payload logged, and
+/// there the work stops: they parse as PayloadShape::RAW, which means "envelope
+/// CRC, checksum, address and length all check out; what DATA means is unknown".
+/// That is deliberate. Guessing a record layout for a page nobody has decoded
+/// would produce numbers that look like readings, and a wrong width silently
+/// misaligns everything after it - a payload hex line in the log cannot mislead
+/// anyone that way.
+static constexpr uint16_t DI_F101 = 0xF101;
+static constexpr uint16_t DI_F104 = 0xF104;
+
 /// The request body that follows the DI. Its length is per-DI, not fixed: the
 /// page polls carry six bytes, the status poll one. Both are constant in every
 /// captured request - there is no parameter selector in either. In particular the
@@ -214,6 +233,11 @@ enum class PayloadShape : uint8_t {
   /// this way; see F102Block. `items` is empty for this shape, because there are
   /// no TAGs to key them by - the payload is what a reader wants.
   FIXED_BLOCK,
+  /// Not decoded at all. Everything below the application layer verified and DATA
+  /// was then left alone: `items` is empty and `payload` holds the lot. This is
+  /// what DI 0xF101 and DI 0xF104 return - a statement of how far the checking
+  /// got, not a failure.
+  RAW,
 };
 
 const char *payload_shape_to_string(PayloadShape s);

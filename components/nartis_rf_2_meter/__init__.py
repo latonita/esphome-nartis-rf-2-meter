@@ -5,12 +5,12 @@ a CMT2300A 443 MHz radio by emulating the НАРТИС-Д101-2 display. The link
 a DL/T 645-1997 frame with no encryption, no session and no password, so this
 component talks to the meter on its own - no UART bridge and no dlms_cosem.
 
-Only a fixed set of values is available: the meter answers five constant requests
+Only a fixed set of values is available: the meter answers seven constant requests
 and returns whatever its configured indication set contains. Entities therefore
 select a value by its 1-byte item TAG or by a field of the status block
 (DI 0xF201) - there is no way to ask for something else.
 
-Every cycle reads all five data identifiers, in this order:
+Every cycle reads all seven data identifiers, in this order:
 
     DI 0xF202  energy registers, clock and the instantaneous values
     DI 0xF203  the tail of that record list, which does not fit one frame
@@ -18,15 +18,22 @@ Every cycle reads all five data identifiers, in this order:
     DI 0xF201  status block
     DI 0xF102  per-phase active and reactive power, voltage, current and
                frequency, as a fixed block with no TAGs on the values
+    DI 0xF101  unknown - read and logged, not decoded
+    DI 0xF104  unknown - read and logged, not decoded
 
 DI 0xF203 resumes DI 0xF202 from a cursor the meter keeps and DI 0xF200 resets it,
 which is why the pair leads. Pages whose records fit the TAG layout are merged, so
 a `tag` entity does not care which one carried its value.
 
-DI 0xF102 is the exception: its values are identified by position, not by TAG, so
-there is nothing for a `tag` entity to select. It is decoded and logged (at DEBUG)
-and goes no further - exposing it needs a way to name a value that has no TAG, and
-that is not designed yet.
+The last three feed no entity:
+
+* DI 0xF102 is decoded but its values are identified by position, not by TAG, so
+  there is nothing for a `tag` entity to select. It is logged (at DEBUG) and goes
+  no further - exposing it needs a way to name a value that has no TAG, and that
+  is not designed yet.
+* DI 0xF101 and DI 0xF104 are not decoded at all. Their frames are verified and
+  their payloads logged, to find out what those pages hold; guessing a layout for
+  them would produce numbers that look like readings.
 """
 
 from esphome import pins
@@ -164,7 +171,9 @@ def validate_tag_entity(config):
 #   0xF203  the tail of the 0xF202 record list, resumed from the meter's cursor
 #   0xF102  the fixed instantaneous block; the 6-byte body was an assumption
 #           until a meter answered it
-KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6, 0xF102: 6}
+#   0xF101  read every cycle, contents unknown; body assumed to match 0xF102
+#   0xF104  the same
+KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6, 0xF102: 6, 0xF101: 6, 0xF104: 6}
 
 MAX_REQUEST_BODY = 8
 
@@ -230,8 +239,8 @@ CONFIG_SCHEMA = cv.Schema(
         # that pause - so if the tail comes back empty on a working link, a shorter
         # gap is the first thing to try.
         #
-        # Five exchanges per cycle at ~1 s each, so the whole cycle is roughly
-        # 5 * (airtime + gap); keep update_interval well clear of that.
+        # Seven exchanges per cycle at ~1 s each, so the whole cycle is roughly
+        # 7 * (airtime + gap); keep update_interval well clear of that.
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,

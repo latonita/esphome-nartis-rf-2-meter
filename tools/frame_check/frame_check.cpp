@@ -139,7 +139,7 @@ int main() {
   // differ from each other in the DI alone; DI 0xF201 carries a 1-byte body.
   uint8_t page_frame[MAX_REQUEST_FRAME_SIZE];
   const size_t page_len = build_request(page_frame, sizeof(page_frame), serial, DI_ENERGY);
-  for (uint16_t di : {DI_ENERGY, DI_PARAMS, DI_PARAMS_CONT}) {
+  for (uint16_t di : {DI_ENERGY, DI_PARAMS, DI_PARAMS_CONT, DI_F102, DI_F101, DI_F104}) {
     uint8_t f[MAX_REQUEST_FRAME_SIZE];
     const size_t n = build_request(f, sizeof(f), serial, di);
     if (n != page_len) {
@@ -149,8 +149,9 @@ int main() {
   }
   uint8_t status_frame[MAX_REQUEST_FRAME_SIZE];
   const size_t status_len = build_request(status_frame, sizeof(status_frame), serial, DI_STATUS);
-  check(page_len > 0 && status_len == page_len - 5, "the three page polls agree in length, DI 0xF201 is 5 shorter");
+  check(page_len > 0 && status_len == page_len - 5, "the page polls agree in length, DI 0xF201 is 5 shorter");
   check(build_request(page_frame, sizeof(page_frame), serial, 0xF204) == 0, "an unknown DI builds nothing");
+
 
   std::printf("\n%s (%d failure(s))\n", failures == 0 ? "ALL CHECKS PASSED" : "CHECKS FAILED", failures);
   return failures == 0 ? 0 : 1;
