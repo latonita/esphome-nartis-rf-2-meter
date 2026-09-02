@@ -20,17 +20,24 @@
  * An exchange no entity consumes is skipped. A failed exchange does not abort the
  * cycle - the remaining steps still run and whatever arrived is published.
  *
- * The three TAG-bearing pages are read every cycle and merged, rather than one
- * being selected from the configured TAGs. Which page carries which TAG is set
- * with the vendor tool, so selection was guesswork; reading all of them costs one
- * more exchange and no guessing. The order is fixed and load-bearing:
+ * The TAG-bearing pages are read every cycle and merged, rather than one being
+ * selected from the configured TAGs. Which page carries which TAG is set with the
+ * vendor tool, so selection was guesswork; reading all of them costs a few more
+ * exchanges and no guessing. The order is fixed and load-bearing:
  *
- *   DI 0xF200 -> DI 0xF201 -> DI 0xF202 -> DI 0xF203
+ *   DI 0xF202 -> DI 0xF203 -> DI 0xF200 -> DI 0xF201 -> DI 0xF102
  *
  * DI 0xF203 resumes the DI 0xF202 record list from a cursor the meter keeps, and
  * both DI 0xF200 and DI 0xF202 clear that cursor, so DI 0xF203 must follow its
- * DI 0xF202 with nothing in between. It is skipped altogether when DI 0xF202
- * already delivered every record it announced.
+ * DI 0xF202 with nothing in between. Leading with the pair is what guarantees
+ * that: no other exchange can be inserted ahead of DI 0xF203, and the reset the
+ * later DI 0xF200 performs lands after the tail has already been collected.
+ *
+ * DI 0xF203 is skipped altogether when DI 0xF202 already delivered every record
+ * it announced.
+ *
+ * DI 0xF102 goes last because it is the least understood of the five - see DI_F102
+ * in d101_frame.h - so it cannot disturb anything ahead of it.
  *
  * SAFETY: this component is read-only by construction. Every frame it can build
  * comes from build_read_request(), which hard-wires the DL/T 645 control code to
@@ -187,6 +194,11 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// WARN breakdown of a response stopped by an unrecognised TAG - everything
   /// needed to work out the missing width by hand.
   void log_unknown_tag_(uint16_t di, const ParsedResponse &resp) const;
+  /// WARN breakdown of a response that verified at every layer below the records
+  /// but whose record layout was not understood. Same purpose as
+  /// log_unknown_tag_(): put everything needed to work the layout out in the log,
+  /// rather than leave a bare "malformed" and an undecoded RX dump.
+  void log_bad_records_(uint16_t di, ParseResult r, const ParsedResponse &resp) const;
 
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);
@@ -240,12 +252,12 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// One poll cycle is a list of exchanges: the energy poll, the status poll, then
   /// each probe. Built at the start of every cycle so the state machine is just
   /// "transmit step, await reply, advance" regardless of how many there are.
-  enum class StepKind : uint8_t { ENERGY, STATUS, PARAMS, PARAMS_CONT, PROBE };
+  enum class StepKind : uint8_t { ENERGY, STATUS, PARAMS, PARAMS_CONT, F102, PROBE };
   struct Step {
     StepKind kind{StepKind::ENERGY};
     uint8_t probe_idx{0};
   };
-  std::array<Step, 4 + MAX_PROBES> steps_{};
+  std::array<Step, 5 + MAX_PROBES> steps_{};
   uint8_t step_count_{0};
   uint8_t step_idx_{0};
 
@@ -274,6 +286,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   bool energy_ok_{false};
   bool params_ok_{false};
   bool params_cont_ok_{false};
+  bool f102_ok_{false};
   /// Set when DI 0xF202 delivered every record it announced, so there is no tail
   /// for DI 0xF203 to fetch and the exchange can be dropped from this cycle.
   bool params_complete_{false};
@@ -292,12 +305,17 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   static constexpr uint8_t PAGE_BIT_ENERGY = 1 << 0;
   static constexpr uint8_t PAGE_BIT_PARAMS = 1 << 1;
   static constexpr uint8_t PAGE_BIT_PARAMS_CONT = 1 << 2;
+  static constexpr uint8_t PAGE_BIT_F102 = 1 << 3;
   /// Cycles to allow before deciding a page is not coming - enough that a marginal
   /// link burning its retry budget is not mistaken for an unimplemented page.
   static constexpr uint32_t PAGE_SILENT_WARN_CYCLES = 3;
   uint8_t pages_polled_{0};
   uint8_t pages_seen_{0};
   bool warned_silent_pages_{false};
+  /// One line per boot, not per cycle, for a reply shape that is a finding to
+  /// report rather than an error to spam.
+  bool warned_params_cont_shape_{false};
+  bool reported_f102_shape_{false};
   /// Bit per TAG (0x00..0x3F) already warned about; keeps the unconfirmed-width
   /// warning to one line per TAG per boot.
   uint64_t warned_tags_{0};

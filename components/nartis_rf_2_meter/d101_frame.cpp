@@ -43,7 +43,13 @@ bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_o
 
   // DI 0xF202 is a larger page over the same TAG numbering, and DI 0xF203 is the
   // tail of that same list, so one table serves all three.
-  if (di != DI_ENERGY && di != DI_PARAMS && di != DI_PARAMS_CONT) {
+  //
+  // DI 0xF102 is offered the same table on the assumption - untested, since no
+  // capture of that page exists - that a Wasion meter numbers its items the same
+  // way everywhere. Nothing rests on the assumption being right: parse_response()
+  // accepts a reading only when it consumes DATA exactly, so a page with different
+  // numbering fails to fit and gets logged rather than mis-decoded.
+  if (di != DI_ENERGY && di != DI_PARAMS && di != DI_PARAMS_CONT && di != DI_F102) {
     return false;
   }
 
@@ -151,6 +157,19 @@ bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_o
     return true;
   }
   return false;
+}
+
+const char *payload_shape_to_string(PayloadShape s) {
+  switch (s) {
+    case PayloadShape::COUNTED:
+      return "counted page";
+    case PayloadShape::CONTINUATION:
+      return "continuation, no COUNT byte";
+    case PayloadShape::COUNTED_STATUS:
+      return "counted page holding a status block";
+    default:
+      return "unknown";
+  }
 }
 
 const char *parse_result_to_string(ParseResult r) {
@@ -311,7 +330,7 @@ size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BC
   // silently dropped, not even an error response - and DI 0xF203 is given the same
   // one, since it selects nothing: which records it returns comes from the cursor
   // the meter saved, not from the request.
-  if (di == DI_ENERGY || di == DI_PARAMS || di == DI_PARAMS_CONT) {
+  if (di == DI_ENERGY || di == DI_PARAMS || di == DI_PARAMS_CONT || di == DI_F102) {
     return build_read_request(out, cap, serial_le, di, PAGE_REQUEST_BODY, sizeof(PAGE_REQUEST_BODY));
   }
   if (di == DI_STATUS) {
@@ -450,56 +469,75 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
 
-    /* Records arrive in one of two shapes.
-     *
-     * A fresh page starts with a COUNT byte:  DI | COUNT | {TAG,value}...
-     * COUNT is how many records the meter *has*, not how many it sent: a live
-     * DI 0xF202 page announces 24 and then stops after 16 (DATA length 83 =
-     * 3 + 16*5), ending on a valid checksum and a valid envelope CRC. The meter
-     * fits what it can and does not correct COUNT, so COUNT is only an upper
-     * bound and the record list ends where DATA does.
-     *
-     * A continuation page has no COUNT byte at all:  DI | {TAG,value}...
-     * The list resumes from the cursor its DI 0xF202 left behind; with no cursor
-     * set DATA is just the echoed DI, which reads as zero records.
-     *
-     * The echoed DI says which shape to expect, but only probably - whether a
-     * resume echoes 0xF203 or the 0xF202 it continues has not been captured. What
-     * is certain is that a page stops on a record boundary, so the right reading
-     * consumes DATA exactly, and that is the tie-breaker: try the shape the DI
-     * implies, fall back to the other, and if neither lands on the last DATA byte
-     * report the expected shape's own failure, whose diagnostics are the ones a
-     * reader can act on.
+    /* Which PayloadShape is this? The echoed DI narrows it down but does not
+     * always settle it, so try the plausible readings and let DATA decide: a page
+     * stops on a record boundary, so exactly one reading normally lands on the
+     * last DATA byte. Try them most-likely-first and take the first exact fit.
      */
-    const auto try_shape = [&](bool as_continuation) -> ItemWalk {
-      // A record is at least 2 bytes, so data_len is an upper bound that never
+    const auto try_shape = [&](PayloadShape shape) -> ItemWalk {
+      // A record is at least 2 bytes, so data_len is a record bound that never
       // truncates a real list - the MAX_ITEMS check inside the walk is what
       // reports an over-long one.
-      if (as_continuation) {
+      if (shape == PayloadShape::CONTINUATION) {
         return walk_items(out->di, payload, data_len, 2, data_len, out->items, tag_width_overrides);
       }
       if (data_len < 3) {
         return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};  // no room for a COUNT byte
       }
-      return walk_items(out->di, payload, data_len, 3, payload[2], out->items, tag_width_overrides);
+      // COUNTED_STATUS differs from COUNTED only in which width table the records
+      // are read with. That one difference is the whole point: under the TAG-page
+      // table TAG 0x00 is a 4-byte energy register, under the DI 0xF201 table it is
+      // a 9-byte status block, and a 13-byte DATA field fits the second exactly and
+      // the first not at all.
+      const uint16_t table_di = (shape == PayloadShape::COUNTED_STATUS) ? DI_STATUS : out->di;
+      return walk_items(table_di, payload, data_len, 3, payload[2], out->items, tag_width_overrides);
     };
-    const auto fits = [&](const ItemWalk &w) { return w.result == ParseResult::OK && w.end == data_len; };
 
-    bool as_continuation = (out->di == DI_PARAMS_CONT);
-    ItemWalk walk = try_shape(as_continuation);
-    if (!fits(walk)) {
-      const ItemWalk alt = try_shape(!as_continuation);
-      if (fits(alt)) {
-        walk = alt;
-        as_continuation = !as_continuation;
-      } else {
-        walk = try_shape(as_continuation);  // re-run so out->items matches what we report
+    PayloadShape candidates[3];
+    uint8_t candidate_count = 0;
+    if (out->di == DI_STATUS) {
+      candidates[candidate_count++] = PayloadShape::COUNTED_STATUS;
+    } else if (out->di == DI_F102) {
+      // Nothing is established about this page, so every layout the parser knows
+      // is a candidate and the exact-fit rule is the only thing deciding.
+      candidates[candidate_count++] = PayloadShape::COUNTED;
+      candidates[candidate_count++] = PayloadShape::COUNTED_STATUS;
+      candidates[candidate_count++] = PayloadShape::CONTINUATION;
+    } else if (out->di == DI_PARAMS_CONT) {
+      // Genuinely unsettled, so all three are on the table. The firmware read says
+      // a resume streams records with no COUNT byte; the one frame captured from a
+      // live meter was instead a counted page holding a status block. Ordered by
+      // what the request asked for, not by what came back last.
+      candidates[candidate_count++] = PayloadShape::CONTINUATION;
+      candidates[candidate_count++] = PayloadShape::COUNTED_STATUS;
+      candidates[candidate_count++] = PayloadShape::COUNTED;
+    } else {
+      candidates[candidate_count++] = PayloadShape::COUNTED;
+      candidates[candidate_count++] = PayloadShape::CONTINUATION;
+    }
+
+    ItemWalk walk{};
+    PayloadShape shape = candidates[0];
+    bool exact = false;
+    for (uint8_t c = 0; c < candidate_count; c++) {
+      walk = try_shape(candidates[c]);
+      if (walk.result == ParseResult::OK && walk.end == data_len) {
+        shape = candidates[c];
+        exact = true;
+        break;
       }
+    }
+    if (!exact) {
+      // No reading consumed DATA exactly. Report the first candidate's own
+      // failure - it is the one the request asked for, so its diagnostics are what
+      // a reader can act on - and re-run it so out->items holds what it decoded.
+      shape = candidates[0];
+      walk = try_shape(shape);
     }
 
     out->count = walk.count;
-    out->continuation = as_continuation;
-    out->announced_count = (as_continuation || data_len < 3) ? 0 : payload[2];
+    out->shape = shape;
+    out->announced_count = (shape == PayloadShape::CONTINUATION || data_len < 3) ? 0 : payload[2];
     if (walk.result == ParseResult::UNKNOWN_TAG) {
       out->unknown_tag = walk.unknown_tag;
       out->unknown_offset = walk.unknown_offset;
@@ -507,9 +545,9 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     if (walk.result != ParseResult::OK) {
       return walk.result;
     }
-    if (walk.end != data_len) {
+    if (!exact) {
       // Every record read cleanly, yet bytes are left over: DATA holds a whole
-      // record neither shape accounted for, so a width above must be wrong.
+      // record no reading accounted for, so a width above must be wrong.
       return ParseResult::MALFORMED;
     }
     return ParseResult::OK;

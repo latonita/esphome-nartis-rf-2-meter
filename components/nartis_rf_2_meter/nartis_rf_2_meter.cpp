@@ -63,6 +63,8 @@ uint8_t NartisRf2MeterComponent::page_bit_of_(StepKind kind) {
       return PAGE_BIT_PARAMS;
     case StepKind::PARAMS_CONT:
       return PAGE_BIT_PARAMS_CONT;
+    case StepKind::F102:
+      return PAGE_BIT_F102;
     default:
       return 0;  // the status poll and the probes are not part of the merged set
   }
@@ -73,9 +75,10 @@ void NartisRf2MeterComponent::merge_page_(const ParsedResponse &resp) {
     const ParsedItem &item = resp.items[i];
     const ParsedItem *seen = this->find_merged_(item.tag);
     if (seen != nullptr) {
-      // DI 0xF202 repeats what DI 0xF200 carried, so duplicates are expected and
-      // the first copy is kept. They have to agree, though: a disagreement means
-      // one of the two decodes is wrong, which is worth saying out loud.
+      // DI 0xF202 is a superset, and it is read first, so the DI 0xF200 that
+      // follows repeats records already held and the first copy stands. They have
+      // to agree, though: a disagreement means one of the two decodes is wrong,
+      // which is worth saying out loud.
       if (seen->len != item.len || std::memcmp(seen->raw, item.raw, item.len) != 0) {
         ESP_LOGW(TAG, "TAG 0x%02X differs between pages: kept %s, DI 0x%04X sent %s", item.tag,
                  format_hex_pretty(seen->raw, seen->len).c_str(), resp.di,
@@ -120,8 +123,10 @@ void NartisRf2MeterComponent::report_silent_pages_() {
     uint8_t bit;
     uint16_t di;
   };
-  static const PageName PAGES[] = {
-      {PAGE_BIT_ENERGY, DI_ENERGY}, {PAGE_BIT_PARAMS, DI_PARAMS}, {PAGE_BIT_PARAMS_CONT, DI_PARAMS_CONT}};
+  static const PageName PAGES[] = {{PAGE_BIT_PARAMS, DI_PARAMS},
+                                   {PAGE_BIT_PARAMS_CONT, DI_PARAMS_CONT},
+                                   {PAGE_BIT_ENERGY, DI_ENERGY},
+                                   {PAGE_BIT_F102, DI_F102}};
   for (const PageName &page : PAGES) {
     if ((silent & page.bit) != 0) {
       ESP_LOGW(TAG,
@@ -153,7 +158,7 @@ void NartisRf2MeterComponent::dump_config() {
   // Print the frames we will actually put on the air, so they can be compared
   // against a capture without having to catch a VERBOSE log line.
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> frame{};
-  for (const uint16_t di : {DI_ENERGY, DI_STATUS, DI_PARAMS, DI_PARAMS_CONT}) {
+  for (const uint16_t di : {DI_PARAMS, DI_PARAMS_CONT, DI_ENERGY, DI_STATUS, DI_F102}) {
     const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, di);
     if (n == 0) {
       ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: FAILED TO BUILD", di);
@@ -249,6 +254,7 @@ void NartisRf2MeterComponent::start_cycle_() {
   this->status_ok_ = false;
   this->params_ok_ = false;
   this->params_cont_ok_ = false;
+  this->f102_ok_ = false;
   this->params_complete_ = false;
   this->attempt_ = 0;
 
@@ -256,20 +262,23 @@ void NartisRf2MeterComponent::start_cycle_() {
   // consumes is not worth waking the radio for.
   //
   // The order is not free. DI 0xF203 resumes the DI 0xF202 list from a cursor the
-  // meter holds, and DI 0xF200 and DI 0xF202 both reset it, so the continuation
-  // has to sit immediately after its DI 0xF202 - the status poll and the probes go
-  // either side of the pair, never between them.
+  // meter holds, and DI 0xF200 and DI 0xF202 both reset it, so the continuation has
+  // to sit immediately after its DI 0xF202. Putting the pair first is what makes
+  // that structural rather than a convention to remember: nothing can be inserted
+  // ahead of DI 0xF203, and the reset DI 0xF200 performs happens once the tail is
+  // already in hand. DI 0xF102 goes last, being the least understood of the five.
   this->step_count_ = 0;
   this->step_idx_ = 0;
   if (this->need_data_) {
+    this->steps_[this->step_count_++] = Step{StepKind::PARAMS, 0};
+    this->steps_[this->step_count_++] = Step{StepKind::PARAMS_CONT, 0};
     this->steps_[this->step_count_++] = Step{StepKind::ENERGY, 0};
   }
   if (this->need_status_) {
     this->steps_[this->step_count_++] = Step{StepKind::STATUS, 0};
   }
   if (this->need_data_) {
-    this->steps_[this->step_count_++] = Step{StepKind::PARAMS, 0};
-    this->steps_[this->step_count_++] = Step{StepKind::PARAMS_CONT, 0};
+    this->steps_[this->step_count_++] = Step{StepKind::F102, 0};
   }
   for (uint8_t i = 0; i < this->probe_count_; i++) {
     this->steps_[this->step_count_++] = Step{StepKind::PROBE, i};
@@ -291,6 +300,8 @@ uint16_t NartisRf2MeterComponent::current_di_() const {
       return DI_PARAMS;
     case StepKind::PARAMS_CONT:
       return DI_PARAMS_CONT;
+    case StepKind::F102:
+      return DI_F102;
     case StepKind::PROBE:
       return this->probes_[step.probe_idx].di;
     default:
@@ -459,15 +470,27 @@ void NartisRf2MeterComponent::handle_wait_() {
                        resp.announced_count, DI_PARAMS_CONT);
             }
             break;
-          case StepKind::PARAMS_CONT:
+          case StepKind::PARAMS_CONT: {
             this->params_cont_ok_ = true;
-            if (!resp.continuation) {
-              // parse_response() fell back to the COUNT shape, so the tail is not
-              // framed the way the firmware read suggested. Either way the widths
-              // had to line up for it to parse at all, so this is a note, not a
-              // fault.
-              ESP_LOGD(TAG, "DI 0x%04X reply carries a COUNT byte after all (%u announced)", di,
-                       resp.announced_count);
+            ESP_LOGD(TAG, "DI 0x%04X reply shape: %s", di, payload_shape_to_string(resp.shape));
+            if (resp.shape == PayloadShape::COUNTED_STATUS) {
+              // Not the record tail this exchange asked for: the meter answered
+              // with a status block, the shape DI 0xF201 returns. Deliberately kept
+              // out of the merged TAG set - there TAG 0x00 is a 4-byte energy
+              // register, and folding a 9-byte block in under the same TAG would
+              // collide with the real one on every cycle.
+              if (!this->warned_params_cont_shape_) {
+                this->warned_params_cont_shape_ = true;
+                const ParsedItem *blob = resp.find(0x00);
+                ESP_LOGW(TAG, "DI 0x%04X answered with a status block, not the tail of the DI 0x%04X list: %s", di,
+                         DI_PARAMS, (blob == nullptr) ? "(no TAG 0x00)"
+                                                      : format_hex_pretty(blob->raw, blob->len).c_str());
+                ESP_LOGW(TAG, "  So on this meter DI 0x%04X is not the continuation it was taken for, and the", di);
+                ESP_LOGW(TAG, "  records DI 0x%04X announces but does not send have no known way to be read.",
+                         DI_PARAMS);
+                ESP_LOGW(TAG, "  The block is ignored rather than published - please report the line above.");
+              }
+              break;
             }
             if (resp.count == 0) {
               // Nothing was pending: the cursor got cleared before we asked, or the
@@ -476,6 +499,29 @@ void NartisRf2MeterComponent::handle_wait_() {
             }
             this->merge_page_(resp);
             break;
+          }
+          case StepKind::F102: {
+            this->f102_ok_ = true;
+            if (!this->reported_f102_shape_) {
+              this->reported_f102_shape_ = true;
+              // First answer from a page little is known about. Saying what shape it
+              // turned out to have is most of the reason it is polled at all.
+              ESP_LOGI(TAG, "DI 0x%04X answered: %s, %u record(s)", di, payload_shape_to_string(resp.shape),
+                       resp.count);
+            }
+            if (resp.shape == PayloadShape::COUNTED_STATUS) {
+              // A status block, not TAG-page data. Kept out of the merged set for
+              // the same reason as on DI 0xF203: TAG 0x00 means a 4-byte energy
+              // register there, and folding a 9-byte block in would collide with it.
+              ESP_LOGD(TAG, "DI 0x%04X holds a status block - not merged into the TAG set", di);
+              break;
+            }
+            // It fits the TAG-page layout exactly, so its records read like any
+            // other page's. A TAG only this page carries still goes through
+            // warn_unconfirmed_tag_once_() before it reaches an entity.
+            this->merge_page_(resp);
+            break;
+          }
           default:
             break;
         }
@@ -497,9 +543,14 @@ void NartisRf2MeterComponent::handle_wait_() {
       ESP_LOGW(TAG, "DI 0x%04X: reply carries DI 0x%04X instead", di, resp.di);
     } else if (r == ParseResult::UNKNOWN_TAG) {
       this->log_unknown_tag_(di, resp);
+    } else if (resp.payload_len > 0) {
+      // payload_len is only set once the envelope CRC, the DL/T 645 checksum, the
+      // address and the length fields have all verified, so reaching here means the
+      // bytes are sound and it is the record layout that is not understood. Show it.
+      this->log_bad_records_(di, r, resp);
     } else {
-      // The captured bytes were already logged above, so just say what was wrong
-      // with them.
+      // Nothing decoded far enough to have a payload; the RX dump above is all
+      // there is to say.
       ESP_LOGW(TAG, "DI 0x%04X: %s", di, parse_result_to_string(r));
     }
 
@@ -592,10 +643,11 @@ void NartisRf2MeterComponent::handle_publish_() {
   this->report_silent_pages_();
 
   ESP_LOGD(TAG,
-           "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); F200 %s, F201 %s, F202 %s, F203 %s)",
-           this->cycles_, millis() - this->cycle_start_ms_, this->merged_count_, YESNO(this->energy_ok_),
-           YESNO(this->status_ok_), YESNO(this->params_ok_),
-           this->params_complete_ ? "skipped" : YESNO(this->params_cont_ok_));
+           "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); "
+           "F202 %s, F203 %s, F200 %s, F201 %s, F102 %s)",
+           this->cycles_, millis() - this->cycle_start_ms_, this->merged_count_, YESNO(this->params_ok_),
+           this->params_complete_ ? "skipped" : YESNO(this->params_cont_ok_), YESNO(this->energy_ok_),
+           YESNO(this->status_ok_), YESNO(this->f102_ok_));
   ESP_LOGV(TAG, "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", retries %" PRIu32 ", give-ups %" PRIu32,
            this->no_reply_count_, this->bad_frame_count_, this->retry_count_, this->giveup_count_);
 
@@ -708,6 +760,25 @@ void NartisRf2MeterComponent::log_unknown_tag_(uint16_t di, const ParsedResponse
              format_hex_pretty(resp.payload + resp.unknown_offset, tail_len).c_str());
   }
   ESP_LOGW(TAG, "  Please report the lines above together with the parameters your display shows.");
+}
+
+void NartisRf2MeterComponent::log_bad_records_(uint16_t di, ParseResult r, const ParsedResponse &resp) const {
+  ESP_LOGW(TAG, "DI 0x%04X: %s - the frame itself verified (envelope CRC, DL/T 645 checksum,", di,
+           parse_result_to_string(r));
+  ESP_LOGW(TAG, "  address and length all good), so it is the record layout that is not understood.");
+  ESP_LOGW(TAG, "  read as: %s", payload_shape_to_string(resp.shape));
+  ESP_LOGW(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
+  if (resp.count > 0) {
+    ESP_LOGW(TAG, "  decoded %u record(s) before the layout stopped adding up:", resp.count);
+    char line[96];
+    for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
+      describe_item_(di, resp.items[i], line, sizeof(line), this->tag_width_);
+      ESP_LOGW(TAG, "    %s", line);
+    }
+  } else {
+    ESP_LOGW(TAG, "  no records decoded at all");
+  }
+  ESP_LOGW(TAG, "  Please report the payload line together with the parameters your display shows.");
 }
 
 void NartisRf2MeterComponent::note_tag_width_(uint8_t tag, StatusField field, uint8_t width) {

@@ -73,17 +73,38 @@ static constexpr uint16_t DI_PARAMS = 0xF202;
 ///   * the cursor is shared state. DI 0xF200 and DI 0xF202 both restart their
 ///     list and clear it, so DI 0xF203 has to follow its DI 0xF202 immediately -
 ///     anything in between makes it answer as if nothing were pending.
-///   * a resumed frame carries no COUNT byte: the records follow the echoed DI
-///     directly. With no cursor set the meter answers with the DI and nothing
-///     else, which parses as a valid response holding zero records.
+///   * how a resumed frame is laid out is NOT settled - see PayloadShape.
 static constexpr uint16_t DI_PARAMS_CONT = 0xF203;
+
+/// A fifth page, read every cycle, about which little is established.
+///
+/// Not seen in any display capture. The working guess is that it carries the
+/// per-phase quantities the DI 0xF202 page has no room for - per-phase active and
+/// reactive power, and power factor - which would make it the natural home for the
+/// records DI 0xF202 announces and does not send. Nothing here depends on that
+/// being right; it is why the page is worth polling, not a claim about it.
+///
+/// Note that power factor has no TAG assigned in the table below, so if it is here
+/// it will arrive under a TAG the parser has no width for and stop the walk - and
+/// say so, with the payload, via log_unknown_tag_().
+///
+/// The request body is not known either. It is polled with the 6-byte page body,
+/// the shape the DI 0xF2xx pages use - if that is the wrong one the meter answers
+/// nothing at all rather than complaining, which is what the silent-page warning
+/// exists to surface.
+///
+/// Its reply is decoded against every record layout the parser knows and accepted
+/// only on an exact fit, so a page numbered differently from the DI 0xF2xx family
+/// gets its payload dumped for inspection instead of being read as garbage.
+static constexpr uint16_t DI_F102 = 0xF102;
 
 /// The request body that follows the DI. Its length is per-DI, not fixed: the
 /// page polls carry six bytes, the status poll one. Both are constant in every
 /// captured request - there is no parameter selector in either. In particular the
 /// DI 0xF203 cursor is state the meter keeps for itself; nothing in the request
 /// says where to resume from, which is why the ordering rule above matters.
-/// Body of the three page polls: DI 0xF200, DI 0xF202 and DI 0xF203.
+/// Body of the page polls: DI 0xF200, DI 0xF202, DI 0xF203 and - assumed, not
+/// observed - DI 0xF102.
 extern const uint8_t PAGE_REQUEST_BODY[6];
 extern const uint8_t STATUS_REQUEST_BODY[1];
 /// Longest request body a probe may carry.
@@ -109,6 +130,30 @@ static constexpr size_t STATUS_VALUE_SIZE = 9;
 static constexpr size_t STATUS_OFF_TEMPERATURE = 5;    // inferred, not confirmed
 static constexpr size_t STATUS_OFF_TARIFF_COUNT = 7;   // inferred
 static constexpr size_t STATUS_OFF_ACTIVE_TARIFF = 8;  // confirmed against the tariff schedule
+
+/// How the DATA field of a response lays its records out. DATA always opens with
+/// the echoed DI; what follows is one of these.
+///
+/// A page stops on a record boundary, never mid-record, so the correct reading is
+/// always the one that consumes DATA exactly. That is what parse_response() uses
+/// to choose between the shapes a given data identifier might answer with.
+enum class PayloadShape : uint8_t {
+  /// DI | COUNT | {TAG,value}... with the TAG-page width table. Every DI 0xF200
+  /// and DI 0xF202 reply observed so far. COUNT is how many records the meter
+  /// *has*, so it is an upper bound, not the number sent.
+  COUNTED,
+  /// DI | {TAG,value}... - no COUNT byte, the list resuming from the meter's
+  /// cursor. This is what the meter firmware builds for a resume according to a
+  /// read of its DI 0xF2xx handler; no frame of this shape has been captured yet.
+  CONTINUATION,
+  /// DI | COUNT | {TAG,value}... read with the DI 0xF201 width table, where TAG
+  /// 0x00 is a 9-byte status block rather than a 4-byte energy register. Every
+  /// DI 0xF201 reply, and - the surprise - the one DI 0xF203 reply captured from a
+  /// live meter, which answered with a status block instead of a record tail.
+  COUNTED_STATUS,
+};
+
+const char *payload_shape_to_string(PayloadShape s);
 
 /// How an item's value bytes should be read. UINT_LE / INT_LE cover every
 /// scalar register; the byte count is TagInfo::width.
@@ -184,9 +229,9 @@ struct ParsedResponse {
   /// normal truncation, not an error, and means a DI 0xF203 read will return the
   /// rest. Zero on a continuation frame, which carries no COUNT byte.
   uint8_t announced_count{0};
-  /// True when the records were read as a continuation - no COUNT byte, the list
-  /// resuming from the meter's cursor. Set for a DI 0xF203 reply.
-  bool continuation{false};
+  /// Which reading of DATA produced `items`. Meaningful when parse_response()
+  /// returned OK; on a failure it is the shape whose diagnostics are reported.
+  PayloadShape shape{PayloadShape::COUNTED};
   ParsedItem items[MAX_ITEMS]{};
 
   /// The application payload with the +0x33 transmission offset removed, kept
@@ -265,8 +310,8 @@ uint32_t frequency_from_serial(const char *digits12);
  * ================================================================ */
 
 /// Build the complete on-air request frame for `di` - one of DI_ENERGY,
-/// DI_STATUS, DI_PARAMS or DI_PARAMS_CONT. Returns the number of bytes written,
-/// or 0 on error.
+/// DI_STATUS, DI_PARAMS, DI_PARAMS_CONT or DI_F102. Returns the number of bytes
+/// written, or 0 on error.
 ///
 /// Header byte 5 is HLEN = LEN ^ 1. The two candidate rules, LEN ^ 1 and
 /// LEN - 1, agree for odd LEN and differ for even, and every even-length frame

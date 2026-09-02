@@ -221,12 +221,12 @@ int main() {
     const size_t len3 = build_response(frame3, sizeof(frame3), serial, data, n);
     ParsedResponse r3{};
     const ParseResult pr3 = parse_response(frame3, len3, serial, &r3);
-    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, continuation %d, payload %u B\n",
-                parse_result_to_string(pr3), r3.di, r3.count, r3.announced_count, (int) r3.continuation,
-                r3.payload_len);
+    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, shape '%s', payload %u B\n",
+                parse_result_to_string(pr3), r3.di, r3.count, r3.announced_count,
+                payload_shape_to_string(r3.shape), r3.payload_len);
     check(pr3 == ParseResult::OK, "continuation page parses");
     check(r3.di == DI_PARAMS_CONT, "DI is 0xF203");
-    check(r3.continuation, "read as a continuation - no COUNT byte");
+    check(r3.shape == PayloadShape::CONTINUATION, "read as a continuation - no COUNT byte");
     check(r3.count == 8, "all 8 tail records decoded");
     check(r3.announced_count == 0, "no COUNT byte to announce anything");
     check(r3.find(0x24) != nullptr && r3.find(0x33) != nullptr, "first and last tail records present");
@@ -269,12 +269,50 @@ int main() {
     const size_t len5 = build_response(frame5, sizeof(frame5), serial, data, n);
     ParsedResponse r5{};
     const ParseResult pr5 = parse_response(frame5, len5, serial, &r5);
-    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, continuation %d\n", parse_result_to_string(pr5),
-                r5.di, r5.count, r5.announced_count, (int) r5.continuation);
+    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, shape '%s'\n", parse_result_to_string(pr5), r5.di,
+                r5.count, r5.announced_count, payload_shape_to_string(r5.shape));
     check(pr5 == ParseResult::OK, "the COUNT-byte form parses too");
-    check(!r5.continuation, "recognised as a counted page, not a continuation");
+    check(r5.shape == PayloadShape::COUNTED, "recognised as a counted page, not a continuation");
     check(r5.count == 8, "all 8 records decoded");
     check(r5.find(0x24) != nullptr && r5.find(0x33) != nullptr, "records are aligned, so COUNT was not read as a TAG");
+  }
+
+  // The DI 0xF203 reply as it actually came off the air, from meter ...5596 on
+  // 2026-09-02. Every layer below the records verifies - envelope CRC 0xE2C5,
+  // DL/T 645 checksum 0x43, our address, control 0x81, L = 0x0D consistent - and
+  // DATA de-offsets to 03 F2 | 01 | 00 | 22 84 00 08 01 1F 00 03 01.
+  //
+  // That is not a record tail. It is DI | COUNT=1 | TAG 0x00 | *nine* bytes: the
+  // DI 0xF201 status-block shape, and 3 + 1 + 9 = 13 fits DATA exactly. Read with
+  // the TAG-page widths, where TAG 0x00 is a 4-byte register, no reading fits at
+  // all - which is how this frame used to be thrown away as malformed.
+  std::printf("\n-- DI 0xF203 as captured off the air --\n");
+  {
+    static const char *const F203_HEX = "1C00011D6896552740320268810D3625343355B7333B34523336344316C5E2";
+    uint8_t frame6[64];
+    const size_t len6 = unhex(F203_HEX, frame6, sizeof(frame6));
+    ParsedResponse r6{};
+    const ParseResult pr6 = parse_response(frame6, len6, serial2, &r6);
+    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, shape '%s', payload %u B\n",
+                parse_result_to_string(pr6), r6.di, r6.count, r6.announced_count,
+                payload_shape_to_string(r6.shape), r6.payload_len);
+    check(len6 == 31, "frame is 31 bytes from the LEN byte");
+    check(pr6 == ParseResult::OK, "the captured DI 0xF203 reply parses (it used to be MALFORMED)");
+    check(r6.di == DI_PARAMS_CONT, "DI is 0xF203");
+    check(r6.shape == PayloadShape::COUNTED_STATUS, "recognised as a counted page holding a status block");
+    check(r6.count == 1 && r6.announced_count == 1, "one record, and COUNT agrees");
+    const ParsedItem *blob = r6.find(0x00);
+    check(blob != nullptr && blob->len == STATUS_VALUE_SIZE, "TAG 0x00 is the 9-byte status block");
+    if (blob != nullptr && blob->len == STATUS_VALUE_SIZE) {
+      std::printf("status block: %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", blob->raw[0], blob->raw[1],
+                  blob->raw[2], blob->raw[3], blob->raw[4], blob->raw[5], blob->raw[6], blob->raw[7], blob->raw[8]);
+      // The three fields the status decoder reads. Plausible values are the only
+      // corroboration available for this reading, so state them and let the
+      // numbers be judged: 31 C in September, 3 tariffs, tariff 1 active.
+      check(blob->raw[STATUS_OFF_TEMPERATURE] == 31, "byte 5 (temperature) = 31");
+      check(blob->raw[STATUS_OFF_TARIFF_COUNT] == 3, "byte 7 (tariff count) = 3");
+      check(blob->raw[STATUS_OFF_ACTIVE_TARIFF] == 1, "byte 8 (active tariff) = 1");
+    }
   }
 
   std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202/0xF203 PAGES DECODE CORRECTLY" : "FAILURES", fail);

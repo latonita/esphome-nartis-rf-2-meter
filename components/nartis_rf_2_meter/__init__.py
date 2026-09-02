@@ -5,16 +5,23 @@ a CMT2300A 443 MHz radio by emulating the НАРТИС-Д101-2 display. The link
 a DL/T 645-1997 frame with no encryption, no session and no password, so this
 component talks to the meter on its own - no UART bridge and no dlms_cosem.
 
-Only a fixed set of values is available: the meter answers four constant requests
+Only a fixed set of values is available: the meter answers five constant requests
 and returns whatever its configured indication set contains. Entities therefore
 select a value by its 1-byte item TAG or by a field of the status block
 (DI 0xF201) - there is no way to ask for something else.
 
-Every cycle reads all four data identifiers: DI 0xF200 (energy registers and
-clock), DI 0xF201 (status), DI 0xF202 (the same registers plus the instantaneous
-values) and DI 0xF203 (the tail of the DI 0xF202 record list, which announces more
-records than one frame can carry). The three TAG-bearing pages are merged, so a
-`tag` entity does not care which one carried its value.
+Every cycle reads all five data identifiers, in this order:
+
+    DI 0xF202  energy registers, clock and the instantaneous values
+    DI 0xF203  the tail of that record list, which does not fit one frame
+    DI 0xF200  energy registers and clock
+    DI 0xF201  status block
+    DI 0xF102  not established; believed to hold the per-phase power, reactive
+               power and power factor that DI 0xF202 has no room for
+
+DI 0xF203 resumes DI 0xF202 from a cursor the meter keeps and DI 0xF200 resets it,
+which is why the pair leads. Pages whose records fit the TAG layout are merged, so
+a `tag` entity does not care which one carried its value.
 """
 
 from esphome import pins
@@ -150,7 +157,8 @@ def validate_tag_entity(config):
 #   0xF201  status block
 #   0xF202  the same registers plus voltages, currents, power, frequency
 #   0xF203  the tail of the 0xF202 record list, resumed from the meter's cursor
-KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6}
+#   0xF102  unestablished; the 6-byte body is an assumption, not an observation
+KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6, 0xF102: 6}
 
 MAX_REQUEST_BODY = 8
 
@@ -215,6 +223,9 @@ CONFIG_SCHEMA = cv.Schema(
         # that continues it, and the meter's resume cursor is what has to survive
         # that pause - so if the tail comes back empty on a working link, a shorter
         # gap is the first thing to try.
+        #
+        # Five exchanges per cycle at ~1 s each, so the whole cycle is roughly
+        # 5 * (airtime + gap); keep update_interval well clear of that.
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,

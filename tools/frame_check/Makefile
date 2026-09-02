@@ -6,8 +6,10 @@
 #   frame_check - envelope, DL/T 645 layer and the reference request/response
 #                 frames from the protocol notes
 #   f202_check  - the 15 records of a captured DI 0xF202 page, which is what
-#                 established that instantaneous values are 2-byte BCD and not
-#                 the 4-byte binary the DLMS data types had suggested
+#                 established that instantaneous values are 4-byte BCD and not
+#                 the 4-byte binary the DLMS data types had suggested, plus the
+#                 DI 0xF203 replies: the assembled continuation forms and the one
+#                 captured off the air, which turned out to be a status block
 COMP := ../../components/nartis_rf_2_meter
 CXXFLAGS := -std=c++17 -Wall -Wextra -I$(COMP)
 DEPS := $(COMP)/d101_frame.cpp $(COMP)/d101_frame.h
