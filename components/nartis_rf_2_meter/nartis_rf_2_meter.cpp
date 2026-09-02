@@ -55,44 +55,71 @@ void NartisRf2MeterComponent::setup() {
   this->set_state_(State::IDLE);
 }
 
-// These two lists are the definition of the undecoded pages, and they are indexed
-// in lockstep by Step::idx - keep them adjacent and the same length.
-uint16_t NartisRf2MeterComponent::raw_page_di_(uint8_t idx) {
-  static const uint16_t DIS[RAW_PAGE_COUNT] = {DI_F101, DI_F104};
-  return (idx < RAW_PAGE_COUNT) ? DIS[idx] : 0;
-}
+void NartisRf2MeterComponent::handle_list_reply_(uint8_t request_idx, const ParsedResponse &resp) {
+  const ListRequest &req = LIST_REQUESTS[request_idx];
+  const uint8_t list = static_cast<uint8_t>(req.list);
+  const bool got_status_half = (resp.shape == PayloadShape::STATUS_HALF);
 
-uint8_t NartisRf2MeterComponent::raw_page_bit_(uint8_t idx) {
-  static const uint8_t BITS[RAW_PAGE_COUNT] = {PAGE_BIT_F101, PAGE_BIT_F104};
-  return (idx < RAW_PAGE_COUNT) ? BITS[idx] : 0;
-}
+  if ((req.part == ListPart::STATUS) != got_status_half) {
+    // The request and the framing of the reply disagree. The reply is taken at
+    // what it decodes as, not at what was asked for - the exact-fit rule already
+    // proved that reading consumes DATA - but it is a finding worth one line.
+    this->warn_unexpected_half_once_(request_idx, resp);
+  }
 
-uint8_t NartisRf2MeterComponent::page_bit_of_(const Step &step) {
-  switch (step.kind) {
-    case StepKind::ENERGY:
-      return PAGE_BIT_ENERGY;
-    case StepKind::PARAMS:
-      return PAGE_BIT_PARAMS;
-    case StepKind::PARAMS_CONT:
-      return PAGE_BIT_PARAMS_CONT;
-    case StepKind::F102:
-      return PAGE_BIT_F102;
-    case StepKind::RAW_PAGE:
-      return raw_page_bit_(step.idx);
-    default:
-      return 0;  // the status poll and the probes are not part of the merged set
+  // Records go into the merged set whichever half carried them: the leftovers a
+  // status half brings are the same list continued, over the same TAG numbering.
+  this->merge_records_(resp);
+  this->list_arrived_[list] = static_cast<uint8_t>(this->list_arrived_[list] + resp.count);
+
+  if (!got_status_half) {
+    // COUNT is the whole list; this frame held what fitted. The status half is
+    // what brings the rest, so the two are compared once the cycle is done.
+    this->list_announced_[list] = resp.announced_count;
+    return;
+  }
+
+  if (!resp.has_status_block) {
+    return;  // unreachable: the shape is only chosen when the block is there
+  }
+  if (!this->status_ok_) {
+    std::memcpy(this->status_block_, resp.status_block, STATUS_BLOCK_SIZE);
+    this->status_ok_ = true;
+    return;
+  }
+  // Both lists end with a block. They should agree - they are built from the same
+  // device state - so a difference means one of the two readings is wrong.
+  if (std::memcmp(this->status_block_, resp.status_block, STATUS_BLOCK_SIZE) != 0) {
+    ESP_LOGW(TAG, "The two lists' status blocks differ: kept %s",
+             format_hex_pretty(this->status_block_, STATUS_BLOCK_SIZE).c_str());
+    ESP_LOGW(TAG, "  DI 0x%04X sent %s", req.di,
+             format_hex_pretty(resp.status_block, STATUS_BLOCK_SIZE).c_str());
   }
 }
 
-void NartisRf2MeterComponent::merge_page_(const ParsedResponse &resp) {
+void NartisRf2MeterComponent::warn_unexpected_half_once_(uint8_t request_idx, const ParsedResponse &resp) {
+  const uint8_t bit = static_cast<uint8_t>(1u << request_idx);
+  if ((this->warned_half_ & bit) != 0) {
+    return;
+  }
+  this->warned_half_ |= bit;
+  const ListRequest &req = LIST_REQUESTS[request_idx];
+  ESP_LOGW(TAG, "DI 0x%04X is list %s's %s half, but its reply is framed as the other one: %s", req.di,
+           list_id_to_string(req.list), (req.part == ListPart::STATUS) ? "status" : "records",
+           payload_shape_to_string(resp.shape));
+  ESP_LOGW(TAG, "  Read as what it decodes to, since that reading fits DATA exactly. Please report the");
+  ESP_LOGW(TAG, "  RX line above - it means this meter frames its lists differently.");
+}
+
+void NartisRf2MeterComponent::merge_records_(const ParsedResponse &resp) {
   for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
     const ParsedItem &item = resp.items[i];
     const ParsedItem *seen = this->find_merged_(item.tag);
     if (seen != nullptr) {
-      // DI 0xF202 is a superset, and it is read first, so the DI 0xF200 that
-      // follows repeats records already held and the first copy stands. They have
-      // to agree, though: a disagreement means one of the two decodes is wrong,
-      // which is worth saying out loud.
+      // The lists overlap, and list B - the superset - is read first, so the
+      // records list A repeats are already held and the first copy stands. They
+      // have to agree, though: a disagreement means one of the two decodes is
+      // wrong, which is worth saying out loud.
       if (seen->len != item.len || std::memcmp(seen->raw, item.raw, item.len) != 0) {
         ESP_LOGW(TAG, "TAG 0x%02X differs between pages: kept %s, DI 0x%04X sent %s", item.tag,
                  format_hex_pretty(seen->raw, seen->len).c_str(), resp.di,
@@ -120,36 +147,29 @@ const ParsedItem *NartisRf2MeterComponent::find_merged_(uint8_t tag) const {
   return nullptr;
 }
 
-void NartisRf2MeterComponent::report_silent_pages_() {
-  // Every cycle asks for all three TAG pages. A meter configured without one of
-  // them answers nothing at all to it, which for a cycle or two looks exactly like
-  // a bad link - so wait a few, then say it once.
-  if (this->warned_silent_pages_ || this->cycles_ < PAGE_SILENT_WARN_CYCLES) {
+void NartisRf2MeterComponent::report_silent_requests_() {
+  // A meter configured with only one of the two lists answers nothing at all to
+  // the other, which for a cycle or two looks exactly like a bad link - so wait a
+  // few cycles, then say it once.
+  if (this->warned_silent_requests_ || this->cycles_ < REQUEST_SILENT_WARN_CYCLES) {
     return;
   }
-  const uint8_t silent = static_cast<uint8_t>(this->pages_polled_ & ~this->pages_seen_);
+  const uint8_t silent = static_cast<uint8_t>(this->requests_polled_ & ~this->requests_seen_);
   if (silent == 0) {
     return;
   }
-  this->warned_silent_pages_ = true;
+  this->warned_silent_requests_ = true;
 
-  struct PageName {
-    uint8_t bit;
-    uint16_t di;
-  };
-  static const PageName PAGES[] = {{PAGE_BIT_PARAMS, DI_PARAMS},
-                                   {PAGE_BIT_PARAMS_CONT, DI_PARAMS_CONT},
-                                   {PAGE_BIT_ENERGY, DI_ENERGY},
-                                   {PAGE_BIT_F102, DI_F102},
-                                   {PAGE_BIT_F101, DI_F101},
-                                   {PAGE_BIT_F104, DI_F104}};
-  for (const PageName &page : PAGES) {
-    if ((silent & page.bit) != 0) {
-      ESP_LOGW(TAG,
-               "DI 0x%04X has not answered once in %" PRIu32 " cycle(s) - most likely this meter does not "
-               "implement it. It still costs one exchange per cycle",
-               page.di, this->cycles_);
+  for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
+    if ((silent & (1u << i)) == 0) {
+      continue;
     }
+    const ListRequest &req = LIST_REQUESTS[i];
+    ESP_LOGW(TAG,
+             "DI 0x%04X (list %s, %s) has not answered once in %" PRIu32 " cycle(s) - most likely this "
+             "meter does not have that list. It still costs one exchange per cycle",
+             req.di, list_id_to_string(req.list), (req.part == ListPart::STATUS) ? "status half" : "records half",
+             this->cycles_);
   }
 }
 
@@ -162,7 +182,8 @@ void NartisRf2MeterComponent::dump_config() {
                 this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
   ESP_LOGCONFIG(TAG, "  RX timeout: %" PRIu32 " ms, retries: %u, request gap: %" PRIu32 " ms", this->rf_rx_timeout_ms_,
                 this->rf_retries_, this->request_gap_ms_);
-  ESP_LOGCONFIG(TAG, "  Polling: data pages %s, status %s", YESNO(this->need_data_), YESNO(this->need_status_));
+  ESP_LOGCONFIG(TAG, "  Polling: list records %s, status blocks %s", YESNO(this->need_data_),
+                YESNO(this->need_data_ || this->need_status_));
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
   LOG_PIN("  SDIO pin: ", this->pin_sdio_);
   LOG_PIN("  SCLK pin: ", this->pin_sclk_);
@@ -174,12 +195,14 @@ void NartisRf2MeterComponent::dump_config() {
   // Print the frames we will actually put on the air, so they can be compared
   // against a capture without having to catch a VERBOSE log line.
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> frame{};
-  for (const uint16_t di : {DI_PARAMS, DI_PARAMS_CONT, DI_ENERGY, DI_STATUS, DI_F102, DI_F101, DI_F104}) {
-    const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, di);
+  for (const ListRequest &req : LIST_REQUESTS) {
+    const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, req.di);
+    const char *half = (req.part == ListPart::STATUS) ? "status " : "records";
     if (n == 0) {
-      ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: FAILED TO BUILD", di);
+      ESP_LOGCONFIG(TAG, "  List %s %s DI 0x%04X: FAILED TO BUILD", list_id_to_string(req.list), half, req.di);
     } else {
-      ESP_LOGCONFIG(TAG, "  Request DI 0x%04X: %s", di, format_hex_pretty(frame.data(), n).c_str());
+      ESP_LOGCONFIG(TAG, "  List %s %s DI 0x%04X: %s", list_id_to_string(req.list), half, req.di,
+                    format_hex_pretty(frame.data(), n).c_str());
     }
   }
 
@@ -266,41 +289,30 @@ void NartisRf2MeterComponent::start_cycle_() {
   this->cycles_++;
   this->cycle_start_ms_ = millis();
   this->merged_count_ = 0;
-  this->energy_ok_ = false;
   this->status_ok_ = false;
-  this->params_ok_ = false;
-  this->params_cont_ok_ = false;
-  this->f102_ok_ = false;
-  this->raw_ok_ = 0;
-  this->params_complete_ = false;
+  this->answered_ = 0;
+  for (uint8_t l = 0; l < LIST_COUNT; l++) {
+    this->list_announced_[l] = 0;
+    this->list_arrived_[l] = 0;
+  }
   this->attempt_ = 0;
 
-  // Build this cycle's exchange list. Capability-gated: an exchange nobody
-  // consumes is not worth waking the radio for.
+  // Build this cycle's exchange list by walking LIST_REQUESTS in order. That
+  // order is load-bearing - a status half has to follow its own records half back
+  // to back, or the cursor holding the leftover records is already gone - so the
+  // table is walked as it stands and nothing is inserted between a pair.
   //
-  // The order is not free. DI 0xF203 resumes the DI 0xF202 list from a cursor the
-  // meter holds, and DI 0xF200 and DI 0xF202 both reset it, so the continuation has
-  // to sit immediately after its DI 0xF202. Putting the pair first is what makes
-  // that structural rather than a convention to remember: nothing can be inserted
-  // ahead of DI 0xF203, and the reset DI 0xF200 performs happens once the tail is
-  // already in hand. DI 0xF102 goes last, being the least understood of the five.
+  // Capability-gated: a records half is only worth the airtime when something
+  // reads a TAG, but a status half is needed either way, since it carries both the
+  // status block and the records that did not fit.
   this->step_count_ = 0;
   this->step_idx_ = 0;
-  if (this->need_data_) {
-    this->steps_[this->step_count_++] = Step{StepKind::PARAMS, 0};
-    this->steps_[this->step_count_++] = Step{StepKind::PARAMS_CONT, 0};
-    this->steps_[this->step_count_++] = Step{StepKind::ENERGY, 0};
-  }
-  if (this->need_status_) {
-    this->steps_[this->step_count_++] = Step{StepKind::STATUS, 0};
-  }
-  if (this->need_data_) {
-    this->steps_[this->step_count_++] = Step{StepKind::F102, 0};
-    // Read but not decoded. They publish nothing, so they are gated on need_data_
-    // like the rest: worth the airtime while the radio is up for real readings,
-    // not worth waking it on their own.
-    for (uint8_t i = 0; i < RAW_PAGE_COUNT; i++) {
-      this->steps_[this->step_count_++] = Step{StepKind::RAW_PAGE, i};
+  for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
+    const bool wanted = (LIST_REQUESTS[i].part == ListPart::RECORDS)
+                            ? this->need_data_
+                            : (this->need_data_ || this->need_status_);
+    if (wanted) {
+      this->steps_[this->step_count_++] = Step{StepKind::LIST, i};
     }
   }
   for (uint8_t i = 0; i < this->probe_count_; i++) {
@@ -314,24 +326,10 @@ void NartisRf2MeterComponent::start_cycle_() {
 
 uint16_t NartisRf2MeterComponent::current_di_() const {
   const Step &step = this->steps_[this->step_idx_];
-  switch (step.kind) {
-    case StepKind::ENERGY:
-      return DI_ENERGY;
-    case StepKind::STATUS:
-      return DI_STATUS;
-    case StepKind::PARAMS:
-      return DI_PARAMS;
-    case StepKind::PARAMS_CONT:
-      return DI_PARAMS_CONT;
-    case StepKind::F102:
-      return DI_F102;
-    case StepKind::RAW_PAGE:
-      return raw_page_di_(step.idx);
-    case StepKind::PROBE:
-      return this->probes_[step.idx].di;
-    default:
-      return 0;
+  if (step.kind == StepKind::PROBE) {
+    return this->probes_[step.idx].di;
   }
+  return LIST_REQUESTS[step.idx].di;
 }
 
 void NartisRf2MeterComponent::loop() {
@@ -388,7 +386,9 @@ bool NartisRf2MeterComponent::send_request_() {
     ESP_LOGE(TAG, "Failed to build request for DI 0x%04X", di);
     return false;
   }
-  this->pages_polled_ |= page_bit_of_(step);
+  if (step.kind == StepKind::LIST) {
+    this->requests_polled_ |= static_cast<uint8_t>(1u << step.idx);
+  }
 
   // Logged at DEBUG alongside the RX dump, so a log excerpt always shows the
   // complete exchange - what we asked and what came back.
@@ -461,112 +461,18 @@ void NartisRf2MeterComponent::handle_wait_() {
     const ParseResult r = parse_response(this->rx_buf_.data(), this->rx_len_, this->serial_le_, &resp,
                                          this->tag_width_);
 
-    // A DI 0xF203 reply may echo either its own data identifier or the DI 0xF202
-    // list it continues - it has never been captured, and both are this exchange
-    // answering.
-    const bool di_matches = (resp.di == di) || (step.kind == StepKind::PARAMS_CONT && resp.di == DI_PARAMS);
-
-    if (r == ParseResult::OK && di_matches) {
+    if (r == ParseResult::OK && resp.di == di) {
       if (is_probe) {
         // Nothing consumes a probe; the log is the whole point.
         ESP_LOGI(TAG, "PROBE DI 0x%04X ANSWERED: %u item(s)", di, resp.count);
-        this->log_response_(di, resp);
+        this->log_response_(resp);
       } else {
-        ESP_LOGV(TAG, "DI 0x%04X: %u item(s), rssi %d dBm", di, resp.count, this->last_rssi_dbm_);
-        this->log_response_(di, resp);
-        this->pages_seen_ |= page_bit_of_(step);
-        switch (step.kind) {
-          case StepKind::STATUS:
-            this->status_ = resp;
-            this->status_ok_ = true;
-            break;
-          case StepKind::ENERGY:
-            this->energy_ok_ = true;
-            this->merge_page_(resp);
-            break;
-          case StepKind::PARAMS:
-            this->params_ok_ = true;
-            this->merge_page_(resp);
-            // COUNT is what the meter holds; the frame carries what fits. Ask
-            // DI 0xF203 for a tail only when there is one to fetch.
-            this->params_complete_ = (resp.announced_count <= resp.count);
-            if (this->params_complete_) {
-              ESP_LOGV(TAG, "DI 0x%04X delivered all %u announced record(s) - skipping DI 0x%04X", DI_PARAMS,
-                       resp.announced_count, DI_PARAMS_CONT);
-            }
-            break;
-          case StepKind::PARAMS_CONT: {
-            this->params_cont_ok_ = true;
-            ESP_LOGD(TAG, "DI 0x%04X reply shape: %s", di, payload_shape_to_string(resp.shape));
-            if (resp.shape == PayloadShape::COUNTED_STATUS) {
-              // Not the record tail this exchange asked for: the meter answered
-              // with a status block, the shape DI 0xF201 returns. Deliberately kept
-              // out of the merged TAG set - there TAG 0x00 is a 4-byte energy
-              // register, and folding a 9-byte block in under the same TAG would
-              // collide with the real one on every cycle.
-              if (!this->warned_params_cont_shape_) {
-                this->warned_params_cont_shape_ = true;
-                const ParsedItem *blob = resp.find(0x00);
-                ESP_LOGW(TAG, "DI 0x%04X answered with a status block, not the tail of the DI 0x%04X list: %s", di,
-                         DI_PARAMS, (blob == nullptr) ? "(no TAG 0x00)"
-                                                      : format_hex_pretty(blob->raw, blob->len).c_str());
-                ESP_LOGW(TAG, "  So on this meter DI 0x%04X is not the continuation it was taken for, and the", di);
-                ESP_LOGW(TAG, "  records DI 0x%04X announces but does not send have no known way to be read.",
-                         DI_PARAMS);
-                ESP_LOGW(TAG, "  The block is ignored rather than published - please report the line above.");
-              }
-              break;
-            }
-            if (resp.count == 0) {
-              // Nothing was pending: the cursor got cleared before we asked, or the
-              // meter had already sent its whole list.
-              ESP_LOGD(TAG, "DI 0x%04X returned an empty tail", di);
-            }
-            this->merge_page_(resp);
-            break;
-          }
-          case StepKind::F102: {
-            this->f102_ok_ = true;
-            if (!this->reported_f102_shape_) {
-              this->reported_f102_shape_ = true;
-              // First answer from a page little is known about. Saying what shape it
-              // turned out to have is most of the reason it is polled at all. A
-              // fixed block has no records to count, so count its values instead.
-              if (resp.shape == PayloadShape::FIXED_BLOCK) {
-                ESP_LOGI(TAG, "DI 0x%04X answered: %s, %u value(s)", di, payload_shape_to_string(resp.shape),
-                         static_cast<unsigned>((resp.payload_len - 3) / F102_VALUE_SIZE));
-              } else {
-                ESP_LOGI(TAG, "DI 0x%04X answered: %s, %u record(s)", di, payload_shape_to_string(resp.shape),
-                         resp.count);
-              }
-            }
-            if (resp.shape == PayloadShape::FIXED_BLOCK) {
-              // The expected answer: instantaneous values with no TAGs on them.
-              // Logged and dropped - there is no TAG to select one by, so nothing
-              // here can reach an entity yet.
-              this->log_f102_block_(resp);
-              break;
-            }
-            if (resp.shape == PayloadShape::COUNTED_STATUS) {
-              // A status block, not TAG-page data. Kept out of the merged set for
-              // the same reason as on DI 0xF203: TAG 0x00 means a 4-byte energy
-              // register there, and folding a 9-byte block in would collide with it.
-              ESP_LOGD(TAG, "DI 0x%04X holds a status block - not merged into the TAG set", di);
-              break;
-            }
-            // It fits the TAG-page layout exactly, so its records read like any
-            // other page's. A TAG only this page carries still goes through
-            // warn_unconfirmed_tag_once_() before it reaches an entity.
-            this->merge_page_(resp);
-            break;
-          }
-          case StepKind::RAW_PAGE:
-            this->raw_ok_ |= static_cast<uint8_t>(1u << step.idx);
-            this->log_raw_page_(di, step.idx, resp);
-            break;
-          default:
-            break;
-        }
+        ESP_LOGV(TAG, "DI 0x%04X: %u record(s), rssi %d dBm", di, resp.count, this->last_rssi_dbm_);
+        this->log_response_(resp);
+        const uint8_t bit = static_cast<uint8_t>(1u << step.idx);
+        this->requests_seen_ |= bit;
+        this->answered_ |= bit;
+        this->handle_list_reply_(step.idx, resp);
       }
       this->finish_exchange_();
       return;
@@ -638,18 +544,14 @@ void NartisRf2MeterComponent::retry_or_finish_() {
   this->finish_exchange_();
 }
 
-bool NartisRf2MeterComponent::skip_step_(const Step &step) const {
-  return step.kind == StepKind::PARAMS_CONT && this->params_complete_;
-}
-
 void NartisRf2MeterComponent::finish_exchange_() {
   this->hal_.go_standby();
   this->rx_len_ = 0;
 
+  // Every step in the list is sent. Nothing is conditional on what an earlier
+  // reply held: a status half is still worth asking for when its records half
+  // delivered the whole list, because the status block comes back either way.
   this->step_idx_++;
-  while (this->step_idx_ < this->step_count_ && this->skip_step_(this->steps_[this->step_idx_])) {
-    this->step_idx_++;
-  }
   if (this->step_idx_ < this->step_count_) {
     this->set_state_(State::GAP);
     return;
@@ -682,15 +584,34 @@ void NartisRf2MeterComponent::handle_publish_() {
     }
   }
 
-  this->report_silent_pages_();
+  // A list that announced more records than arrived is the interesting case: the
+  // records half sent what fitted and the status half should have brought the
+  // rest, so a shortfall means some are unaccounted for.
+  for (uint8_t l = 0; l < LIST_COUNT; l++) {
+    if (this->list_announced_[l] > this->list_arrived_[l]) {
+      ESP_LOGD(TAG, "List %s announced %u record(s) but %u arrived", list_id_to_string(static_cast<ListId>(l)),
+               this->list_announced_[l], this->list_arrived_[l]);
+    }
+  }
 
-  ESP_LOGD(TAG,
-           "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); "
-           "F202 %s, F203 %s, F200 %s, F201 %s, F102 %s, F101 %s, F104 %s)",
-           this->cycles_, millis() - this->cycle_start_ms_, this->merged_count_, YESNO(this->params_ok_),
-           this->params_complete_ ? "skipped" : YESNO(this->params_cont_ok_), YESNO(this->energy_ok_),
-           YESNO(this->status_ok_), YESNO(this->f102_ok_), YESNO((this->raw_ok_ & raw_page_bit_(0)) != 0),
-           YESNO((this->raw_ok_ & raw_page_bit_(1)) != 0));
+  this->report_silent_requests_();
+
+  // Which of the four answered, built from LIST_REQUESTS so the line cannot fall
+  // out of step with what was actually asked.
+  char asked[72];
+  size_t at = 0;
+  for (uint8_t i = 0; i < LIST_REQUEST_COUNT && at + 1 < sizeof(asked); i++) {
+    const bool sent = (this->requests_polled_ & (1u << i)) != 0;
+    const int n = std::snprintf(asked + at, sizeof(asked) - at, "%s%04X %s", (i != 0) ? ", " : "",
+                                LIST_REQUESTS[i].di,
+                                !sent ? "-" : (((this->answered_ & (1u << i)) != 0) ? "yes" : "no"));
+    if (n <= 0) {
+      break;
+    }
+    at += static_cast<size_t>(n);
+  }
+  ESP_LOGD(TAG, "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); %s)", this->cycles_,
+           millis() - this->cycle_start_ms_, this->merged_count_, asked);
   ESP_LOGV(TAG, "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", retries %" PRIu32 ", give-ups %" PRIu32,
            this->no_reply_count_, this->bad_frame_count_, this->retry_count_, this->giveup_count_);
 
@@ -698,13 +619,16 @@ void NartisRf2MeterComponent::handle_publish_() {
   // partial cycle is reported as a failure on purpose: it left some entity holding
   // a stale value, which is the thing this entity exists to expose.
   //
-  // "Needed" is per-kind, not per-page. DI 0xF202 is a superset of DI 0xF200, so a
-  // meter that implements only one of them is fully read by whichever answers, and
-  // demanding both would peg this entity to false forever. The DI 0xF203 tail is
-  // not required either: it is skipped when nothing is pending, and an empty tail
-  // is a valid answer.
-  this->publish_cycle_outcome_((!this->need_data_ || this->energy_ok_ || this->params_ok_) &&
-                               (!this->need_status_ || this->status_ok_));
+  // Deliberately lenient about which list answered: a meter configured with only
+  // one of the two is fully read from that one, so requiring both would peg this
+  // entity to false forever. A status half is not required for data either.
+  bool any_records = false;
+  for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
+    if (LIST_REQUESTS[i].part == ListPart::RECORDS && (this->answered_ & (1u << i)) != 0) {
+      any_records = true;
+    }
+  }
+  this->publish_cycle_outcome_((!this->need_data_ || any_records) && (!this->need_status_ || this->status_ok_));
 }
 
 void NartisRf2MeterComponent::publish_cycle_outcome_(bool ok) {
@@ -714,7 +638,7 @@ void NartisRf2MeterComponent::publish_cycle_outcome_(bool ok) {
   this->last_read_ok_bs_->publish_state(ok);
 }
 
-void NartisRf2MeterComponent::describe_item_(uint16_t di, const ParsedItem &item, char *out, size_t cap,
+void NartisRf2MeterComponent::describe_item_(const ParsedItem &item, char *out, size_t cap,
                                              const uint8_t *width_overrides) {
   const std::string hex = format_hex_pretty(item.raw, item.len);
 
@@ -722,7 +646,10 @@ void NartisRf2MeterComponent::describe_item_(uint16_t di, const ParsedItem &item
   // without decoding little-endian bytes by eye.
   char interp[48] = "";
   TagInfo info{};
-  if (tag_info(di, item.tag, &info, width_overrides)) {
+  // The width check is what keeps the DI 0xF201 status block out of this: it
+  // arrives as TAG 0x00 with 9 bytes, where the TAG table has a 4-byte energy
+  // register, so there is no sensible scalar reading and none is printed.
+  if (tag_info(item.tag, &info, width_overrides) && info.width == item.len) {
     switch (info.enc) {
       case TagEnc::UINT_LE: {
         const uint32_t v = item_as_u32(item);
@@ -743,6 +670,15 @@ void NartisRf2MeterComponent::describe_item_(uint16_t di, const ParsedItem &item
         }
         break;
       }
+      case TagEnc::BCD_LE_SIGNED: {
+        int32_t v = 0;
+        if (item_as_bcd_signed(item, &v)) {
+          std::snprintf(interp, sizeof(interp), " (%" PRId32 " -> %.3f %s)", v, v * info.scale, info.unit);
+        } else {
+          std::snprintf(interp, sizeof(interp), " (not valid BCD)");
+        }
+        break;
+      }
       case TagEnc::BCD_CLOCK: {
         char clock[20];
         if (item_clock_to_string(item, clock, sizeof(clock))) {
@@ -755,15 +691,13 @@ void NartisRf2MeterComponent::describe_item_(uint16_t di, const ParsedItem &item
           std::snprintf(interp, sizeof(interp), " (%" PRIu32 ", unit unknown)", item_as_u32(item));
         }
         break;
-      case TagEnc::STATUS_BLOB:
-        break;  // no single scalar interpretation
     }
   }
 
   std::snprintf(out, cap, "TAG 0x%02X = %s%s", item.tag, hex.c_str(), interp);
 }
 
-void NartisRf2MeterComponent::log_response_(uint16_t di, const ParsedResponse &resp) const {
+void NartisRf2MeterComponent::log_response_(const ParsedResponse &resp) const {
   ESP_LOGVV(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
   if (resp.announced_count > resp.count) {
     // Normal: the meter announces its whole record set and sends what fits.
@@ -771,7 +705,7 @@ void NartisRf2MeterComponent::log_response_(uint16_t di, const ParsedResponse &r
   }
   char line[96];
   for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
-    describe_item_(di, resp.items[i], line, sizeof(line), this->tag_width_);
+    describe_item_(resp.items[i], line, sizeof(line), this->tag_width_);
     ESP_LOGD(TAG, "  %s", line);
   }
 }
@@ -790,7 +724,7 @@ void NartisRf2MeterComponent::log_unknown_tag_(uint16_t di, const ParsedResponse
     ESP_LOGW(TAG, "  decoded %u item(s) before it:", resp.count);
     char line[96];
     for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
-      describe_item_(di, resp.items[i], line, sizeof(line), this->tag_width_);
+      describe_item_(resp.items[i], line, sizeof(line), this->tag_width_);
       ESP_LOGW(TAG, "    %s", line);
     }
   } else {
@@ -815,72 +749,13 @@ void NartisRf2MeterComponent::log_bad_records_(uint16_t di, ParseResult r, const
     ESP_LOGW(TAG, "  decoded %u record(s) before the layout stopped adding up:", resp.count);
     char line[96];
     for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
-      describe_item_(di, resp.items[i], line, sizeof(line), this->tag_width_);
+      describe_item_(resp.items[i], line, sizeof(line), this->tag_width_);
       ESP_LOGW(TAG, "    %s", line);
     }
   } else {
     ESP_LOGW(TAG, "  no records decoded at all");
   }
   ESP_LOGW(TAG, "  Please report the payload line together with the parameters your display shows.");
-}
-
-void NartisRf2MeterComponent::log_f102_block_(const ParsedResponse &resp) const {
-  F102Block b{};
-  if (!parse_f102_block(resp.payload, resp.payload_len, &b)) {
-    // parse_response() accepted the shape by running this same function, so a
-    // failure here would mean the two disagree.
-    ESP_LOGE(TAG, "DI 0x%04X: fixed block failed to re-parse: %s", DI_F102,
-             format_hex_pretty(resp.payload, resp.payload_len).c_str());
-    return;
-  }
-
-  if (b.count != F102_VALUE_COUNT) {
-    // A different number of values than the layout describes, so position no
-    // longer identifies anything. Dump them raw and say so; this is the evidence
-    // a second layout would be worked out from.
-    ESP_LOGW(TAG, "DI 0x%04X: %u values, not the %u the known layout has - order unknown, values raw:", DI_F102,
-             b.count, static_cast<unsigned>(F102_VALUE_COUNT));
-    for (uint8_t i = 0; i < b.count; i++) {
-      ESP_LOGW(TAG, "  [%2u] %" PRId32, i + 1, b.values[i]);
-    }
-    ESP_LOGW(TAG, "  marker 0x%02X, payload: %s", b.marker,
-             format_hex_pretty(resp.payload, resp.payload_len).c_str());
-    return;
-  }
-
-  // Grouped the way the quantities relate rather than one line per value: three
-  // lines a cycle is readable in a long log, fifteen is not. Indices are the
-  // F102_VALUES order - see the layout there before rearranging these.
-  const auto v = [&](uint8_t i) { return static_cast<float>(b.values[i]) * F102_VALUES[i].scale; };
-  ESP_LOGD(TAG, "DI 0x%04X: P %.1f W (L1 %.1f, L2 %.1f, L3 %.1f)", DI_F102, v(0), v(1), v(2), v(3));
-  ESP_LOGD(TAG, "DI 0x%04X: Q %.1f var (L1 %.1f, L2 %.1f, L3 %.1f)", DI_F102, v(4), v(5), v(6), v(7));
-  ESP_LOGD(TAG, "DI 0x%04X: L1 %.2f V %.2f A | L2 %.2f V %.2f A | L3 %.2f V %.2f A | %.2f Hz", DI_F102, v(8), v(9),
-           v(10), v(11), v(12), v(13), v(14));
-  if (b.marker != 0x01) {
-    // The one byte of the block nothing is known about. Worth a line if it ever
-    // differs from the value every observed reply carries.
-    ESP_LOGD(TAG, "DI 0x%04X: marker 0x%02X, not the 0x01 seen so far", DI_F102, b.marker);
-  }
-}
-
-void NartisRf2MeterComponent::log_raw_page_(uint16_t di, uint8_t idx, const ParsedResponse &resp) {
-  const uint8_t bit = static_cast<uint8_t>(1u << idx);
-  const bool first = (this->reported_raw_pages_ & bit) == 0;
-  this->reported_raw_pages_ |= bit;
-
-  // The payload IS the result of this exchange - nothing else is done with it - so
-  // it goes in the log every cycle. The first answer gets INFO instead of DEBUG:
-  // that a page nobody has decoded answers at all is the finding, and it should
-  // not take a DEBUG log to notice. The control code was already checked, so a
-  // refusal never reaches here; it goes through the error path with its hint.
-  if (first) {
-    ESP_LOGI(TAG, "DI 0x%04X answered: %u byte(s) of DATA, not decoded (there is no known layout for it):", di,
-             resp.payload_len);
-    ESP_LOGI(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
-  } else {
-    ESP_LOGD(TAG, "DI 0x%04X: %u byte(s) not decoded, payload: %s", di, resp.payload_len,
-             format_hex_pretty(resp.payload, resp.payload_len).c_str());
-  }
 }
 
 void NartisRf2MeterComponent::note_tag_width_(uint8_t tag, StatusField field, uint8_t width) {
@@ -894,11 +769,12 @@ void NartisRf2MeterComponent::warn_unconfirmed_tag_once_(uint8_t tag, TagConfide
   if (tag >= TAG_WIDTH_TABLE_SIZE) {
     return;
   }
-  const uint64_t bit = 1ULL << tag;
-  if ((this->warned_tags_ & bit) != 0) {
+  const uint64_t bit = 1ULL << (tag % 64);
+  uint64_t &word = this->warned_tags_[tag / 64];
+  if ((word & bit) != 0) {
     return;
   }
-  this->warned_tags_ |= bit;
+  word |= bit;
   ESP_LOGW(TAG, "TAG 0x%02X: value width not yet seen on this link (%s) - check the value looks sane", tag,
            tag_confidence_to_string(conf));
 }
@@ -917,9 +793,7 @@ void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
   }
 
   TagInfo info{};
-  // Any of the three pages resolves the same table, so the DI here only picks the
-  // TAG-page family rather than a specific page.
-  if (!tag_info(DI_PARAMS, e.tag, &info, this->tag_width_)) {
+  if (!tag_info(e.tag, &info, this->tag_width_)) {
     return;  // cannot happen: the parser would have aborted on an unknown TAG
   }
   if (info.conf != TagConfidence::OBSERVED) {
@@ -952,6 +826,17 @@ void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
         }
         e.sensor->publish_state(static_cast<float>(value));
         ESP_LOGD(TAG, "  -> '%s' = %" PRIu32, e.sensor->get_name().c_str(), value);
+        break;
+      }
+      case TagEnc::BCD_LE_SIGNED: {
+        int32_t value = 0;
+        if (!item_as_bcd_signed(*item, &value)) {
+          ESP_LOGW(TAG, "TAG 0x%02X: value is not valid signed BCD: %s", e.tag,
+                   format_hex_pretty(item->raw, item->len).c_str());
+          break;
+        }
+        e.sensor->publish_state(static_cast<float>(value));
+        ESP_LOGD(TAG, "  -> '%s' = %" PRId32, e.sensor->get_name().c_str(), value);
         break;
       }
       default:
@@ -989,6 +874,18 @@ void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
         ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
         break;
       }
+      case TagEnc::BCD_LE_SIGNED: {
+        int32_t value = 0;
+        if (!item_as_bcd_signed(*item, &value)) {
+          ESP_LOGW(TAG, "TAG 0x%02X: value is not valid signed BCD: %s", e.tag,
+                   format_hex_pretty(item->raw, item->len).c_str());
+          break;
+        }
+        std::snprintf(buf, sizeof(buf), "%" PRId32, value);
+        e.text_sensor->publish_state(buf);
+        ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
+        break;
+      }
       default:
         if (item->len > 4) {
           // Too wide for a scalar, so hand over the raw bytes rather than
@@ -1011,15 +908,9 @@ void NartisRf2MeterComponent::publish_from_status_(const SensorEntry &e) {
     return;
   }
 
-  const ParsedItem *item = this->status_.find(0x00);
-  if (item == nullptr || item->len != STATUS_VALUE_SIZE) {
-    ESP_LOGW(TAG, "Status block missing or wrong size");
-    return;
-  }
-
   if (e.status == StatusField::RAW) {
     if (e.text_sensor != nullptr) {
-      const std::string hex = format_hex_pretty(item->raw, item->len);
+      const std::string hex = format_hex_pretty(this->status_block_, STATUS_BLOCK_SIZE);
       e.text_sensor->publish_state(hex);
       ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), hex.c_str());
     } else {
@@ -1031,10 +922,10 @@ void NartisRf2MeterComponent::publish_from_status_(const SensorEntry &e) {
   uint8_t value = 0;
   switch (e.status) {
     case StatusField::ACTIVE_TARIFF:
-      value = item->raw[STATUS_OFF_ACTIVE_TARIFF];
+      value = this->status_block_[STATUS_OFF_ACTIVE_TARIFF];
       break;
     case StatusField::TARIFF_COUNT:
-      value = item->raw[STATUS_OFF_TARIFF_COUNT];
+      value = this->status_block_[STATUS_OFF_TARIFF_COUNT];
       break;
     default:
       return;

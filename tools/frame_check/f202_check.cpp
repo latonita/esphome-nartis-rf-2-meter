@@ -11,7 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
-#include <initializer_list>
+#include <string>
 
 using namespace esphome::nartis_rf_2_meter;
 
@@ -82,6 +82,21 @@ static size_t build_response(uint8_t *out, size_t cap, const uint8_t serial[SERI
   return p;
 }
 
+
+// The status block every status half ends with, as captured from meter ...5596.
+// Byte 0 is the constant 0x01 marker.
+static const uint8_t STATUS_BLOCK[STATUS_BLOCK_SIZE] = {0x01, 0x00, 0x22, 0x84, 0x00, 0x08,
+                                                        0x01, 0x1F, 0x00, 0x03, 0x01};
+
+static std::string format_block(const uint8_t *b) {
+  char out[STATUS_BLOCK_SIZE * 3];
+  size_t at = 0;
+  for (size_t i = 0; i < STATUS_BLOCK_SIZE; i++) {
+    at += static_cast<size_t>(std::snprintf(out + at, sizeof(out) - at, "%s%02X", (i != 0) ? " " : "", b[i]));
+  }
+  return std::string(out);
+}
+
 struct Expect {
   uint8_t tag;
   uint8_t width;
@@ -106,7 +121,7 @@ int main() {
   std::printf("parse: %s, DI 0x%04X, count %u, payload %u B\n", parse_result_to_string(pr), r.di, r.count,
               r.payload_len);
   check(pr == ParseResult::OK, "page parses");
-  check(r.di == DI_PARAMS, "DI is 0xF202");
+  check(r.di == DI_LIST_B_RECORDS, "DI is 0xF202");
   check(r.count == 15, "15 records");
   check(r.payload_len == 0x51, "DATA length is 0x51 = 81, as captured");
 
@@ -136,7 +151,7 @@ int main() {
       continue;
     }
     TagInfo info{};
-    if (!tag_info(r.di, e.tag, &info) || info.width != e.width || info.enc != e.enc) {
+    if (!tag_info(e.tag, &info) || info.width != e.width || info.enc != e.enc) {
       std::printf("FAIL  tag 0x%02X width/encoding: table says %u B, expected %u B\n", e.tag, info.width, e.width);
       fail++;
       continue;
@@ -187,7 +202,7 @@ int main() {
   std::printf("parse: %s, DI 0x%04X, count %u of %u announced, payload %u B\n", parse_result_to_string(pr2), r2.di,
               r2.count, r2.announced_count, r2.payload_len);
   check(pr2 == ParseResult::OK, "short page parses");
-  check(r2.di == DI_PARAMS, "DI is 0xF202");
+  check(r2.di == DI_LIST_B_RECORDS, "DI is 0xF202");
   check(r2.count == 16, "16 records decoded");
   check(r2.announced_count == 24, "COUNT byte reported as announced_count");
   check(r2.payload_len == 0x53, "DATA length is 0x53 = 83");
@@ -197,210 +212,177 @@ int main() {
   check(r2.find(0x22) != nullptr, "the final record, TAG 0x22, is present");
   check(r2.find(0x28) == nullptr, "records the meter did not send are absent");
 
-  // --- DI 0xF203, the tail of that list ---------------------------------
+  // --- the status half of list B ----------------------------------------
   //
-  // Not captured: this is the shape the meter firmware builds for a resume - the
-  // records stream out with no COUNT byte in front of them - assembled here so the
-  // parser is exercised against it. The records chosen are the eight the reference
-  // page announced but did not send (reactive power and the billing-period
-  // mirrors), each 1 + 4 bytes, so DATA is 2 + 8*5 = 42.
-  std::printf("\n-- DI 0xF203 continuation, no COUNT byte --\n");
+  // DI(2) | leftover records | status block. The records below are the eight that
+  // the live list B announced and did not fit: P L3, the four reactive powers,
+  // frequency, the clock and temperature - which is 4*6 + 7 + 2 = 33 bytes of
+  // value, 8 TAG bytes, so DATA is 2 + 41 + 11 = 54.
+  //
+  // This is the case the whole layout turns on: no COUNT byte, and the block is
+  // always last, so the split is arithmetic rather than guesswork.
+  std::printf("\n-- list B status half, with leftover records --\n");
   {
-    static const uint8_t TAIL_TAGS[] = {0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33};
-    uint8_t data[2 + 8 * 5];
+    static const uint8_t TAIL[] = {0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A};
+    uint8_t data[2 + 41 + STATUS_BLOCK_SIZE];
     size_t n = 0;
     data[n++] = 0x03;  // DI little-endian: 0xF203
     data[n++] = 0xF2;
-    for (uint8_t tag : TAIL_TAGS) {
+    for (uint8_t tag : TAIL) {
+      TagInfo info{};
+      check(tag_info(tag, &info), "the tail TAG has a width");
       data[n++] = tag;
-      data[n++] = 0x11;
-      data[n++] = 0x00;
-      data[n++] = 0x00;
-      data[n++] = 0x00;
+      for (uint8_t b = 0; b < info.width; b++) {
+        // Valid BCD digits, so the signed-reactive rows decode rather than being
+        // rejected; the values themselves are not what this case is about.
+        data[n++] = 0x11;
+      }
     }
+    const size_t records_end = n;
+    std::memcpy(data + n, STATUS_BLOCK, STATUS_BLOCK_SIZE);
+    n += STATUS_BLOCK_SIZE;
+    check(n == sizeof(data), "DATA is 2 + 41 + 11 = 54 bytes");
+
     uint8_t frame3[256];
     const size_t len3 = build_response(frame3, sizeof(frame3), serial, data, n);
     ParsedResponse r3{};
     const ParseResult pr3 = parse_response(frame3, len3, serial, &r3);
-    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, shape '%s', payload %u B\n",
-                parse_result_to_string(pr3), r3.di, r3.count, r3.announced_count,
-                payload_shape_to_string(r3.shape), r3.payload_len);
-    check(pr3 == ParseResult::OK, "continuation page parses");
-    check(r3.di == DI_PARAMS_CONT, "DI is 0xF203");
-    check(r3.shape == PayloadShape::CONTINUATION, "read as a continuation - no COUNT byte");
-    check(r3.count == 8, "all 8 tail records decoded");
-    check(r3.announced_count == 0, "no COUNT byte to announce anything");
-    check(r3.find(0x24) != nullptr && r3.find(0x33) != nullptr, "first and last tail records present");
+    std::printf("parse: %s, DI 0x%04X, count %u, shape '%s', payload %u B\n", parse_result_to_string(pr3), r3.di,
+                r3.count, payload_shape_to_string(r3.shape), r3.payload_len);
+    check(pr3 == ParseResult::OK, "the status half parses");
+    check(r3.di == DI_LIST_B_STATUS, "DI is 0xF203");
+    check(r3.shape == PayloadShape::STATUS_HALF, "read as a status half");
+    check(r3.count == 8, "all 8 leftover records decoded");
+    check(r3.announced_count == 0, "a status half has no COUNT byte to announce anything");
+    check(r3.find(0x23) != nullptr && r3.find(0x2A) != nullptr, "first and last leftover records present");
+    check(r3.has_status_block, "the block is there");
+    check(std::memcmp(r3.status_block, STATUS_BLOCK, STATUS_BLOCK_SIZE) == 0, "and it is the trailing 11 bytes");
+    // The two widths that make this frame add up, and so the two most load-bearing
+    // rows of TAG_TABLE: get either wrong and the block lands off by a byte.
+    const ParsedItem *clock = r3.find(0x29);
+    const ParsedItem *temp = r3.find(0x2A);
+    check(clock != nullptr && clock->len == 7, "the clock in the tail is 7 bytes");
+    check(temp != nullptr && temp->len == 2, "temperature in the tail is 2 bytes");
+    (void) records_end;
   }
 
-  // With no cursor set the meter answers with the echoed DI and nothing else. That
-  // is a valid response holding zero records, not a malformed frame.
-  std::printf("\n-- DI 0xF203 with nothing pending --\n");
+  // Nothing left to continue: DI(2) plus the block and no more. That is the
+  // shortest a status half can be, and it is what a meter sends when the records
+  // half already delivered the whole list - or when the cursor was lost.
+  std::printf("\n-- list B status half with nothing left over --\n");
   {
-    const uint8_t data[2] = {0x03, 0xF2};
+    uint8_t data[2 + STATUS_BLOCK_SIZE];
+    data[0] = 0x03;
+    data[1] = 0xF2;
+    std::memcpy(data + 2, STATUS_BLOCK, STATUS_BLOCK_SIZE);
     uint8_t frame4[64];
     const size_t len4 = build_response(frame4, sizeof(frame4), serial, data, sizeof(data));
     ParsedResponse r4{};
     const ParseResult pr4 = parse_response(frame4, len4, serial, &r4);
-    std::printf("parse: %s, DI 0x%04X, count %u\n", parse_result_to_string(pr4), r4.di, r4.count);
-    check(pr4 == ParseResult::OK, "an empty tail parses");
-    check(r4.di == DI_PARAMS_CONT, "DI is 0xF203");
-    check(r4.count == 0, "zero records");
+    std::printf("parse: %s, DI 0x%04X, count %u, shape '%s'\n", parse_result_to_string(pr4), r4.di, r4.count,
+                payload_shape_to_string(r4.shape));
+    check(pr4 == ParseResult::OK, "it parses");
+    check(r4.shape == PayloadShape::STATUS_HALF, "read as a status half");
+    check(r4.count == 0, "zero leftover records");
+    check(r4.has_status_block, "the block is still there - it always is");
+    check(r4.payload_len == 2 + STATUS_BLOCK_SIZE, "DATA is exactly DI + block");
   }
 
-  // The fallback in the other direction: should a resume turn out to carry a COUNT
-  // byte after all, the exact-fit tie-breaker has to find it rather than read the
-  // COUNT as a TAG. Same eight records, this time with COUNT = 8 in front.
-  std::printf("\n-- DI 0xF203 that does carry a COUNT byte --\n");
-  {
-    static const uint8_t TAIL_TAGS[] = {0x24, 0x25, 0x26, 0x27, 0x30, 0x31, 0x32, 0x33};
-    uint8_t data[3 + 8 * 5];
-    size_t n = 0;
-    data[n++] = 0x03;
-    data[n++] = 0xF2;
-    data[n++] = 8;  // COUNT
-    for (uint8_t tag : TAIL_TAGS) {
-      data[n++] = tag;
-      data[n++] = 0x11;
-      data[n++] = 0x00;
-      data[n++] = 0x00;
-      data[n++] = 0x00;
-    }
-    uint8_t frame5[256];
-    const size_t len5 = build_response(frame5, sizeof(frame5), serial, data, n);
-    ParsedResponse r5{};
-    const ParseResult pr5 = parse_response(frame5, len5, serial, &r5);
-    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, shape '%s'\n", parse_result_to_string(pr5), r5.di,
-                r5.count, r5.announced_count, payload_shape_to_string(r5.shape));
-    check(pr5 == ParseResult::OK, "the COUNT-byte form parses too");
-    check(r5.shape == PayloadShape::COUNTED, "recognised as a counted page, not a continuation");
-    check(r5.count == 8, "all 8 records decoded");
-    check(r5.find(0x24) != nullptr && r5.find(0x33) != nullptr, "records are aligned, so COUNT was not read as a TAG");
-  }
-
-  // The DI 0xF203 reply as it actually came off the air, from meter ...5596 on
-  // 2026-09-02. Every layer below the records verifies - envelope CRC 0xE2C5,
-  // DL/T 645 checksum 0x43, our address, control 0x81, L = 0x0D consistent - and
-  // DATA de-offsets to 03 F2 | 01 | 00 | 22 84 00 08 01 1F 00 03 01.
+  // The reply that first exposed all of this, from meter ...5596 on 2026-09-02.
+  // Every layer below the records verifies - envelope CRC 0xE2C5, DL/T 645
+  // checksum 0x43, our address, control 0x81, L = 0x0D - and DATA de-offsets to
+  // 03 F2 | 01 00 22 84 00 08 01 1F 00 03 01.
   //
-  // That is not a record tail. It is DI | COUNT=1 | TAG 0x00 | *nine* bytes: the
-  // DI 0xF201 status-block shape, and 3 + 1 + 9 = 13 fits DATA exactly. Read with
-  // the TAG-page widths, where TAG 0x00 is a 4-byte register, no reading fits at
-  // all - which is how this frame used to be thrown away as malformed.
-  std::printf("\n-- DI 0xF203 as captured off the air --\n");
+  // 2 + 11 = 13, so it is a status half with nothing left over. It was read as
+  // DI | COUNT=1 | TAG 0x00 | 9 bytes for a while, which fits the same 13 bytes by
+  // coincidence: the "COUNT" was the block's 0x01 marker.
+  std::printf("\n-- the captured status half --\n");
   {
     static const char *const F203_HEX = "1C00011D6896552740320268810D3625343355B7333B34523336344316C5E2";
     uint8_t frame6[64];
     const size_t len6 = unhex(F203_HEX, frame6, sizeof(frame6));
     ParsedResponse r6{};
     const ParseResult pr6 = parse_response(frame6, len6, serial2, &r6);
-    std::printf("parse: %s, DI 0x%04X, count %u, announced %u, shape '%s', payload %u B\n",
-                parse_result_to_string(pr6), r6.di, r6.count, r6.announced_count,
-                payload_shape_to_string(r6.shape), r6.payload_len);
+    std::printf("parse: %s, DI 0x%04X, count %u, shape '%s', payload %u B\n", parse_result_to_string(pr6), r6.di,
+                r6.count, payload_shape_to_string(r6.shape), r6.payload_len);
     check(len6 == 31, "frame is 31 bytes from the LEN byte");
-    check(pr6 == ParseResult::OK, "the captured DI 0xF203 reply parses (it used to be MALFORMED)");
-    check(r6.di == DI_PARAMS_CONT, "DI is 0xF203");
-    check(r6.shape == PayloadShape::COUNTED_STATUS, "recognised as a counted page holding a status block");
-    check(r6.count == 1 && r6.announced_count == 1, "one record, and COUNT agrees");
-    const ParsedItem *blob = r6.find(0x00);
-    check(blob != nullptr && blob->len == STATUS_VALUE_SIZE, "TAG 0x00 is the 9-byte status block");
-    if (blob != nullptr && blob->len == STATUS_VALUE_SIZE) {
-      std::printf("status block: %02X %02X %02X %02X %02X %02X %02X %02X %02X\n", blob->raw[0], blob->raw[1],
-                  blob->raw[2], blob->raw[3], blob->raw[4], blob->raw[5], blob->raw[6], blob->raw[7], blob->raw[8]);
-      // The three fields the status decoder reads. Plausible values are the only
-      // corroboration available for this reading, so state them and let the
-      // numbers be judged: 31 C in September, 3 tariffs, tariff 1 active.
-      check(blob->raw[STATUS_OFF_TEMPERATURE] == 31, "byte 5 (temperature) = 31");
-      check(blob->raw[STATUS_OFF_TARIFF_COUNT] == 3, "byte 7 (tariff count) = 3");
-      check(blob->raw[STATUS_OFF_ACTIVE_TARIFF] == 1, "byte 8 (active tariff) = 1");
-    }
+    check(pr6 == ParseResult::OK, "the captured reply parses");
+    check(r6.di == DI_LIST_B_STATUS, "DI is 0xF203");
+    check(r6.shape == PayloadShape::STATUS_HALF, "read as a status half");
+    check(r6.count == 0, "no leftover records, so the cursor was already gone");
+    check(r6.has_status_block, "the block is there");
+    check(std::memcmp(r6.status_block, STATUS_BLOCK, STATUS_BLOCK_SIZE) == 0,
+          "and it is the block the other cases use");
+    std::printf("status block: %s\n", format_block(r6.status_block).c_str());
+    check(r6.status_block[0] == 0x01, "byte 0 is the constant marker");
+    // The two bytes the `status:` entities read. The firmware calls them the
+    // relay/breaker state and an internal object rather than tariff fields, so
+    // these assertions pin the POSITIONS, not the names.
+    check(r6.status_block[STATUS_OFF_TARIFF_COUNT] == 3, "byte 9 = 3");
+    check(r6.status_block[STATUS_OFF_ACTIVE_TARIFF] == 1, "byte 10 = 1");
   }
 
-  // The DI 0xF102 reply as it came off the air, from meter ...1060 on 2026-09-02.
-  // DATA de-offsets to 02 F1 | 01 | fifteen 4-byte BCD values and nothing else -
-  // no COUNT, no TAGs, just values in an order the reader has to know. 3 + 15*4
-  // = 63 = L, exactly.
-  //
-  // Two internal cross-checks corroborate the layout below, and they are the
-  // reason it is trusted from a single capture: the three per-phase reactive
-  // powers sum to the total exactly, and the three active powers sum to the total
-  // within rounding. Get the order or the sign rule wrong and neither holds.
-  std::printf("\n-- DI 0xF102 fixed block, as captured off the air --\n");
+  // The TAG table itself. A typo here - two rows overlapping, or a gap where the
+  // meter does send a record - misaligns every record after it, so the table is
+  // checked for shape and not only for the values it hands back.
+  std::printf("\n-- the TAG table --\n");
   {
-    static const char *const F102_HEX =
-        "4E00014F6860102740320268813F35243483793433936633337357333343BB3333B34433B3434633B3C33333B353353333B4"
-        "6735338C343333766935335B34333379673533BA363333CB7C3333C4160DC2";
-    uint8_t frame7[128];
-    const size_t len7 = unhex(F102_HEX, frame7, sizeof(frame7));
-    ParsedResponse r7{};
-    const ParseResult pr7 = parse_response(frame7, len7, serial, &r7);
-    std::printf("parse: %s, DI 0x%04X, count %u, shape '%s', payload %u B\n", parse_result_to_string(pr7), r7.di,
-                r7.count, payload_shape_to_string(r7.shape), r7.payload_len);
-    check(pr7 == ParseResult::OK, "the captured DI 0xF102 reply parses");
-    check(r7.di == DI_F102, "DI is 0xF102");
-    check(r7.shape == PayloadShape::FIXED_BLOCK, "recognised as a fixed positional block");
-    check(r7.count == 0, "no items - there are no TAGs to key them by");
-    check(r7.payload_len == 3 + F102_VALUE_COUNT * F102_VALUE_SIZE, "payload is DI + marker + 15 values");
-
-    F102Block b{};
-    check(parse_f102_block(r7.payload, r7.payload_len, &b), "the block decodes");
-    check(b.marker == 0x01, "the byte before the values is 0x01");
-    check(b.count == F102_VALUE_COUNT, "15 values");
-    for (uint8_t i = 0; i < b.count && i < F102_VALUE_COUNT; i++) {
-      std::printf("  %2u %-6s %10.2f %s\n", i + 1, F102_VALUES[i].name,
-                  static_cast<double>(b.values[i]) * F102_VALUES[i].scale, F102_VALUES[i].unit);
+    bool shape_ok = true;
+    for (uint16_t t = 0x00; t <= 0xFF; t++) {
+      TagInfo info{};
+      const bool known = tag_info(static_cast<uint8_t>(t), &info);
+      // Contiguous 0x00..0x47 apart from 0x2B, and nothing at all above 0x47.
+      const bool want = (t <= 0x47) && (t != 0x2B);
+      if (known != want) {
+        std::printf("FAIL  TAG 0x%02X is %s, expected %s\n", t, known ? "known" : "unknown",
+                    want ? "known" : "unknown");
+        shape_ok = false;
+      }
+      if (known && (info.width == 0 || info.width > MAX_ITEM_WIDTH)) {
+        std::printf("FAIL  TAG 0x%02X width %u is out of range\n", t, info.width);
+        shape_ok = false;
+      }
     }
-    // Spot values, against the meter's own display: 1465.0 W total, 234.81 V on
-    // L1, 49.98 Hz. The negative reactive powers are the sign rule working - bit 7
-    // of the most-significant BCD byte, which is why 80 11 00 80 is -118.0 and not
-    // some eight-digit number.
-    check(b.values[0] == 14650, "P total = 1465.0 W");
-    check(b.values[1] + b.values[2] + b.values[3] == 14610, "per-phase P sums to 1461.0 W, within rounding of P");
-    check(b.values[4] == -1180, "Q total = -118.0 var, sign bit honoured");
-    check(b.values[5] + b.values[6] + b.values[7] == b.values[4], "per-phase Q sums to Q total exactly");
-    check(b.values[8] == 23481 && b.values[10] == 23643 && b.values[12] == 23446, "U = 234.81 / 236.43 / 234.46 V");
-    check(b.values[9] == 159 && b.values[11] == 128 && b.values[13] == 387, "I = 1.59 / 1.28 / 3.87 A");
-    check(b.values[14] == 4998, "frequency = 49.98 Hz");
+    check(shape_ok, "every TAG 0x00-0x47 but 0x2B has a usable width, and nothing above 0x47 does");
 
-    // The validation is what keeps FIXED_BLOCK from swallowing other shapes: a
-    // payload that is not a whole number of values, or holds a non-BCD nibble,
-    // has to be rejected so the record readings still get their turn.
-    F102Block junk{};
-    uint8_t bad[3 + 4];
-    std::memcpy(bad, r7.payload, sizeof(bad));
-    check(parse_f102_block(bad, sizeof(bad), &junk), "one value is a valid block");
-    check(!parse_f102_block(bad, sizeof(bad) - 1, &junk), "a partial trailing value is rejected");
-    bad[4] = 0x0A;  // low nibble 0x0A is not a BCD digit
-    check(!parse_f102_block(bad, sizeof(bad), &junk), "a non-BCD nibble is rejected");
-  }
+    TagInfo info{};
+    // The one row that breaks the pattern of its neighbours, so the one most
+    // likely to be "corrected" back to 4-byte BCD by someone reading the block.
+    check(tag_info(0x2A, &info) && info.width == 2 && info.enc == TagEnc::INT_LE,
+          "temperature 0x2A is 2 bytes of signed binary, not the 4-byte BCD around it");
+    check(tag_info(0x24, &info) && info.enc == TagEnc::BCD_LE_SIGNED, "reactive power 0x24 is signed BCD");
+    check(tag_info(0x23, &info) && info.enc == TagEnc::BCD_LE, "active power 0x23 is plain BCD");
+    check(tag_info(0x00, &info) && info.enc == TagEnc::UINT_LE, "energy 0x00 is binary, the one non-BCD family");
+    check(tag_info(0x29, &info) && info.width == 7 && info.enc == TagEnc::BCD_CLOCK, "the clock 0x29 is 7 bytes");
+    check(!tag_info(0x48, &info), "the identity objects from 0x48 up have no single width to walk by");
 
-  // DI 0xF101 and DI 0xF104 are read but never decoded, so what is worth checking
-  // is that they are asked at all and that the answer stops at the frame layer.
-  // Built rather than captured: the point is the parser's contract, and no reply
-  // from either has been seen yet.
-  std::printf("\n-- the undecoded pages --\n");
-  for (uint16_t di : {DI_F101, DI_F104}) {
-    uint8_t data[3 + 9];
-    data[0] = static_cast<uint8_t>(di & 0xFF);
-    data[1] = static_cast<uint8_t>(di >> 8);
-    // Bytes that are not a valid record list under any width table, which is the
-    // whole point: an undecoded page must not depend on them making sense.
-    for (size_t i = 2; i < sizeof(data); i++) {
-      data[i] = static_cast<uint8_t>(0xA0 + i);
-    }
-    uint8_t frame[MAX_REQUEST_FRAME_SIZE];
-    check(build_request(frame, sizeof(frame), serial, di) > 0, "the poll builds");
+    // TAG 0x00 means the same thing in both halves now - the status block is not
+    // a record and has no TAG at all, so nothing shadows the energy register.
+    check(tag_info(0x00, &info) && info.width == 4, "TAG 0x00 is the 4-byte energy register in either half");
 
-    uint8_t rsp[64];
-    const size_t rsp_len = build_response(rsp, sizeof(rsp), serial, data, sizeof(data));
-    ParsedResponse r{};
-    const ParseResult pr = parse_response(rsp, rsp_len, serial, &r);
-    std::printf("DI 0x%04X: %s, shape '%s', %u item(s), payload %u B\n", di, parse_result_to_string(pr),
-                payload_shape_to_string(r.shape), r.count, r.payload_len);
-    check(pr == ParseResult::OK, "a payload no width table can walk still parses");
-    check(r.shape == PayloadShape::RAW, "reported as verified-but-not-decoded");
-    check(r.count == 0, "no items are invented");
-    check(r.payload_len == sizeof(data), "the whole payload is handed over");
+    // A YAML-declared width fills gaps only - it must never shadow a built-in row,
+    // or a stray entry could break the confirmed energy decoding.
+    uint8_t overrides[TAG_WIDTH_TABLE_SIZE] = {};
+    overrides[0x00] = 9;
+    overrides[0x2B] = 3;
+    check(tag_info(0x00, &info, overrides) && info.width == 4, "a declared width cannot shadow a known TAG");
+    check(tag_info(0x2B, &info, overrides) && info.width == 3 && info.enc == TagEnc::USER,
+          "a declared width does fill a gap");
+
+    // Signed BCD, with the worked example from the vendor notes.
+    ParsedItem q{};
+    q.tag = 0x24;
+    q.len = 4;
+    q.raw[0] = 0x78;
+    q.raw[1] = 0x08;
+    q.raw[2] = 0x00;
+    q.raw[3] = 0x80;
+    int32_t sv = 0;
+    check(item_as_bcd_signed(q, &sv) && sv == -878, "signed BCD 78 08 00 80 = -878 (-87.8 var)");
+    q.raw[3] = 0x00;
+    check(item_as_bcd_signed(q, &sv) && sv == 878, "the same digits with the sign bit clear = +878");
+    q.raw[1] = 0x0A;
+    check(!item_as_bcd_signed(q, &sv), "a non-BCD nibble is rejected rather than guessed at");
   }
 
   std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202/0xF203 PAGES DECODE CORRECTLY" : "FAILURES", fail);

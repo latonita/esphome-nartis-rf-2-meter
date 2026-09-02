@@ -18,142 +18,101 @@ const char *tag_confidence_to_string(TagConfidence c) {
   switch (c) {
     case TagConfidence::OBSERVED:
       return "observed on this link";
-    case TagConfidence::DLMS_DERIVED:
-      return "width from the meter's DLMS data type";
-    case TagConfidence::FAMILY_ASSUMED:
-      return "extrapolated from a sibling register";
+    case TagConfidence::DOCUMENTED:
+      return "from the vendor TAG table, not yet seen on this link";
+    case TagConfidence::CONFLICTING:
+      return "the sources disagree about what this TAG holds";
     default:
       return "unknown";
   }
 }
 
-bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
+namespace {
+
+/* The TAG table.
+ *
+ * A record is TAG followed by its value with no length field, so the width here
+ * is what makes the rest of a page readable at all - get one wrong and every
+ * record after it is garbage. The rows are contiguous TAG ranges because the
+ * meter groups its registers that way: one row per family, ascending.
+ *
+ * `scale` and `unit` are for the log line only. Published values stay raw so the
+ * YAML decides the unit with a `multiply` filter, which is why a scale being
+ * uncertain is not a correctness problem here.
+ *
+ * Two rows are worth reading twice before trusting:
+ *
+ *   - 0x20..0x27, the power group. The vendor table's multiplier puts these in
+ *     units of 10 W / 10 var. On one meter a cross-check against the raw objects
+ *     (P ~ U*I*PF, and P against the energy rate) fitted 1 W instead, so builds
+ *     or CT variants differ by a factor of ten. Check the per-phase P against
+ *     P_total on your own meter before believing the absolute value.
+ *   - 0x2C..0x2F, where the firmware calls the group one thing and the manual
+ *     another. The width is agreed, so the records still walk; the meaning does
+ *     not, hence CONFLICTING.
+ */
+struct TagRange {
+  uint8_t first;
+  uint8_t last;
+  uint8_t width;
+  TagEnc enc;
+  TagConfidence conf;
+  float scale;
+  const char *unit;
+};
+
+constexpr TagRange TAG_TABLE[] = {
+    // Energy accumulators. Binary little-endian - the one family that is not BCD.
+    // 0x00..0x07 are active import/export; the rest of the range is reactive and
+    // other cumulative registers, so the log unit covers both.
+    {0x00, 0x07, 4, TagEnc::UINT_LE, TagConfidence::OBSERVED, 0.001f, "kWh"},
+    {0x08, 0x13, 4, TagEnc::UINT_LE, TagConfidence::DOCUMENTED, 0.001f, "kWh/kvarh"},
+
+    // Voltages: 0x14 single-phase, 0x15..0x17 per phase, 0x18..0x1A line-to-line.
+    {0x14, 0x14, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
+    {0x15, 0x17, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.1f, "V"},
+    {0x18, 0x1A, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
+
+    // Currents: 0x1B single-phase, 0x1C neutral, 0x1D..0x1F per phase.
+    {0x1B, 0x1C, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.01f, "A"},
+    {0x1D, 0x1F, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.01f, "A"},
+
+    // Power, total then per phase. Reactive is the only signed BCD on the wire.
+    {0x20, 0x23, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 10.0f, "W"},
+    {0x24, 0x27, 4, TagEnc::BCD_LE_SIGNED, TagConfidence::OBSERVED, 10.0f, "var"},
+
+    {0x28, 0x28, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.01f, "Hz"},
+    {0x29, 0x29, 7, TagEnc::BCD_CLOCK, TagConfidence::OBSERVED, 1.0f, ""},
+    // Temperature is binary two's-complement and 2 bytes wide, not the 4-byte BCD
+    // its neighbours use - the one row in this table that breaks the pattern.
+    {0x2A, 0x2A, 2, TagEnc::INT_LE, TagConfidence::OBSERVED, 0.1f, "\302\260C"},
+
+    // 0x2B is the LCD test, a command rather than a register, and has no width.
+    {0x2C, 0x2F, 4, TagEnc::BCD_LE, TagConfidence::CONFLICTING, 1.0f, ""},
+    {0x30, 0x33, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, ""},
+    {0x34, 0x47, 4, TagEnc::UINT_LE, TagConfidence::DOCUMENTED, 1.0f, ""},
+    // 0x48..0x4F are identity and configuration objects whose widths vary per
+    // object, so there is no single width to walk them by. A YAML `bytes:` is the
+    // only way to read one.
+};
+
+}  // namespace
+
+bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
   if (out == nullptr) {
     return false;
   }
-
-  if (di == DI_STATUS) {
-    // The status block is a single item: TAG 0x00 carrying 9 opaque bytes.
-    if (tag != 0x00) {
-      return false;
+  for (const TagRange &r : TAG_TABLE) {
+    if (tag >= r.first && tag <= r.last) {
+      *out = TagInfo{r.width, r.enc, r.conf, r.scale, r.unit};
+      return true;
     }
-    *out = TagInfo{STATUS_VALUE_SIZE, TagEnc::STATUS_BLOB, TagConfidence::OBSERVED, 1.0f, ""};
-    return true;
   }
-
-  // DI 0xF202 is a larger page over the same TAG numbering, and DI 0xF203 is the
-  // tail of that same list, so one table serves all three.
-  //
-  // DI 0xF102 is offered the same table on the assumption - untested, since no
-  // capture of that page exists - that a Wasion meter numbers its items the same
-  // way everywhere. Nothing rests on the assumption being right: parse_response()
-  // accepts a reading only when it consumes DATA exactly, so a page with different
-  // numbering fails to fit and gets logged rather than mis-decoded.
-  if (di != DI_ENERGY && di != DI_PARAMS && di != DI_PARAMS_CONT && di != DI_F102) {
-    return false;
-  }
-
-  /* Widths and encodings, and where each comes from.
-   *
-   * A capture of the DI 0xF202 page (15 items) settled the instantaneous values
-   * and corrected an earlier guess. The lesson is worth recording: their widths
-   * had been derived from the DLMS/COSEM data types the same meter reports for
-   * the same OBIS codes, and that was wrong in two ways - currents and power are
-   * 2 bytes rather than 4, and every instantaneous value is BCD rather than
-   * binary. DLMS carried the rough magnitude across but not the encoding.
-   *
-   * Only the energy registers are binary little-endian, which is exactly the one
-   * family the DLMS mapping had been validated against.
-   *
-   *   energy registers      4 bytes binary LE, Wh      observed
-   *   voltages              4 bytes BCD, x0.1 V        observed (0x15..0x17)
-   *   currents              4 bytes BCD, x0.01 A       observed (0x1C..0x1E)
-   *   active power          4 bytes BCD, x0.01 kW      observed (0x20)
-   *   frequency             4 bytes BCD, x0.01 Hz      observed (0x28)
-   *   clock                 7 bytes BCD                observed
-   *
-   * The instantaneous values are 4 bytes with the upper two always zero, so only
-   * four of the eight BCD digits are ever used. Reading them as 2 bytes yields the
-   * same number and looks right - the DL/T 645 length field is what gives it away:
-   * the captured page reports L = 0x51 = 81, which is 3 + 6*(1+4) + 8*(1+4) +
-   * (1+7). With 2-byte values it would have been 65.
-   *
-   * Everything still marked assumed is extrapolated from an observed sibling of
-   * the same kind - the same reasoning that just failed for the DLMS widths, so
-   * treat it accordingly. A wrong width desyncs every item after it.
-   */
-  switch (tag) {
-    // --- active energy import, sum and per-tariff ---
-    case 0x00:  // 1.0.1.8.0.255
-    case 0x01:  // 1.0.1.8.1.255
-    case 0x02:  // 1.0.1.8.2.255
-    // --- active energy export, sum and tariffs 1-2 (zeroes, but 4 bytes wide) ---
-    case 0x05:  // 1.0.2.8.0.255
-    case 0x06:  // 1.0.2.8.1.255
-    case 0x07:  // 1.0.2.8.2.255
-      *out = TagInfo{4, TagEnc::UINT_LE, TagConfidence::OBSERVED, 0.001f, "kWh"};
-      return true;
-    // --- date and time ---
-    case 0x29:  // 0.0.1.0.0.255
-      *out = TagInfo{7, TagEnc::BCD_CLOCK, TagConfidence::OBSERVED, 1.0f, ""};
-      return true;
-    default:
-      break;
-  }
-
-  // --- voltages: phase-neutral 0x14..0x17, line-to-line 0x18..0x1A.
-  //     0x15..0x17 observed; 0x14 (single-phase) and the line voltages are the
-  //     same quantity and assumed identical.
-  if (tag >= 0x14 && tag <= 0x1A) {
-    const bool seen = (tag >= 0x15 && tag <= 0x17);
-    *out = TagInfo{4, TagEnc::BCD_LE, seen ? TagConfidence::OBSERVED : TagConfidence::FAMILY_ASSUMED, 0.1f, "V"};
-    return true;
-  }
-  // --- currents: single-phase 0x1B, neutral 0x1C, per-phase 0x1D..0x1F.
-  //     0x1C..0x1E observed; 0x1B and 0x1F assumed to match.
-  if (tag >= 0x1B && tag <= 0x1F) {
-    const bool seen = (tag >= 0x1C && tag <= 0x1E);
-    *out = TagInfo{4, TagEnc::BCD_LE, seen ? TagConfidence::OBSERVED : TagConfidence::FAMILY_ASSUMED, 0.01f, "A"};
-    return true;
-  }
-  // --- active power, sum and per-phase. 0x20 observed as 8.40 kW; the per-phase
-  //     registers are assumed to match. Note the manual says these are shown with
-  //     a sign, and how a sign is carried in BCD here is not known - no negative
-  //     value has been captured.
-  if (tag >= 0x20 && tag <= 0x23) {
-    *out = TagInfo{4, TagEnc::BCD_LE, (tag == 0x20) ? TagConfidence::OBSERVED : TagConfidence::FAMILY_ASSUMED, 0.01f,
-                   "kW"};
-    return true;
-  }
-  // --- reactive power, sum and per-phase. Never captured; assumed to mirror
-  //     active power.
-  if (tag >= 0x24 && tag <= 0x27) {
-    *out = TagInfo{4, TagEnc::BCD_LE, TagConfidence::FAMILY_ASSUMED, 0.01f, "kvar"};
-    return true;
-  }
-  // --- mains frequency ---
-  if (tag == 0x28) {
-    *out = TagInfo{4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.01f, "Hz"};
-    return true;
-  }
-  // --- temperature. Never captured. Assumed to follow the other instantaneous
-  //     values (4 bytes BCD) rather than the DLMS type, since that mapping is now
-  //     known to get the encoding wrong. Sign handling unknown.
-  if (tag == 0x2A) {
-    *out = TagInfo{4, TagEnc::BCD_LE, TagConfidence::FAMILY_ASSUMED, 0.1f, "\302\260C"};
-    return true;
-  }
-  // --- cumulative registers of the same family as the observed energy ones:
-  //     remaining tariffs, reactive energy, and the billing-period mirrors ---
-  if ((tag >= 0x03 && tag <= 0x13) || (tag >= 0x2C && tag <= 0x3F)) {
-    *out = TagInfo{4, TagEnc::UINT_LE, TagConfidence::FAMILY_ASSUMED, 0.001f, "kWh"};
-    return true;
-  }
-
-  // Left over: 0x2B (LCD test, a Data object rather than a register). A width
-  // declared in YAML fills the gap; consulted only after everything built in.
+  // Not in the table: 0x2B, the identity objects at 0x48..0x4F, or a TAG this
+  // meter's indication set has that the vendor table does not. A width declared
+  // in YAML fills the gap - consulted last, so it can never shadow a row above.
   if (tag_width_overrides != nullptr && tag < TAG_WIDTH_TABLE_SIZE && tag_width_overrides[tag] != 0) {
-    *out = TagInfo{tag_width_overrides[tag], TagEnc::USER, TagConfidence::FAMILY_ASSUMED, 1.0f, ""};
+    *out = TagInfo{tag_width_overrides[tag], TagEnc::USER, TagConfidence::DOCUMENTED, 1.0f, ""};
     return true;
   }
   return false;
@@ -161,66 +120,13 @@ bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_o
 
 const char *payload_shape_to_string(PayloadShape s) {
   switch (s) {
-    case PayloadShape::COUNTED:
-      return "counted page";
-    case PayloadShape::CONTINUATION:
-      return "continuation, no COUNT byte";
-    case PayloadShape::COUNTED_STATUS:
-      return "counted page holding a status block";
-    case PayloadShape::FIXED_BLOCK:
-      return "fixed positional block, no TAGs";
-    case PayloadShape::RAW:
-      return "frame verified, DATA not decoded";
+    case PayloadShape::RECORDS:
+      return "records half: DI, COUNT, records";
+    case PayloadShape::STATUS_HALF:
+      return "status half: DI, leftover records, status block";
     default:
       return "unknown";
   }
-}
-
-const F102ValueInfo F102_VALUES[F102_VALUE_COUNT] = {
-    {"P", 0.1f, "W"},         {"P L1", 0.1f, "W"},   {"P L2", 0.1f, "W"},   {"P L3", 0.1f, "W"},
-    {"Q", 0.1f, "var"},       {"Q L1", 0.1f, "var"}, {"Q L2", 0.1f, "var"}, {"Q L3", 0.1f, "var"},
-    {"U L1", 0.01f, "V"},     {"I L1", 0.01f, "A"},  {"U L2", 0.01f, "V"},  {"I L2", 0.01f, "A"},
-    {"U L3", 0.01f, "V"},     {"I L3", 0.01f, "A"},  {"f", 0.01f, "Hz"},
-};
-
-bool parse_f102_block(const uint8_t *payload, size_t payload_len, F102Block *out) {
-  // DI(2) | MARKER(1) | value... - so anything shorter than one value cannot be
-  // this shape, and a partial trailing value means it is not this shape either.
-  if (payload == nullptr || out == nullptr || payload_len < 3 + F102_VALUE_SIZE) {
-    return false;
-  }
-  const size_t body = payload_len - 3;
-  if (body % F102_VALUE_SIZE != 0) {
-    return false;
-  }
-  const size_t values = body / F102_VALUE_SIZE;
-  if (values > F102_MAX_VALUES) {
-    return false;
-  }
-
-  out->marker = payload[2];
-  out->count = static_cast<uint8_t>(values);
-  for (size_t v = 0; v < values; v++) {
-    const uint8_t *q = &payload[3 + v * F102_VALUE_SIZE];
-    // Most-significant pair last, and bit 7 of that byte is the sign rather than
-    // part of the top digit.
-    const bool negative = (q[F102_VALUE_SIZE - 1] & F102_SIGN_BIT) != 0;
-    int32_t value = 0;
-    for (size_t i = F102_VALUE_SIZE; i > 0; i--) {
-      uint8_t b = q[i - 1];
-      if (i == F102_VALUE_SIZE) {
-        b = static_cast<uint8_t>(b & ~F102_SIGN_BIT);
-      }
-      const uint8_t hi = static_cast<uint8_t>(b >> 4);
-      const uint8_t lo = static_cast<uint8_t>(b & 0x0F);
-      if (hi > 9 || lo > 9) {
-        return false;  // not BCD, so not this shape - reject the whole block
-      }
-      value = value * 100 + hi * 10 + lo;
-    }
-    out->values[v] = negative ? -value : value;
-  }
-  return true;
 }
 
 const char *parse_result_to_string(ParseResult r) {
@@ -294,24 +200,28 @@ void serial_to_bcd_le(const char *digits12, uint8_t out[SERIAL_BCD_SIZE]) {
   }
 }
 
-uint32_t frequency_from_serial(const char *digits12) {
-  uint32_t n3 = 0;
-  if (digits12 != nullptr) {
-    const size_t len = std::strlen(digits12);
-    const size_t start = (len >= 3) ? (len - 3) : 0;
-    for (size_t i = start; i < len; i++) {
-      const char c = digits12[i];
-      if (c >= '0' && c <= '9') {
-        n3 = n3 * 10 + static_cast<uint32_t>(c - '0');
-      }
+const uint8_t REQUEST_BODY_LONG[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
+const uint8_t REQUEST_BODY_SHORT[1] = {0x00};
+
+const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT] = {
+    {DI_LIST_B_RECORDS, ListId::B, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    {DI_LIST_B_STATUS, ListId::B, ListPart::STATUS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    // The one short body. Sending the long one here gets no reply at all - not
+    // even an error response - so the pairing matters.
+    {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
+};
+
+const char *list_id_to_string(ListId l) { return (l == ListId::A) ? "A" : "B"; }
+
+uint8_t list_request_index(uint16_t di) {
+  for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
+    if (LIST_REQUESTS[i].di == di) {
+      return i;
     }
   }
-  const uint32_t k = n3 % 24;
-  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ + (k > CHANNEL_STEP_BREAK ? CHANNEL_STEP_EXTRA_HZ : 0u);
+  return LIST_REQUEST_COUNT;
 }
-
-const uint8_t PAGE_REQUEST_BODY[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
-const uint8_t STATUS_REQUEST_BODY[1] = {0x00};
 
 size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di,
                           const uint8_t *body, size_t body_len) {
@@ -375,24 +285,11 @@ size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERI
 }
 
 size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di) {
-  // The polls the display itself sends, with their captured bodies. All are
-  // constant; the meter answers with whatever its indication set holds.
-  // DI 0xF202 takes the same 6-byte body as DI 0xF200 - with the 1-byte body it is
-  // silently dropped, not even an error response - and DI 0xF203 is given the same
-  // one, since it selects nothing: which records it returns comes from the cursor
-  // the meter saved, not from the request.
-  // DI 0xF101 and DI 0xF104 get the same body on the assumption that the DI 0xF1xx
-  // pages share one, DI 0xF102 having answered to it. That is a guess, and a wrong
-  // body draws silence rather than a complaint - which is what the silent-page
-  // warning exists to catch.
-  if (di == DI_ENERGY || di == DI_PARAMS || di == DI_PARAMS_CONT || di == DI_F102 || di == DI_F101 ||
-      di == DI_F104) {
-    return build_read_request(out, cap, serial_le, di, PAGE_REQUEST_BODY, sizeof(PAGE_REQUEST_BODY));
+  const uint8_t req = list_request_index(di);
+  if (req >= LIST_REQUEST_COUNT) {
+    return 0;  // not one of the four; a probe has to supply its own body
   }
-  if (di == DI_STATUS) {
-    return build_read_request(out, cap, serial_le, di, STATUS_REQUEST_BODY, sizeof(STATUS_REQUEST_BODY));
-  }
-  return 0;
+  return build_read_request(out, cap, serial_le, di, LIST_REQUESTS[req].body, LIST_REQUESTS[req].body_len);
 }
 
 /// Smallest LEN that could hold a 645 frame with an empty DATA field.
@@ -413,31 +310,34 @@ struct ItemWalk {
   uint8_t unknown_offset{0};
 };
 
-/// Decode records from `payload[start .. payload_len)`, at most `max_records` of
-/// them, into `out` (which must hold MAX_ITEMS entries).
+/// Decode records from `payload[start .. end)`, at most `max_records` of them,
+/// into `out` (which must hold MAX_ITEMS entries).
 ///
-/// Records carry no length field, so a TAG of unknown width ends the walk: there
+/// `end` is where the records stop, which is not always the end of DATA: on a
+/// status half the last STATUS_BLOCK_SIZE bytes are the block, not a record.
+///
+/// Records carry no length field, so a TAG of unknown width ends the walk - there
 /// is no way to find where the next record starts. `count` and `end` then describe
 /// how far it got, which is what the caller needs in order to log the rest.
-ItemWalk walk_items(uint16_t di, const uint8_t *payload, size_t payload_len, size_t start, size_t max_records,
-                    ParsedItem *out, const uint8_t *tag_width_overrides) {
+ItemWalk walk_items(const uint8_t *payload, size_t end, size_t start, size_t max_records, ParsedItem *out,
+                    const uint8_t *tag_width_overrides) {
   ItemWalk w{};
   w.end = start;
   size_t pos = start;
-  while (w.count < max_records && pos < payload_len) {
+  while (w.count < max_records && pos < end) {
     if (w.count >= MAX_ITEMS) {
       w.result = ParseResult::TOO_MANY_ITEMS;
       return w;
     }
     const uint8_t tag = payload[pos];
     TagInfo info{};
-    if (!tag_info(di, tag, &info, tag_width_overrides)) {
+    if (!tag_info(tag, &info, tag_width_overrides)) {
       w.result = ParseResult::UNKNOWN_TAG;
       w.unknown_tag = tag;
       w.unknown_offset = static_cast<uint8_t>(pos);
       return w;
     }
-    if (pos + 1 + info.width > payload_len) {
+    if (pos + 1 + info.width > end) {
       // Cut mid-record. Unlike stopping short by whole records this is not
       // something a meter does deliberately, so it is a framing error.
       w.result = ParseResult::MALFORMED;
@@ -525,102 +425,78 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
 
-    // DI 0xF102 answers with a fixed block, which has no records to walk, so it
-    // cannot go through the machinery below. Try it first and on its own terms:
-    // parse_f102_block() only accepts a payload that is a whole number of valid
-    // BCD values, which makes a fit here as strong a signal as the exact-fit rule.
-    // If it does not fit, fall through - a meter answering this page with records
-    // is then read as records.
-    if (out->di == DI_F102) {
-      F102Block block{};
-      if (parse_f102_block(payload, data_len, &block)) {
-        out->count = 0;  // no TAGs, so no items; the caller reads out->payload
-        out->announced_count = 0;
-        out->shape = PayloadShape::FIXED_BLOCK;
-        return ParseResult::OK;
-      }
-    }
-
-    // DI 0xF101 and DI 0xF104 are read to see what comes back and nothing more, so
-    // the decoding stops at the application layer: the frame is known good and DATA
-    // is handed over untouched. Anything cleverer would mean inventing a record
-    // layout for a page nobody has decoded.
-    if (out->di == DI_F101 || out->di == DI_F104) {
-      out->count = 0;
-      out->announced_count = 0;
-      out->shape = PayloadShape::RAW;
-      return ParseResult::OK;
-    }
-
-    /* Which PayloadShape is this? The echoed DI narrows it down but does not
-     * always settle it, so try the plausible readings and let DATA decide: a page
-     * stops on a record boundary, so exactly one reading normally lands on the
-     * last DATA byte. Try them most-likely-first and take the first exact fit.
+    /* Which of the two framings is this?
+     *
+     * The request settles it - a records half answers with records, a status half
+     * with leftover records and then the block - but the reading is verified, not
+     * assumed: a page stops on a record boundary, so the right reading is the one
+     * that consumes DATA exactly. The expected framing is tried first and the
+     * other kept as a fallback, which is what lets a meter that answers a request
+     * the other way round be identified rather than read as garbage. A probe's
+     * data identifier is in neither half and is read as records.
      */
+    const uint8_t req = list_request_index(out->di);
+    const bool expect_status = (req < LIST_REQUEST_COUNT) && (LIST_REQUESTS[req].part == ListPart::STATUS);
+
+    // Records end here under each framing; walk_items() stops there and the fit
+    // is judged against it.
+    const auto records_end = [&](PayloadShape shape) -> size_t {
+      return (shape == PayloadShape::STATUS_HALF) ? data_len - STATUS_BLOCK_SIZE : data_len;
+    };
+
     const auto try_shape = [&](PayloadShape shape) -> ItemWalk {
-      // A record is at least 2 bytes, so data_len is a record bound that never
-      // truncates a real list - the MAX_ITEMS check inside the walk is what
-      // reports an over-long one.
-      if (shape == PayloadShape::CONTINUATION) {
-        return walk_items(out->di, payload, data_len, 2, data_len, out->items, tag_width_overrides);
+      if (shape == PayloadShape::STATUS_HALF) {
+        // DI(2) plus the block is the shortest a status half can be, and that is
+        // the shape of a reply with nothing left over to continue.
+        if (data_len < 2 + STATUS_BLOCK_SIZE) {
+          return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};
+        }
+        // No COUNT byte, so the byte budget is the only bound; a record is at
+        // least 2 bytes, so this never truncates a real list.
+        const size_t end = records_end(shape);
+        return walk_items(payload, end, 2, end, out->items, tag_width_overrides);
       }
       if (data_len < 3) {
         return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};  // no room for a COUNT byte
       }
-      // COUNTED_STATUS differs from COUNTED only in which width table the records
-      // are read with. That one difference is the whole point: under the TAG-page
-      // table TAG 0x00 is a 4-byte energy register, under the DI 0xF201 table it is
-      // a 9-byte status block, and a 13-byte DATA field fits the second exactly and
-      // the first not at all.
-      const uint16_t table_di = (shape == PayloadShape::COUNTED_STATUS) ? DI_STATUS : out->di;
-      return walk_items(table_di, payload, data_len, 3, payload[2], out->items, tag_width_overrides);
+      return walk_items(payload, data_len, 3, payload[2], out->items, tag_width_overrides);
     };
 
-    PayloadShape candidates[3];
-    uint8_t candidate_count = 0;
-    if (out->di == DI_STATUS) {
-      candidates[candidate_count++] = PayloadShape::COUNTED_STATUS;
-    } else if (out->di == DI_F102) {
-      // Nothing is established about this page, so every layout the parser knows
-      // is a candidate and the exact-fit rule is the only thing deciding.
-      candidates[candidate_count++] = PayloadShape::COUNTED;
-      candidates[candidate_count++] = PayloadShape::COUNTED_STATUS;
-      candidates[candidate_count++] = PayloadShape::CONTINUATION;
-    } else if (out->di == DI_PARAMS_CONT) {
-      // Genuinely unsettled, so all three are on the table. The firmware read says
-      // a resume streams records with no COUNT byte; the one frame captured from a
-      // live meter was instead a counted page holding a status block. Ordered by
-      // what the request asked for, not by what came back last.
-      candidates[candidate_count++] = PayloadShape::CONTINUATION;
-      candidates[candidate_count++] = PayloadShape::COUNTED_STATUS;
-      candidates[candidate_count++] = PayloadShape::COUNTED;
+    PayloadShape candidates[2];
+    if (expect_status) {
+      candidates[0] = PayloadShape::STATUS_HALF;
+      candidates[1] = PayloadShape::RECORDS;
     } else {
-      candidates[candidate_count++] = PayloadShape::COUNTED;
-      candidates[candidate_count++] = PayloadShape::CONTINUATION;
+      candidates[0] = PayloadShape::RECORDS;
+      candidates[1] = PayloadShape::STATUS_HALF;
     }
 
     ItemWalk walk{};
     PayloadShape shape = candidates[0];
     bool exact = false;
-    for (uint8_t c = 0; c < candidate_count; c++) {
-      walk = try_shape(candidates[c]);
-      if (walk.result == ParseResult::OK && walk.end == data_len) {
-        shape = candidates[c];
+    for (const PayloadShape candidate : candidates) {
+      walk = try_shape(candidate);
+      if (walk.result == ParseResult::OK && walk.end == records_end(candidate)) {
+        shape = candidate;
         exact = true;
         break;
       }
     }
     if (!exact) {
-      // No reading consumed DATA exactly. Report the first candidate's own
-      // failure - it is the one the request asked for, so its diagnostics are what
-      // a reader can act on - and re-run it so out->items holds what it decoded.
+      // Neither reading landed on a boundary. Report the expected one's own
+      // failure - its diagnostics are what a reader can act on - and re-run it so
+      // out->items holds whatever it did decode.
       shape = candidates[0];
       walk = try_shape(shape);
     }
 
     out->count = walk.count;
     out->shape = shape;
-    out->announced_count = (shape == PayloadShape::CONTINUATION || data_len < 3) ? 0 : payload[2];
+    out->announced_count = (shape == PayloadShape::RECORDS && data_len >= 3) ? payload[2] : 0;
+    if (shape == PayloadShape::STATUS_HALF && data_len >= 2 + STATUS_BLOCK_SIZE) {
+      std::memcpy(out->status_block, payload + data_len - STATUS_BLOCK_SIZE, STATUS_BLOCK_SIZE);
+      out->has_status_block = true;
+    }
     if (walk.result == ParseResult::UNKNOWN_TAG) {
       out->unknown_tag = walk.unknown_tag;
       out->unknown_offset = walk.unknown_offset;
@@ -630,7 +506,7 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     }
     if (!exact) {
       // Every record read cleanly, yet bytes are left over: DATA holds a whole
-      // record no reading accounted for, so a width above must be wrong.
+      // record that no reading accounted for, so a width above must be wrong.
       return ParseResult::MALFORMED;
     }
     return ParseResult::OK;
@@ -679,6 +555,30 @@ bool item_as_bcd(const ParsedItem &item, uint32_t *out) {
     v = v * 100u + hi * 10u + lo;
   }
   *out = v;
+  return true;
+}
+
+bool item_as_bcd_signed(const ParsedItem &item, int32_t *out) {
+  if (out == nullptr || item.len == 0 || item.len > 4) {
+    return false;
+  }
+  const bool negative = (item.raw[item.len - 1] & BCD_SIGN_BIT) != 0;
+  int32_t v = 0;
+  // Least-significant BCD pair first, so walk the bytes backwards; the sign bit
+  // is masked off the first byte read, which is the most significant one.
+  for (uint8_t i = item.len; i > 0; i--) {
+    uint8_t b = item.raw[i - 1];
+    if (i == item.len) {
+      b = static_cast<uint8_t>(b & ~BCD_SIGN_BIT);
+    }
+    const uint8_t hi = static_cast<uint8_t>(b >> 4);
+    const uint8_t lo = static_cast<uint8_t>(b & 0x0F);
+    if (hi > 9 || lo > 9) {
+      return false;
+    }
+    v = v * 100 + hi * 10 + lo;
+  }
+  *out = negative ? -v : v;
   return true;
 }
 

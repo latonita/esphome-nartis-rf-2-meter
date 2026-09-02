@@ -57,187 +57,149 @@ static constexpr size_t SERIAL_BCD_SIZE = 6;
 /* ================================================================
  * Application layer
  * ================================================================ */
-static constexpr uint16_t DI_ENERGY = 0xF200;  // energy registers + clock
-static constexpr uint16_t DI_STATUS = 0xF201;  // status block
-/// Full parameter page: the energy registers AND the instantaneous values.
-/// Takes the same 6-byte body as DI 0xF200 - with the 1-byte body of DI 0xF201 it
-/// is silently dropped, no error response at all.
-static constexpr uint16_t DI_PARAMS = 0xF202;
-/// Continuation of the DI 0xF202 record list.
-///
-/// The instantaneous page announces more records than one DL/T 645 frame can
-/// carry - COUNT 24 against the 16 that fit - and the meter keeps a cursor at the
-/// point where it ran out. DI 0xF203 asks for the same list from that cursor and
-/// returns the tail. Two consequences:
-///
-///   * the cursor is shared state. DI 0xF200 and DI 0xF202 both restart their
-///     list and clear it, so DI 0xF203 has to follow its DI 0xF202 immediately -
-///     anything in between makes it answer as if nothing were pending.
-///   * how a resumed frame is laid out is NOT settled - see PayloadShape.
-static constexpr uint16_t DI_PARAMS_CONT = 0xF203;
+/* The meter holds two pre-defined indication lists, and each list is read with
+ * two requests - one for the tagged values, one for the untagged status data that
+ * follows them:
+ *
+ *                 tagged records    status block
+ *      list A       DI 0xF200         DI 0xF201
+ *      list B       DI 0xF202         DI 0xF203
+ *
+ * Every request body is constant and selects nothing; which values a list holds
+ * is configured per meter with the vendor tool, and there is no way to ask for
+ * one value in particular.
+ *
+ * The two halves are framed differently, which is why PayloadShape exists:
+ *
+ *   records half   DI(2) | COUNT | {TAG,value}...
+ *   status half    DI(2) | {TAG,value}... | STATUS_BLOCK_SIZE bytes
+ *
+ * The records half announces the whole list in COUNT and then sends only what
+ * fits one DL/T 645 frame - a list of 24 comes back as 16. The status half has no
+ * COUNT of its own: it carries whatever records were left over, then the status
+ * block, which is ALWAYS present. That makes the split deterministic - peel the
+ * last STATUS_BLOCK_SIZE bytes off as the block and everything between the DI and
+ * there is records - and it is why a reply with no leftovers is exactly
+ * 2 + STATUS_BLOCK_SIZE bytes of payload.
+ *
+ * ORDERING: the leftover records come from a cursor the meter keeps, and it does
+ * not survive an intervening request. A status half must follow its own records
+ * half back to back or it answers with the block alone - seen both ways on a live
+ * meter, which is why LIST_REQUESTS keeps each pair adjacent.
+ *
+ * The lists overlap: list B has been seen carrying everything list A does plus
+ * the instantaneous values, making list A redundant on that meter. Which list
+ * holds what is a per-meter setting, so both are read and their records merged.
+ */
+static constexpr uint16_t DI_LIST_A_RECORDS = 0xF200;
+static constexpr uint16_t DI_LIST_A_STATUS = 0xF201;
+static constexpr uint16_t DI_LIST_B_RECORDS = 0xF202;
+static constexpr uint16_t DI_LIST_B_STATUS = 0xF203;
 
-/// A fifth page, read every cycle, and the one that answers with instantaneous
-/// values at full precision.
-///
-/// Not seen in any display capture, but a live meter answers the 6-byte page body
-/// with something no other page uses: a *fixed positional block*, no TAGs at all.
-/// See F102Block for the layout. It carries the per-phase active and reactive
-/// power the DI 0xF202 list has no room for, plus voltage, current and frequency
-/// at finer scaling than the DI 0xF202 records give - so it is where the per-phase
-/// quantities live, though not in the record form the DI 0xF202 tail was expected
-/// to arrive in.
-///
-/// Nothing here is exported. There are no TAGs to name the values by, so the block
-/// is parsed and logged and goes no further; how it should reach entities is still
-/// an open question.
-///
-/// Its reply is decoded against every layout the parser knows and accepted only on
-/// an exact fit, so a meter that answers this page differently gets its payload
-/// dumped for inspection instead of being read as garbage.
-static constexpr uint16_t DI_F102 = 0xF102;
+enum class ListId : uint8_t { A, B };
+static constexpr uint8_t LIST_COUNT = 2;
+/// "A" or "B", for the log.
+const char *list_id_to_string(ListId l);
 
-/// Two more of the DI 0xF1xx family, read every cycle and deliberately NOT
-/// interpreted.
-///
-/// DI 0xF102 turning out to hold something useful is the whole argument for
-/// asking these: they are its immediate neighbours, so whatever numbering scheme
-/// put the instantaneous block at 0xF102 probably put something at 0xF101 and
-/// 0xF104 too. Nothing is known about either - not the contents, not whether the
-/// values carry TAGs, not even whether the 6-byte page body is the one they want.
-///
-/// So the frame is verified to the DL/T 645 layer and its payload logged, and
-/// there the work stops: they parse as PayloadShape::RAW, which means "envelope
-/// CRC, checksum, address and length all check out; what DATA means is unknown".
-/// That is deliberate. Guessing a record layout for a page nobody has decoded
-/// would produce numbers that look like readings, and a wrong width silently
-/// misaligns everything after it - a payload hex line in the log cannot mislead
-/// anyone that way.
-static constexpr uint16_t DI_F101 = 0xF101;
-static constexpr uint16_t DI_F104 = 0xF104;
+enum class ListPart : uint8_t {
+  /// The list's tagged values, as many as one frame holds, behind a COUNT.
+  RECORDS,
+  /// The records that did not fit, then the status block. No COUNT byte.
+  STATUS,
+};
 
-/// The request body that follows the DI. Its length is per-DI, not fixed: the
-/// page polls carry six bytes, the status poll one. Both are constant in every
-/// captured request - there is no parameter selector in either. In particular the
-/// DI 0xF203 cursor is state the meter keeps for itself; nothing in the request
-/// says where to resume from, which is why the ordering rule above matters.
-/// Body of the page polls: DI 0xF200, DI 0xF202, DI 0xF203 and DI 0xF102 - the
-/// last of which was a guess until a meter answered it.
-extern const uint8_t PAGE_REQUEST_BODY[6];
-extern const uint8_t STATUS_REQUEST_BODY[1];
+/// The two request bodies. Both are constant in every captured request - there is
+/// no parameter selector in either - and which request takes which is observed
+/// rather than derived, so it lives in LIST_REQUESTS below. Note that three of
+/// the four take the long body and DI 0xF201 alone takes the short one; that
+/// asymmetry is what the display does, not a rule anyone has explained.
+extern const uint8_t REQUEST_BODY_LONG[6];
+extern const uint8_t REQUEST_BODY_SHORT[1];
 /// Longest request body a probe may carry.
 static constexpr size_t MAX_REQUEST_BODY = 8;
 
-/// Widest item value we can hold (the 9-byte status blob).
+struct ListRequest {
+  uint16_t di;
+  ListId list;
+  ListPart part;
+  const uint8_t *body;
+  uint8_t body_len;
+};
+
+/// The four requests, in the order they go on air. List B leads because it is the
+/// superset, so where the lists overlap its records are the ones that land in the
+/// merged set first; each list's two halves stay together.
+static constexpr uint8_t LIST_REQUEST_COUNT = 4;
+extern const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT];
+
+/// Index of `di` in LIST_REQUESTS, or LIST_REQUEST_COUNT when it is not one of
+/// the four - which is how a probe's data identifier reads.
+uint8_t list_request_index(uint16_t di);
+
+/// Widest item value in TAG_TABLE is the 7-byte clock; the extra room is for a
+/// YAML-declared width.
 static constexpr size_t MAX_ITEM_WIDTH = 9;
-/// Items in ONE response. The DI 0xF200 automatic cycle sends 4 and the DI 0xF202
-/// page 15-16, so this is sized from the payload instead of from what a particular
-/// page happens to use: the smallest possible item is 3 bytes (TAG plus a 2-byte
+/// Items in ONE response. Sized from the payload rather than from what a list
+/// happens to hold: the smallest possible record is 3 bytes (TAG plus a 2-byte
 /// value), so a MAX_PAYLOAD-byte payload cannot hold more than
 /// (MAX_PAYLOAD - 3) / 3 of them.
 ///
-/// This is per-response, not per-cycle: the DI 0xF202 + DI 0xF203 pair delivers
-/// one list across two frames and the component merges them itself.
+/// Per-response, not per-cycle: a list arrives across its two halves and the
+/// component merges them itself.
 static constexpr size_t MAX_ITEMS = 32;
-/// Longest request we build (the energy poll is 28 bytes on air).
+/// Longest request we build (28 bytes on air with the long body).
 static constexpr size_t MAX_REQUEST_FRAME_SIZE = 40;
 
-/// Layout of the 9-byte DI 0xF201 / TAG 0x00 status value.
-/// Bytes 0..4 and 6 are constant across the capture and unexplained.
-static constexpr size_t STATUS_VALUE_SIZE = 9;
-static constexpr size_t STATUS_OFF_TEMPERATURE = 5;    // inferred, not confirmed
-static constexpr size_t STATUS_OFF_TARIFF_COUNT = 7;   // inferred
-static constexpr size_t STATUS_OFF_ACTIVE_TARIFF = 8;  // confirmed against the tariff schedule
-
-/* ================================================================
- * The DI 0xF102 fixed block
- * ================================================================ */
-
-/// Width of one value in the DI 0xF102 block: 4 bytes of BCD, most-significant
-/// pair last, so the bytes read backwards - the same order as the TAG pages' BCD.
-static constexpr size_t F102_VALUE_SIZE = 4;
-/// Values in the layout below. A block of any other length is still parsed - the
-/// values just have no names, since the order is all that identifies them.
-static constexpr size_t F102_VALUE_COUNT = 15;
-/// Ceiling on what we will decode, from MAX_PAYLOAD: (128 - 3) / 4.
-static constexpr size_t F102_MAX_VALUES = 31;
-
-/// Sign bit of a DI 0xF102 value: bit 7 of the most-significant BCD byte, set to
-/// mean negative. It collides with the top BCD digit, so a value only reads back
-/// correctly below 80 000 000 raw counts - 8 MW at the 0.1 W scaling, which no
-/// meter this component talks to will reach. Reactive power is the field that
-/// actually goes negative; the rule is applied to every value because it is one
-/// encoder on the meter side, not a per-field convention.
-static constexpr uint8_t F102_SIGN_BIT = 0x80;
-
-/// One value of the DI 0xF102 block, for the log line. Positional: the index into
-/// F102_VALUES *is* the identity of the value, there being no TAG.
-struct F102ValueInfo {
-  const char *name;
-  /// Multiplier from raw BCD counts to `unit`.
-  float scale;
-  const char *unit;
-};
-
-/// The layout, in the order the meter appends the values. Read off one live reply
-/// and cross-checked two ways: the per-phase reactive powers sum to the total
-/// exactly, and the per-phase active powers sum to the total within rounding.
+/// The status block that ends every status-half reply.
 ///
-/// Note that voltage and current are interleaved per phase (U1 I1 U2 I2 U3 I3)
-/// while power is grouped with the total first, and that the scaling here is the
-/// meter's raw precision - finer than the DI 0xF202 records, which pre-divide
-/// voltage to 0.1 V. Do not reuse the DI 0xF202 scales for these.
-extern const F102ValueInfo F102_VALUES[F102_VALUE_COUNT];
-
-/// A decoded DI 0xF102 reply. Values are raw BCD counts with the sign applied;
-/// multiply by F102_VALUES[i].scale for engineering units.
-struct F102Block {
-  /// The byte between the echoed DI and the first value. 0x01 in the one reply
-  /// seen. Not a record count - the values that follow carry no TAGs - so it is
-  /// kept rather than interpreted.
-  uint8_t marker{0};
-  uint8_t count{0};
-  int32_t values[F102_MAX_VALUES]{};
-};
-
-/// Read a DI 0xF102 fixed block out of a de-offset payload (as held in
-/// ParsedResponse::payload). Returns false unless the payload is a whole number
-/// of values and every one of them is valid BCD - which is what stops this from
-/// accepting a payload that is really some other shape.
+/// Device state and alarm flags, not measurements: the firmware builds it from
+/// its alarm/status bitmap plus a few internal objects. Byte 0 is a constant
+/// marker, which is what makes an all-status reply recognisable at a glance.
 ///
-/// Called on the response rather than during parse_response() because the block
-/// has no TAGs and so has nowhere to live in ParsedResponse::items.
-bool parse_f102_block(const uint8_t *payload, size_t payload_len, F102Block *out);
-
-/// How the DATA field of a response lays its records out. DATA always opens with
-/// the echoed DI; what follows is one of these.
+///    0  constant 0x01 marker
+///    1  status group
+///    2  status bitfield
+///    3  status bitfield
+///    4  0x80 when a flag is set, else 0
+///    5  0x08 when a flag is set, else 0
+///    6  config / identity
+///    7  config value
+///    8  status bit
+///    9  relay / breaker state
+///   10  a further object, present only in this variant of the block
 ///
-/// A page stops on a record boundary, never mid-record, so the correct reading is
-/// always the one that consumes DATA exactly. That is what parse_response() uses
-/// to choose between the shapes a given data identifier might answer with.
+/// The same block exists 10 bytes long elsewhere in the firmware; the status
+/// halves send the 11-byte variant, which is the only one this component sees.
+static constexpr size_t STATUS_BLOCK_SIZE = 11;
+
+/* The bytes the `status:` entities read.
+ *
+ * These were inferred from one capture before the firmware's own layout was
+ * known, and the two do not agree: the table above calls byte 9 the relay/breaker
+ * state and byte 10 an internal object, neither of which is a tariff. The offsets
+ * are kept pointing at the same physical bytes so that no already-configured
+ * entity silently changes value, but treat the NAMES as unconfirmed and prefer
+ * `status: raw` when reporting what a meter sends.
+ *
+ * Temperature is not in here at all - it is TAG 0x2A in a list's records.
+ */
+static constexpr size_t STATUS_OFF_TARIFF_COUNT = 9;    // firmware: relay/breaker state
+static constexpr size_t STATUS_OFF_ACTIVE_TARIFF = 10;  // firmware: an internal object
+
+/// How the DATA field of a response is framed. Which one to expect follows from
+/// the request - see ListPart - but the reading is verified rather than assumed:
+/// a page stops on a record boundary, so the correct reading is the one that
+/// consumes DATA exactly, and parse_response() takes the first candidate that
+/// does. A meter framing a reply the other way round is then identified instead
+/// of being read as garbage.
 enum class PayloadShape : uint8_t {
-  /// DI | COUNT | {TAG,value}... with the TAG-page width table. Every DI 0xF200
-  /// and DI 0xF202 reply observed so far. COUNT is how many records the meter
-  /// *has*, so it is an upper bound, not the number sent.
-  COUNTED,
-  /// DI | {TAG,value}... - no COUNT byte, the list resuming from the meter's
-  /// cursor. This is what the meter firmware builds for a resume according to a
-  /// read of its DI 0xF2xx handler; no frame of this shape has been captured yet.
-  CONTINUATION,
-  /// DI | COUNT | {TAG,value}... read with the DI 0xF201 width table, where TAG
-  /// 0x00 is a 9-byte status block rather than a 4-byte energy register. Every
-  /// DI 0xF201 reply, and - the surprise - the one DI 0xF203 reply captured from a
-  /// live meter, which answered with a status block instead of a record tail.
-  COUNTED_STATUS,
-  /// DI | MARKER | value... - no records, no TAGs, just fixed-width values in a
-  /// positional order the reader has to know in advance. Only DI 0xF102 answers
-  /// this way; see F102Block. `items` is empty for this shape, because there are
-  /// no TAGs to key them by - the payload is what a reader wants.
-  FIXED_BLOCK,
-  /// Not decoded at all. Everything below the application layer verified and DATA
-  /// was then left alone: `items` is empty and `payload` holds the lot. This is
-  /// what DI 0xF101 and DI 0xF104 return - a statement of how far the checking
-  /// got, not a failure.
-  RAW,
+  /// DI | COUNT | {TAG,value}... - a records half. COUNT is how many records the
+  /// list *has*, so it is an upper bound on how many this frame carries.
+  RECORDS,
+  /// DI | {TAG,value}... | status block - a status half. No COUNT byte, and the
+  /// block is always there, so the records end STATUS_BLOCK_SIZE bytes before the
+  /// end of DATA.
+  STATUS_HALF,
 };
 
 const char *payload_shape_to_string(PayloadShape s);
@@ -247,31 +209,33 @@ const char *payload_shape_to_string(PayloadShape s);
 enum class TagEnc : uint8_t {
   UINT_LE,      // little-endian unsigned binary - the energy registers
   INT_LE,       // little-endian two's-complement signed binary
-  BCD_LE,       // BCD, least-significant pair first: 41 23 -> 2341
-  BCD_CLOCK,    // 7 bytes BCD: ss mm hh dow DD MM YY
-  STATUS_BLOB,  // 9 raw bytes (DI 0xF201)
-  USER,         // width declared in YAML; read as UINT_LE, unit unknown
+  BCD_LE,        // BCD, least-significant pair first: 41 23 -> 2341
+  BCD_LE_SIGNED,  // the same, with BCD_SIGN_BIT of the top byte meaning negative
+  BCD_CLOCK,      // 7 bytes BCD: ss mm hh dow DD MM YY
+  USER,           // width declared in YAML; read as UINT_LE, unit unknown
 };
 
-/// Where a TAG's width and encoding came from. Nothing but OBSERVED has been
-/// seen on this radio link, so the rest can still be wrong.
+/// Sign of a BCD_LE_SIGNED value: bit 7 of the most-significant byte, set to mean
+/// negative, with the remaining digits carrying the magnitude. It overlaps the top
+/// BCD digit, so the encoding cannot express a magnitude at or above 80 000 000
+/// counts - far past anything a meter reports in these registers.
+static constexpr uint8_t BCD_SIGN_BIT = 0x80;
+
+/// Where a TAG's width and encoding came from. Only OBSERVED has been seen on
+/// this radio link; the others can still be wrong.
 enum class TagConfidence : uint8_t {
   /// Decoded from captured D101-2 traffic.
   OBSERVED,
-  /// Taken from the DLMS/COSEM data type the same meter reports for the same
-  /// OBIS code over the DLMS-HDLC link. Validated by the energy registers,
-  /// where DLMS says double-long-unsigned and D101-2 does send 4 bytes.
-  DLMS_DERIVED,
-  /// Extrapolated from a sibling register of the same kind.
-  FAMILY_ASSUMED,
+  /// From the vendor's TAG table, but no frame carrying it has been captured.
+  DOCUMENTED,
+  /// The sources disagree about what this TAG holds. The width is agreed, so the
+  /// record can still be walked past - it is the meaning that is unsettled.
+  CONFLICTING,
 };
 
-/// Per-TAG value widths supplied from YAML for TAGs the decoder does not know,
-/// indexed by TAG (0x00..0x3F); 0 = no override. Lets a user who has learned a
-/// width from a log dump decode that item without a firmware change. Overrides
-/// only fill gaps - they never shadow a built-in width, so a stray entry cannot
-/// break the confirmed energy or clock decoding.
-static constexpr size_t TAG_WIDTH_TABLE_SIZE = 64;
+/// One past the highest TAG the vendor table describes (0x4F), and so the size of
+/// every per-TAG array here.
+static constexpr size_t TAG_WIDTH_TABLE_SIZE = 0x50;
 
 struct TagInfo {
   uint8_t width;
@@ -286,10 +250,16 @@ struct TagInfo {
 /// Human-readable provenance, for the log.
 const char *tag_confidence_to_string(TagConfidence c);
 
-/// Look up an item TAG's width and encoding for a given DI. Returns false when
-/// the TAG is unknown - the caller must then abort the parse, because without a
-/// width there is no way to find the next item.
-bool tag_info(uint16_t di, uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides = nullptr);
+/// Look up an item TAG's width, encoding and scale. Returns false when the TAG is
+/// unknown - the caller must then abort the parse, because without a width there
+/// is no way to find where the next record starts.
+///
+/// The TAG numbering does not depend on which page carried the record: DI 0xF200,
+/// DI 0xF202 and DI 0xF203 are one list read three ways, so one table serves all
+/// of them. `tag_width_overrides` is an optional TAG_WIDTH_TABLE_SIZE array of
+/// YAML-declared widths, consulted only for TAGs with no built-in entry, so a
+/// stray entry cannot shadow a known width.
+bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides = nullptr);
 
 struct ParsedItem {
   uint8_t tag{0};
@@ -311,15 +281,21 @@ struct ParsedResponse {
   uint16_t di{0};
   /// Records actually decoded - the length of `items`.
   uint8_t count{0};
-  /// The COUNT byte as received. Meters announce the full record set and then
-  /// send only what fits the frame, so this can exceed `count`; a difference is
-  /// normal truncation, not an error, and means a DI 0xF203 read will return the
-  /// rest. Zero on a continuation frame, which carries no COUNT byte.
+  /// The COUNT byte as received: how many records the list holds in total. A
+  /// records half sends only what fits one frame, so this routinely exceeds
+  /// `count` - the difference is what the status half then brings. Zero on a
+  /// status half, which has no COUNT byte of its own.
   uint8_t announced_count{0};
   /// Which reading of DATA produced `items`. Meaningful when parse_response()
   /// returned OK; on a failure it is the shape whose diagnostics are reported.
-  PayloadShape shape{PayloadShape::COUNTED};
+  PayloadShape shape{PayloadShape::RECORDS};
   ParsedItem items[MAX_ITEMS]{};
+
+  /// The status block, when `shape` is STATUS_HALF - where it is always present.
+  /// It is not a record and is deliberately not in `items`: it has no TAG, and
+  /// the byte a TAG would occupy is its constant 0x01 marker.
+  uint8_t status_block[STATUS_BLOCK_SIZE]{};
+  bool has_status_block{false};
 
   /// The application payload with the +0x33 transmission offset removed, kept
   /// whenever the envelope and the DL/T 645 layer verified - including on an
@@ -378,26 +354,13 @@ uint16_t crc16_x25(const uint8_t *data, size_t len);
 /// Writes zeroes if `digits12` is not 12 digits long.
 void serial_to_bcd_le(const char *digits12, uint8_t out[SERIAL_BCD_SIZE]);
 
-// Meter channel grid: k = last3(serial) % 24, freq = BASE + k * STEP, plus EXTRA
-// once k > BREAK. The k=18 -> 19 step is 800 kHz; every other step is 700 kHz.
-// Kept here rather than in cmt2300a_defs.h so this protocol layer stays free of
-// the HAL headers - the host-side frame checks build it on its own.
-static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
-static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
-static constexpr uint32_t CHANNEL_STEP_BREAK = 18u;
-static constexpr uint32_t CHANNEL_STEP_EXTRA_HZ = 100000u;
-
-/// Channel frequency (Hz) from the last three digits of the meter serial:
-///   k = last3 % 24;  f = 435.5 MHz + k*0.7 MHz, +100 kHz when k > 18.
-/// e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz; "...596" -> 20 -> 449.600 MHz.
-uint32_t frequency_from_serial(const char *digits12);
 
 /* ================================================================
  * Build / parse
  * ================================================================ */
 
-/// Build the complete on-air request frame for `di` - one of DI_ENERGY,
-/// DI_STATUS, DI_PARAMS, DI_PARAMS_CONT or DI_F102. Returns the number of bytes
+/// Build the complete on-air request frame for `di` - one of the four in
+/// LIST_REQUESTS, whose body it uses. Returns the number of bytes
 /// written, or 0 on error.
 ///
 /// Header byte 5 is HLEN = LEN ^ 1. The two candidate rules, LEN ^ 1 and
@@ -440,6 +403,10 @@ int32_t item_as_i32(const ParsedItem &item);
 /// BCD value of an item, least-significant pair first: 41 23 -> 2341.
 /// Returns false if any nibble is not a decimal digit.
 bool item_as_bcd(const ParsedItem &item, uint32_t *out);
+
+/// Same, for BCD_LE_SIGNED: BCD_SIGN_BIT of the top byte is stripped and applied
+/// as the sign. Returns false if the remaining nibbles are not BCD digits.
+bool item_as_bcd_signed(const ParsedItem &item, int32_t *out);
 
 /// Format a BCD_CLOCK item as "YYYY-MM-DD HH:MM:SS". Returns false if the item
 /// is not a 7-byte clock or the buffer is too small (needs 20 bytes).

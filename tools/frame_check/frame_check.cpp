@@ -1,5 +1,6 @@
 // Host-side check of d101_frame.cpp against PROTOCOL-D101-2.local.md.
 // Build: g++ -std=c++17 -o frame_check frame_check.cpp <component>/d101_frame.cpp
+#include "cmt2300a_defs.h"
 #include "d101_frame.h"
 
 #include <cstdio>
@@ -34,12 +35,9 @@ int main() {
   std::printf("frequency      %.3f MHz\n", f / 1e6);
   check(f == 443900000u, "frequency 443.900 MHz for ...060 (k=12, confirmed on air)");
 
-  // The grid steps 0.7 MHz per k, with one extra 100 kHz above k=18. The break
-  // is on-air evidence: serial ...596 (k=20) answers on 449.600 and is silent on
-  // 449.500, and k=12/k=13 pin the base below it. A reading of the display's own
-  // SPI capture suggested a uniform grid - FREQ_CHNL advancing by exactly +8 per
-  // k across k=17..19 - but where the meter actually transmits settles it, so
-  // these assertions exist to stop the uniform grid creeping back in.
+  // The grid steps 0.7 MHz per k, with one extra 100 kHz above k=18 - see
+  // frequency_from_serial in cmt2300a_defs.h for why the break is believed. These
+  // assertions exist to stop a uniform grid creeping back in.
   auto freq_for_k = [](unsigned k) {
     char serial[13];
     std::snprintf(serial, sizeof(serial), "000000000%03u", k);  // last 3 digits = k, k < 24
@@ -65,7 +63,7 @@ int main() {
   const uint8_t want_energy[] = {0x98, 0xF3, 0x17, 0x00, 0x01, 0x16, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32, 0x02, 0x68,
                                  0x01, 0x08, 0x33, 0x25, 0x33, 0x33, 0x33, 0x33, 0x34, 0x56, 0x92, 0x16, 0xFE, 0xB0};
   uint8_t buf[MAX_REQUEST_FRAME_SIZE];
-  size_t n = build_request(buf, sizeof(buf), serial, DI_ENERGY);
+  size_t n = build_request(buf, sizeof(buf), serial, DI_LIST_A_RECORDS);
   hex("energy built", buf, n);
   hex("energy doc", want_energy, sizeof(want_energy));
   check(n == sizeof(want_energy) && std::memcmp(buf, want_energy, n) == 0, "energy request matches the capture exactly");
@@ -75,7 +73,7 @@ int main() {
   //     this must match the capture byte-for-byte too. ---
   const uint8_t want_status[] = {0x98, 0xF3, 0x12, 0x00, 0x01, 0x13, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32,
                                  0x02, 0x68, 0x01, 0x03, 0x34, 0x25, 0x33, 0x6B, 0x16, 0x29, 0x0A};
-  n = build_request(buf, sizeof(buf), serial, DI_STATUS);
+  n = build_request(buf, sizeof(buf), serial, DI_LIST_A_STATUS);
   hex("status built", buf, n);
   hex("status doc", want_status, sizeof(want_status));
   check(n == sizeof(want_status) && std::memcmp(buf, want_status, n) == 0,
@@ -100,7 +98,7 @@ int main() {
   std::printf("parse          %s, DI 0x%04X, count %u\n", parse_result_to_string(pr), r.di, r.count);
   hex("payload", r.payload, r.payload_len);
   check(pr == ParseResult::OK, "worked-example response parses");
-  check(r.di == DI_ENERGY, "DI is 0xF200");
+  check(r.di == DI_LIST_A_RECORDS, "DI is 0xF200");
   check(r.count == 4, "4 items");
 
   const ParsedItem *total = r.find(0x00);
@@ -134,12 +132,12 @@ int main() {
   check(parse_response(corrupt, sizeof(corrupt), serial, &tmp) == ParseResult::NO_FRAME,
         "a corrupted frame is rejected");
 
-  // Every cycle polls all four data identifiers, so build_request() has to know
-  // all four - and only those. The three page polls share one 6-byte body and so
-  // differ from each other in the DI alone; DI 0xF201 carries a 1-byte body.
+  // Every cycle sends all four list requests, so build_request() has to know all
+  // four - and only those. Three share the long body and so differ from each other
+  // in the DI alone; list A's status half is the one that takes the short body.
   uint8_t page_frame[MAX_REQUEST_FRAME_SIZE];
-  const size_t page_len = build_request(page_frame, sizeof(page_frame), serial, DI_ENERGY);
-  for (uint16_t di : {DI_ENERGY, DI_PARAMS, DI_PARAMS_CONT, DI_F102, DI_F101, DI_F104}) {
+  const size_t page_len = build_request(page_frame, sizeof(page_frame), serial, DI_LIST_A_RECORDS);
+  for (uint16_t di : {DI_LIST_A_RECORDS, DI_LIST_B_RECORDS, DI_LIST_B_STATUS}) {
     uint8_t f[MAX_REQUEST_FRAME_SIZE];
     const size_t n = build_request(f, sizeof(f), serial, di);
     if (n != page_len) {
@@ -148,8 +146,8 @@ int main() {
     }
   }
   uint8_t status_frame[MAX_REQUEST_FRAME_SIZE];
-  const size_t status_len = build_request(status_frame, sizeof(status_frame), serial, DI_STATUS);
-  check(page_len > 0 && status_len == page_len - 5, "the page polls agree in length, DI 0xF201 is 5 shorter");
+  const size_t status_len = build_request(status_frame, sizeof(status_frame), serial, DI_LIST_A_STATUS);
+  check(page_len > 0 && status_len == page_len - 5, "the three page polls agree in length, DI 0xF201 is 5 shorter");
   check(build_request(page_frame, sizeof(page_frame), serial, 0xF204) == 0, "an unknown DI builds nothing");
 
 

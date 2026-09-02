@@ -5,35 +5,24 @@ a CMT2300A 443 MHz radio by emulating the НАРТИС-Д101-2 display. The link
 a DL/T 645-1997 frame with no encryption, no session and no password, so this
 component talks to the meter on its own - no UART bridge and no dlms_cosem.
 
-Only a fixed set of values is available: the meter answers seven constant requests
-and returns whatever its configured indication set contains. Entities therefore
-select a value by its 1-byte item TAG or by a field of the status block
-(DI 0xF201) - there is no way to ask for something else.
+Only a fixed set of values is available: the meter holds two pre-defined
+indication lists, configured by the utility with the vendor tool, and answers
+four constant requests that read them. Entities therefore select a value by its
+1-byte item TAG, or by a field of the status block - there is no way to ask for
+something else.
 
-Every cycle reads all seven data identifiers, in this order:
+Each list is read with two requests, and every cycle sends all four:
 
-    DI 0xF202  energy registers, clock and the instantaneous values
-    DI 0xF203  the tail of that record list, which does not fit one frame
-    DI 0xF200  energy registers and clock
-    DI 0xF201  status block
-    DI 0xF102  per-phase active and reactive power, voltage, current and
-               frequency, as a fixed block with no TAGs on the values
-    DI 0xF101  unknown - read and logged, not decoded
-    DI 0xF104  unknown - read and logged, not decoded
+    DI 0xF202   list B, records         tagged values, as many as fit one frame
+    DI 0xF203   list B, status half     the records left over, then the status block
+    DI 0xF200   list A, records
+    DI 0xF201   list A, status half
 
-DI 0xF203 resumes DI 0xF202 from a cursor the meter keeps and DI 0xF200 resets it,
-which is why the pair leads. Pages whose records fit the TAG layout are merged, so
-a `tag` entity does not care which one carried its value.
-
-The last three feed no entity:
-
-* DI 0xF102 is decoded but its values are identified by position, not by TAG, so
-  there is nothing for a `tag` entity to select. It is logged (at DEBUG) and goes
-  no further - exposing it needs a way to name a value that has no TAG, and that
-  is not designed yet.
-* DI 0xF101 and DI 0xF104 are not decoded at all. Their frames are verified and
-  their payloads logged, to find out what those pages hold; guessing a layout for
-  them would produce numbers that look like readings.
+The order matters: a status half has to follow its own records half back to back,
+because the leftover records come from a cursor the meter drops as soon as
+anything else is asked. Both lists are read and their records merged, so a `tag`
+entity does not care which list carried its value - list B has been seen to be a
+superset of list A, but which list holds what is a per-meter setting.
 """
 
 from esphome import pins
@@ -76,58 +65,69 @@ NartisRf2MeterComponent = nartis_rf_2_meter_ns.class_(
 )
 StatusField = nartis_rf_2_meter_ns.enum("StatusField", is_class=True)
 
-# Fields of the 9-byte DI 0xF201 status block. `active_tariff` is confirmed
-# against the observed tariff schedule; `tariff_count` and `temperature` are
-# inferred from byte positions and should be treated as experimental.
+# Fields of the 11-byte status block that ends each list.
+#
+# Both names are UNCONFIRMED. They were inferred from byte positions in a single
+# capture; the firmware's own layout of that block (see STATUS_BLOCK_SIZE in
+# d101_frame.h) calls the same two bytes the relay/breaker state and an internal
+# object, and describes the whole block as device state and alarm flags rather
+# than measurements. The bytes read are unchanged, so an existing entity keeps
+# reporting the same number - but prefer `raw` when working out what a meter
+# actually sends.
+#
+# `temperature` used to be listed here and is gone: it named a byte that is not a
+# temperature, and it referred to a C++ enumerator that never existed, so the
+# option could not compile. Real temperature is `tag: 0x2A`.
 STATUS_FIELDS = {
     "active_tariff": StatusField.ACTIVE_TARIFF,
     "tariff_count": StatusField.TARIFF_COUNT,
-    "temperature": StatusField.TEMPERATURE,
 }
 STATUS_FIELDS_TEXT = {
     **STATUS_FIELDS,
-    # Hex dump of the whole status block - for reporting the still-unexplained
-    # bytes 0..4 and 6.
+    # Hex dump of the whole block - the useful one, since most of it is
+    # unexplained bit flags.
     "raw": StatusField.RAW,
 }
 
-# TAGs with a built-in width. Items carry no length field, so a TAG of unknown
+# TAGs with a built-in width. Records carry no length field, so a TAG of unknown
 # width cannot even be skipped - it destroys framing for the rest of the payload.
+# The widths, encodings and scales all live in one table, TAG_TABLE in
+# d101_frame.cpp; this mirrors only what the config layer has to validate.
 #
-#   0x00..0x02   active energy import: sum, tariff 1, tariff 2  4B u32  observed
-#   0x29         date and time                                  7B BCD  observed
-#   0x14..0x1A   voltages, phase and line-to-line               2B u16  DLMS
-#   0x1B..0x1F   currents, single-phase, neutral, per-phase     4B u32  DLMS
-#   0x20..0x23   active power, sum and per-phase (signed)       4B i32  DLMS
-#   0x24..0x27   reactive power, sum and per-phase (signed)     4B i32  assumed
-#   0x28         mains frequency                                2B u16  DLMS
-#   0x2A         temperature (signed)                           2B i16  DLMS
-#   0x03..0x13   remaining tariffs, export, reactive energy     4B u32  assumed
-#   0x2C..0x3F   the same registers at the last billing period  4B u32  assumed
+#   0x00..0x13   energy accumulators                  4B binary LE
+#   0x14..0x1A   voltages, phase and line-to-line     4B BCD LE
+#   0x1B..0x1F   currents, single/neutral/per-phase   4B BCD LE
+#   0x20..0x23   active power, total and per-phase    4B BCD LE
+#   0x24..0x27   reactive power, total and per-phase  4B BCD LE, signed
+#   0x28         mains frequency                      4B BCD LE
+#   0x29         date and time                        7B BCD
+#   0x2A         temperature                          2B binary LE, signed
+#   0x2C..0x2F   contested group - see the table      4B BCD
+#   0x30..0x33   power factor                         4B BCD
+#   0x34..0x47   event and log counters               4B binary LE
 #
-# "DLMS" widths come from the data type the same meter reports for the same OBIS
-# code over the DLMS-HDLC link. That mapping is validated by the energy
-# registers, where DLMS says double-long-unsigned and D101-2 does send 4 bytes -
-# but no DLMS-derived width has been seen on this link yet, so the component
-# warns once per TAG when it publishes one.
+# Without a built-in width, and so needing `bytes:` before they can be read:
+# 0x2B (the LCD test, a command rather than a register) and 0x48..0x4F (identity
+# and configuration objects, whose widths differ per object).
 #
-# 0x2B (LCD test) is the only TAG left without a width.
+# Only some of these have been seen on this link; the component warns once per
+# TAG when it publishes one taken from the vendor table rather than a capture.
 TAG_CLOCK = 0x29
-TAG_NO_WIDTH = {0x2B}
-TAG_KNOWN = set(range(0x00, 0x40)) - TAG_NO_WIDTH
+TAG_NO_WIDTH = {0x2B} | set(range(0x48, 0x50))
+TAG_KNOWN = set(range(0x00, 0x50)) - TAG_NO_WIDTH
 TAG_NUMERIC = TAG_KNOWN - {TAG_CLOCK}
 
-# Any TAG is accepted, because the item index is a 6-bit field and a meter
-# configured with the vendor tool can send any of them. TAGs outside TAG_KNOWN
-# have no built-in width: they stay unavailable until `bytes:` declares one.
+# Any TAG in range is accepted: a meter configured with the vendor tool can send
+# any of them. TAGs in TAG_NO_WIDTH have no built-in width and stay unavailable
+# until `bytes:` declares one.
 TAG_MIN = 0x00
-TAG_MAX = 0x3F
+TAG_MAX = 0x4F
 # Widest item value the parser can hold (MAX_ITEM_WIDTH in d101_frame.h).
 TAG_MAX_WIDTH = 9
 
 
 def validate_tag(value):
-    """An item TAG of a data-page response (6-bit index, 0x00-0x3F)."""
+    """An item TAG of a data-page response (0x00-0x4F)."""
     tag = cv.hex_int(value)
     if not TAG_MIN <= tag <= TAG_MAX:
         raise cv.Invalid(
@@ -169,11 +169,7 @@ def validate_tag_entity(config):
 #   0xF201  status block
 #   0xF202  the same registers plus voltages, currents, power, frequency
 #   0xF203  the tail of the 0xF202 record list, resumed from the meter's cursor
-#   0xF102  the fixed instantaneous block; the 6-byte body was an assumption
-#           until a meter answered it
-#   0xF101  read every cycle, contents unknown; body assumed to match 0xF102
-#   0xF104  the same
-KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6, 0xF102: 6, 0xF101: 6, 0xF104: 6}
+KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6}
 
 MAX_REQUEST_BODY = 8
 
@@ -234,13 +230,13 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_FREQUENCY): cv.All(
             cv.frequency, cv.Range(min=430000000, max=460000000)
         ),
-        # Pause between exchanges. It also separates DI 0xF202 from the DI 0xF203
-        # that continues it, and the meter's resume cursor is what has to survive
-        # that pause - so if the tail comes back empty on a working link, a shorter
-        # gap is the first thing to try.
+        # Pause between exchanges. It also separates a list's records half from
+        # the status half that continues it, and the meter's cursor is what has to
+        # survive that pause - so if a status half comes back with no leftover
+        # records on a working link, a shorter gap is the first thing to try.
         #
-        # Seven exchanges per cycle at ~1 s each, so the whole cycle is roughly
-        # 7 * (airtime + gap); keep update_interval well clear of that.
+        # Four exchanges per cycle at ~1 s each, so the whole cycle is roughly
+        # 4 * (airtime + gap); keep update_interval well clear of that.
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,
