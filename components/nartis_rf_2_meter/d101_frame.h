@@ -126,10 +126,10 @@ struct ListRequest {
   uint8_t body_len;
 };
 
-/// The four requests, in the order they go on air. List B leads because it is the
+/// The two requests, in the order they go on air. List B leads because it is the
 /// superset, so where the lists overlap its records are the ones that land in the
 /// merged set first; each list's two halves stay together.
-static constexpr uint8_t LIST_REQUEST_COUNT = 4;
+static constexpr uint8_t LIST_REQUEST_COUNT = 2;
 extern const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT];
 
 /// Index of `di` in LIST_REQUESTS, or LIST_REQUEST_COUNT when it is not one of

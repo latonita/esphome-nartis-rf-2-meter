@@ -65,8 +65,8 @@ constexpr TagRange TAG_TABLE[] = {
     // Energy accumulators. Binary little-endian - the one family that is not BCD.
     // 0x00..0x07 are active import/export; the rest of the range is reactive and
     // other cumulative registers, so the log unit covers both.
-    {0x00, 0x07, 4, TagEnc::UINT_LE, TagConfidence::OBSERVED, 0.001f, "kWh"},
-    {0x08, 0x13, 4, TagEnc::UINT_LE, TagConfidence::DOCUMENTED, 0.001f, "kWh/kvarh"},
+    {0x00, 0x09, 4, TagEnc::UINT_LE, TagConfidence::OBSERVED, 0.001f, "kWh"},
+    {0x0A, 0x13, 4, TagEnc::UINT_LE, TagConfidence::DOCUMENTED, 0.001f, "kvarh"},
 
     // Voltages: 0x14 single-phase, 0x15..0x17 per phase, 0x18..0x1A line-to-line.
     {0x14, 0x14, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
@@ -74,12 +74,11 @@ constexpr TagRange TAG_TABLE[] = {
     {0x18, 0x1A, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
 
     // Currents: 0x1B single-phase, 0x1C neutral, 0x1D..0x1F per phase.
-    {0x1B, 0x1C, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "A"},
-    {0x1D, 0x1F, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.001f, "A"},
+    {0x1B, 0x1F, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "A"},
 
     // Power, total then per phase. Reactive is the only signed BCD on the wire.
-    {0x20, 0x23, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 10.0f, "W"},
-    {0x24, 0x27, 4, TagEnc::BCD_LE_SIGNED, TagConfidence::OBSERVED, 10.0f, "var"},
+    {0x20, 0x23, 4, TagEnc::BCD_LE_SIGNED, TagConfidence::OBSERVED, 1.0f, "W"},
+    {0x24, 0x27, 4, TagEnc::BCD_LE_SIGNED, TagConfidence::OBSERVED, 1.0f, "var"},
 
     {0x28, 0x28, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.01f, "Hz"},
     {0x29, 0x29, 7, TagEnc::BCD_CLOCK, TagConfidence::OBSERVED, 1.0f, ""},
@@ -87,10 +86,9 @@ constexpr TagRange TAG_TABLE[] = {
     // its neighbours use - the one row in this table that breaks the pattern.
     {0x2A, 0x2A, 2, TagEnc::INT_LE, TagConfidence::OBSERVED, 0.1f, "\302\260C"},
 
-    // 0x2B is the LCD test, a command rather than a register, and has no width.
-    {0x2C, 0x2F, 4, TagEnc::BCD_LE, TagConfidence::CONFLICTING, 1.0f, ""},
-    {0x30, 0x33, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, ""},
-    {0x34, 0x47, 4, TagEnc::UINT_LE, TagConfidence::DOCUMENTED, 1.0f, ""},
+    // 0x2B skipped, special use-case for D101-2 LCD test
+    {0x2C, 0x35, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "kWh"}, // active energy import (sum + by 4 tariffs), then export, end of last period
+    {0x36, 0x3F, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "kvarh"}, // reactive energy import  (sum + by 4 tariffs), then export end of last period
     // 0x48..0x4F are identity and configuration objects whose widths vary per
     // object, so there is no single width to walk them by. A YAML `bytes:` is the
     // only way to read one.
@@ -206,10 +204,8 @@ const uint8_t REQUEST_BODY_SHORT[1] = {0x00};
 const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT] = {
     {DI_LIST_B_RECORDS, ListId::B, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
     {DI_LIST_B_STATUS, ListId::B, ListPart::STATUS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    // The one short body. Sending the long one here gets no reply at all - not
-    // even an error response - so the pairing matters.
-    {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
+    // {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    // {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
 };
 
 const char *list_id_to_string(ListId l) { return (l == ListId::A) ? "A" : "B"; }
