@@ -315,6 +315,64 @@ int main() {
     }
   }
 
+  // The DI 0xF102 reply as it came off the air, from meter ...1060 on 2026-09-02.
+  // DATA de-offsets to 02 F1 | 01 | fifteen 4-byte BCD values and nothing else -
+  // no COUNT, no TAGs, just values in an order the reader has to know. 3 + 15*4
+  // = 63 = L, exactly.
+  //
+  // Two internal cross-checks corroborate the layout below, and they are the
+  // reason it is trusted from a single capture: the three per-phase reactive
+  // powers sum to the total exactly, and the three active powers sum to the total
+  // within rounding. Get the order or the sign rule wrong and neither holds.
+  std::printf("\n-- DI 0xF102 fixed block, as captured off the air --\n");
+  {
+    static const char *const F102_HEX =
+        "4E00014F6860102740320268813F35243483793433936633337357333343BB3333B34433B3434633B3C33333B353353333B4"
+        "6735338C343333766935335B34333379673533BA363333CB7C3333C4160DC2";
+    uint8_t frame7[128];
+    const size_t len7 = unhex(F102_HEX, frame7, sizeof(frame7));
+    ParsedResponse r7{};
+    const ParseResult pr7 = parse_response(frame7, len7, serial, &r7);
+    std::printf("parse: %s, DI 0x%04X, count %u, shape '%s', payload %u B\n", parse_result_to_string(pr7), r7.di,
+                r7.count, payload_shape_to_string(r7.shape), r7.payload_len);
+    check(pr7 == ParseResult::OK, "the captured DI 0xF102 reply parses");
+    check(r7.di == DI_F102, "DI is 0xF102");
+    check(r7.shape == PayloadShape::FIXED_BLOCK, "recognised as a fixed positional block");
+    check(r7.count == 0, "no items - there are no TAGs to key them by");
+    check(r7.payload_len == 3 + F102_VALUE_COUNT * F102_VALUE_SIZE, "payload is DI + marker + 15 values");
+
+    F102Block b{};
+    check(parse_f102_block(r7.payload, r7.payload_len, &b), "the block decodes");
+    check(b.marker == 0x01, "the byte before the values is 0x01");
+    check(b.count == F102_VALUE_COUNT, "15 values");
+    for (uint8_t i = 0; i < b.count && i < F102_VALUE_COUNT; i++) {
+      std::printf("  %2u %-6s %10.2f %s\n", i + 1, F102_VALUES[i].name,
+                  static_cast<double>(b.values[i]) * F102_VALUES[i].scale, F102_VALUES[i].unit);
+    }
+    // Spot values, against the meter's own display: 1465.0 W total, 234.81 V on
+    // L1, 49.98 Hz. The negative reactive powers are the sign rule working - bit 7
+    // of the most-significant BCD byte, which is why 80 11 00 80 is -118.0 and not
+    // some eight-digit number.
+    check(b.values[0] == 14650, "P total = 1465.0 W");
+    check(b.values[1] + b.values[2] + b.values[3] == 14610, "per-phase P sums to 1461.0 W, within rounding of P");
+    check(b.values[4] == -1180, "Q total = -118.0 var, sign bit honoured");
+    check(b.values[5] + b.values[6] + b.values[7] == b.values[4], "per-phase Q sums to Q total exactly");
+    check(b.values[8] == 23481 && b.values[10] == 23643 && b.values[12] == 23446, "U = 234.81 / 236.43 / 234.46 V");
+    check(b.values[9] == 159 && b.values[11] == 128 && b.values[13] == 387, "I = 1.59 / 1.28 / 3.87 A");
+    check(b.values[14] == 4998, "frequency = 49.98 Hz");
+
+    // The validation is what keeps FIXED_BLOCK from swallowing other shapes: a
+    // payload that is not a whole number of values, or holds a non-BCD nibble,
+    // has to be rejected so the record readings still get their turn.
+    F102Block junk{};
+    uint8_t bad[3 + 4];
+    std::memcpy(bad, r7.payload, sizeof(bad));
+    check(parse_f102_block(bad, sizeof(bad), &junk), "one value is a valid block");
+    check(!parse_f102_block(bad, sizeof(bad) - 1, &junk), "a partial trailing value is rejected");
+    bad[4] = 0x0A;  // low nibble 0x0A is not a BCD digit
+    check(!parse_f102_block(bad, sizeof(bad), &junk), "a non-BCD nibble is rejected");
+  }
+
   std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF202/0xF203 PAGES DECODE CORRECTLY" : "FAILURES", fail);
   return fail ? 1 : 0;
 }

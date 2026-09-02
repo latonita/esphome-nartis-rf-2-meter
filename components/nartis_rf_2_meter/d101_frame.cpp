@@ -167,9 +167,58 @@ const char *payload_shape_to_string(PayloadShape s) {
       return "continuation, no COUNT byte";
     case PayloadShape::COUNTED_STATUS:
       return "counted page holding a status block";
+    case PayloadShape::FIXED_BLOCK:
+      return "fixed positional block, no TAGs";
     default:
       return "unknown";
   }
+}
+
+const F102ValueInfo F102_VALUES[F102_VALUE_COUNT] = {
+    {"P", 0.1f, "W"},         {"P L1", 0.1f, "W"},   {"P L2", 0.1f, "W"},   {"P L3", 0.1f, "W"},
+    {"Q", 0.1f, "var"},       {"Q L1", 0.1f, "var"}, {"Q L2", 0.1f, "var"}, {"Q L3", 0.1f, "var"},
+    {"U L1", 0.01f, "V"},     {"I L1", 0.01f, "A"},  {"U L2", 0.01f, "V"},  {"I L2", 0.01f, "A"},
+    {"U L3", 0.01f, "V"},     {"I L3", 0.01f, "A"},  {"f", 0.01f, "Hz"},
+};
+
+bool parse_f102_block(const uint8_t *payload, size_t payload_len, F102Block *out) {
+  // DI(2) | MARKER(1) | value... - so anything shorter than one value cannot be
+  // this shape, and a partial trailing value means it is not this shape either.
+  if (payload == nullptr || out == nullptr || payload_len < 3 + F102_VALUE_SIZE) {
+    return false;
+  }
+  const size_t body = payload_len - 3;
+  if (body % F102_VALUE_SIZE != 0) {
+    return false;
+  }
+  const size_t values = body / F102_VALUE_SIZE;
+  if (values > F102_MAX_VALUES) {
+    return false;
+  }
+
+  out->marker = payload[2];
+  out->count = static_cast<uint8_t>(values);
+  for (size_t v = 0; v < values; v++) {
+    const uint8_t *q = &payload[3 + v * F102_VALUE_SIZE];
+    // Most-significant pair last, and bit 7 of that byte is the sign rather than
+    // part of the top digit.
+    const bool negative = (q[F102_VALUE_SIZE - 1] & F102_SIGN_BIT) != 0;
+    int32_t value = 0;
+    for (size_t i = F102_VALUE_SIZE; i > 0; i--) {
+      uint8_t b = q[i - 1];
+      if (i == F102_VALUE_SIZE) {
+        b = static_cast<uint8_t>(b & ~F102_SIGN_BIT);
+      }
+      const uint8_t hi = static_cast<uint8_t>(b >> 4);
+      const uint8_t lo = static_cast<uint8_t>(b & 0x0F);
+      if (hi > 9 || lo > 9) {
+        return false;  // not BCD, so not this shape - reject the whole block
+      }
+      value = value * 100 + hi * 10 + lo;
+    }
+    out->values[v] = negative ? -value : value;
+  }
+  return true;
 }
 
 const char *parse_result_to_string(ParseResult r) {
@@ -468,6 +517,22 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ParseResult::MALFORMED;  // need at least the echoed DI
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
+
+    // DI 0xF102 answers with a fixed block, which has no records to walk, so it
+    // cannot go through the machinery below. Try it first and on its own terms:
+    // parse_f102_block() only accepts a payload that is a whole number of valid
+    // BCD values, which makes a fit here as strong a signal as the exact-fit rule.
+    // If it does not fit, fall through - a meter answering this page with records
+    // is then read as records.
+    if (out->di == DI_F102) {
+      F102Block block{};
+      if (parse_f102_block(payload, data_len, &block)) {
+        out->count = 0;  // no TAGs, so no items; the caller reads out->payload
+        out->announced_count = 0;
+        out->shape = PayloadShape::FIXED_BLOCK;
+        return ParseResult::OK;
+      }
+    }
 
     /* Which PayloadShape is this? The echoed DI narrows it down but does not
      * always settle it, so try the plausible readings and let DATA decide: a page

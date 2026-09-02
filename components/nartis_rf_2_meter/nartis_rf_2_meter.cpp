@@ -505,9 +505,22 @@ void NartisRf2MeterComponent::handle_wait_() {
             if (!this->reported_f102_shape_) {
               this->reported_f102_shape_ = true;
               // First answer from a page little is known about. Saying what shape it
-              // turned out to have is most of the reason it is polled at all.
-              ESP_LOGI(TAG, "DI 0x%04X answered: %s, %u record(s)", di, payload_shape_to_string(resp.shape),
-                       resp.count);
+              // turned out to have is most of the reason it is polled at all. A
+              // fixed block has no records to count, so count its values instead.
+              if (resp.shape == PayloadShape::FIXED_BLOCK) {
+                ESP_LOGI(TAG, "DI 0x%04X answered: %s, %u value(s)", di, payload_shape_to_string(resp.shape),
+                         static_cast<unsigned>((resp.payload_len - 3) / F102_VALUE_SIZE));
+              } else {
+                ESP_LOGI(TAG, "DI 0x%04X answered: %s, %u record(s)", di, payload_shape_to_string(resp.shape),
+                         resp.count);
+              }
+            }
+            if (resp.shape == PayloadShape::FIXED_BLOCK) {
+              // The expected answer: instantaneous values with no TAGs on them.
+              // Logged and dropped - there is no TAG to select one by, so nothing
+              // here can reach an entity yet.
+              this->log_f102_block_(resp);
+              break;
             }
             if (resp.shape == PayloadShape::COUNTED_STATUS) {
               // A status block, not TAG-page data. Kept out of the merged set for
@@ -779,6 +792,45 @@ void NartisRf2MeterComponent::log_bad_records_(uint16_t di, ParseResult r, const
     ESP_LOGW(TAG, "  no records decoded at all");
   }
   ESP_LOGW(TAG, "  Please report the payload line together with the parameters your display shows.");
+}
+
+void NartisRf2MeterComponent::log_f102_block_(const ParsedResponse &resp) const {
+  F102Block b{};
+  if (!parse_f102_block(resp.payload, resp.payload_len, &b)) {
+    // parse_response() accepted the shape by running this same function, so a
+    // failure here would mean the two disagree.
+    ESP_LOGE(TAG, "DI 0x%04X: fixed block failed to re-parse: %s", DI_F102,
+             format_hex_pretty(resp.payload, resp.payload_len).c_str());
+    return;
+  }
+
+  if (b.count != F102_VALUE_COUNT) {
+    // A different number of values than the layout describes, so position no
+    // longer identifies anything. Dump them raw and say so; this is the evidence
+    // a second layout would be worked out from.
+    ESP_LOGW(TAG, "DI 0x%04X: %u values, not the %u the known layout has - order unknown, values raw:", DI_F102,
+             b.count, static_cast<unsigned>(F102_VALUE_COUNT));
+    for (uint8_t i = 0; i < b.count; i++) {
+      ESP_LOGW(TAG, "  [%2u] %" PRId32, i + 1, b.values[i]);
+    }
+    ESP_LOGW(TAG, "  marker 0x%02X, payload: %s", b.marker,
+             format_hex_pretty(resp.payload, resp.payload_len).c_str());
+    return;
+  }
+
+  // Grouped the way the quantities relate rather than one line per value: three
+  // lines a cycle is readable in a long log, fifteen is not. Indices are the
+  // F102_VALUES order - see the layout there before rearranging these.
+  const auto v = [&](uint8_t i) { return static_cast<float>(b.values[i]) * F102_VALUES[i].scale; };
+  ESP_LOGD(TAG, "DI 0x%04X: P %.1f W (L1 %.1f, L2 %.1f, L3 %.1f)", DI_F102, v(0), v(1), v(2), v(3));
+  ESP_LOGD(TAG, "DI 0x%04X: Q %.1f var (L1 %.1f, L2 %.1f, L3 %.1f)", DI_F102, v(4), v(5), v(6), v(7));
+  ESP_LOGD(TAG, "DI 0x%04X: L1 %.2f V %.2f A | L2 %.2f V %.2f A | L3 %.2f V %.2f A | %.2f Hz", DI_F102, v(8), v(9),
+           v(10), v(11), v(12), v(13), v(14));
+  if (b.marker != 0x01) {
+    // The one byte of the block nothing is known about. Worth a line if it ever
+    // differs from the value every observed reply carries.
+    ESP_LOGD(TAG, "DI 0x%04X: marker 0x%02X, not the 0x01 seen so far", DI_F102, b.marker);
+  }
 }
 
 void NartisRf2MeterComponent::note_tag_width_(uint8_t tag, StatusField field, uint8_t width) {

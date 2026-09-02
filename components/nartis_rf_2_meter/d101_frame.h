@@ -76,26 +76,24 @@ static constexpr uint16_t DI_PARAMS = 0xF202;
 ///   * how a resumed frame is laid out is NOT settled - see PayloadShape.
 static constexpr uint16_t DI_PARAMS_CONT = 0xF203;
 
-/// A fifth page, read every cycle, about which little is established.
+/// A fifth page, read every cycle, and the one that answers with instantaneous
+/// values at full precision.
 ///
-/// Not seen in any display capture. The working guess is that it carries the
-/// per-phase quantities the DI 0xF202 page has no room for - per-phase active and
-/// reactive power, and power factor - which would make it the natural home for the
-/// records DI 0xF202 announces and does not send. Nothing here depends on that
-/// being right; it is why the page is worth polling, not a claim about it.
+/// Not seen in any display capture, but a live meter answers the 6-byte page body
+/// with something no other page uses: a *fixed positional block*, no TAGs at all.
+/// See F102Block for the layout. It carries the per-phase active and reactive
+/// power the DI 0xF202 list has no room for, plus voltage, current and frequency
+/// at finer scaling than the DI 0xF202 records give - so it is where the per-phase
+/// quantities live, though not in the record form the DI 0xF202 tail was expected
+/// to arrive in.
 ///
-/// Note that power factor has no TAG assigned in the table below, so if it is here
-/// it will arrive under a TAG the parser has no width for and stop the walk - and
-/// say so, with the payload, via log_unknown_tag_().
+/// Nothing here is exported. There are no TAGs to name the values by, so the block
+/// is parsed and logged and goes no further; how it should reach entities is still
+/// an open question.
 ///
-/// The request body is not known either. It is polled with the 6-byte page body,
-/// the shape the DI 0xF2xx pages use - if that is the wrong one the meter answers
-/// nothing at all rather than complaining, which is what the silent-page warning
-/// exists to surface.
-///
-/// Its reply is decoded against every record layout the parser knows and accepted
-/// only on an exact fit, so a page numbered differently from the DI 0xF2xx family
-/// gets its payload dumped for inspection instead of being read as garbage.
+/// Its reply is decoded against every layout the parser knows and accepted only on
+/// an exact fit, so a meter that answers this page differently gets its payload
+/// dumped for inspection instead of being read as garbage.
 static constexpr uint16_t DI_F102 = 0xF102;
 
 /// The request body that follows the DI. Its length is per-DI, not fixed: the
@@ -103,8 +101,8 @@ static constexpr uint16_t DI_F102 = 0xF102;
 /// captured request - there is no parameter selector in either. In particular the
 /// DI 0xF203 cursor is state the meter keeps for itself; nothing in the request
 /// says where to resume from, which is why the ordering rule above matters.
-/// Body of the page polls: DI 0xF200, DI 0xF202, DI 0xF203 and - assumed, not
-/// observed - DI 0xF102.
+/// Body of the page polls: DI 0xF200, DI 0xF202, DI 0xF203 and DI 0xF102 - the
+/// last of which was a guess until a meter answered it.
 extern const uint8_t PAGE_REQUEST_BODY[6];
 extern const uint8_t STATUS_REQUEST_BODY[1];
 /// Longest request body a probe may carry.
@@ -131,6 +129,66 @@ static constexpr size_t STATUS_OFF_TEMPERATURE = 5;    // inferred, not confirme
 static constexpr size_t STATUS_OFF_TARIFF_COUNT = 7;   // inferred
 static constexpr size_t STATUS_OFF_ACTIVE_TARIFF = 8;  // confirmed against the tariff schedule
 
+/* ================================================================
+ * The DI 0xF102 fixed block
+ * ================================================================ */
+
+/// Width of one value in the DI 0xF102 block: 4 bytes of BCD, most-significant
+/// pair last, so the bytes read backwards - the same order as the TAG pages' BCD.
+static constexpr size_t F102_VALUE_SIZE = 4;
+/// Values in the layout below. A block of any other length is still parsed - the
+/// values just have no names, since the order is all that identifies them.
+static constexpr size_t F102_VALUE_COUNT = 15;
+/// Ceiling on what we will decode, from MAX_PAYLOAD: (128 - 3) / 4.
+static constexpr size_t F102_MAX_VALUES = 31;
+
+/// Sign bit of a DI 0xF102 value: bit 7 of the most-significant BCD byte, set to
+/// mean negative. It collides with the top BCD digit, so a value only reads back
+/// correctly below 80 000 000 raw counts - 8 MW at the 0.1 W scaling, which no
+/// meter this component talks to will reach. Reactive power is the field that
+/// actually goes negative; the rule is applied to every value because it is one
+/// encoder on the meter side, not a per-field convention.
+static constexpr uint8_t F102_SIGN_BIT = 0x80;
+
+/// One value of the DI 0xF102 block, for the log line. Positional: the index into
+/// F102_VALUES *is* the identity of the value, there being no TAG.
+struct F102ValueInfo {
+  const char *name;
+  /// Multiplier from raw BCD counts to `unit`.
+  float scale;
+  const char *unit;
+};
+
+/// The layout, in the order the meter appends the values. Read off one live reply
+/// and cross-checked two ways: the per-phase reactive powers sum to the total
+/// exactly, and the per-phase active powers sum to the total within rounding.
+///
+/// Note that voltage and current are interleaved per phase (U1 I1 U2 I2 U3 I3)
+/// while power is grouped with the total first, and that the scaling here is the
+/// meter's raw precision - finer than the DI 0xF202 records, which pre-divide
+/// voltage to 0.1 V. Do not reuse the DI 0xF202 scales for these.
+extern const F102ValueInfo F102_VALUES[F102_VALUE_COUNT];
+
+/// A decoded DI 0xF102 reply. Values are raw BCD counts with the sign applied;
+/// multiply by F102_VALUES[i].scale for engineering units.
+struct F102Block {
+  /// The byte between the echoed DI and the first value. 0x01 in the one reply
+  /// seen. Not a record count - the values that follow carry no TAGs - so it is
+  /// kept rather than interpreted.
+  uint8_t marker{0};
+  uint8_t count{0};
+  int32_t values[F102_MAX_VALUES]{};
+};
+
+/// Read a DI 0xF102 fixed block out of a de-offset payload (as held in
+/// ParsedResponse::payload). Returns false unless the payload is a whole number
+/// of values and every one of them is valid BCD - which is what stops this from
+/// accepting a payload that is really some other shape.
+///
+/// Called on the response rather than during parse_response() because the block
+/// has no TAGs and so has nowhere to live in ParsedResponse::items.
+bool parse_f102_block(const uint8_t *payload, size_t payload_len, F102Block *out);
+
 /// How the DATA field of a response lays its records out. DATA always opens with
 /// the echoed DI; what follows is one of these.
 ///
@@ -151,6 +209,11 @@ enum class PayloadShape : uint8_t {
   /// DI 0xF201 reply, and - the surprise - the one DI 0xF203 reply captured from a
   /// live meter, which answered with a status block instead of a record tail.
   COUNTED_STATUS,
+  /// DI | MARKER | value... - no records, no TAGs, just fixed-width values in a
+  /// positional order the reader has to know in advance. Only DI 0xF102 answers
+  /// this way; see F102Block. `items` is empty for this shape, because there are
+  /// no TAGs to key them by - the payload is what a reader wants.
+  FIXED_BLOCK,
 };
 
 const char *payload_shape_to_string(PayloadShape s);

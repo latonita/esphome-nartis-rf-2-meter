@@ -36,8 +36,11 @@
  * DI 0xF203 is skipped altogether when DI 0xF202 already delivered every record
  * it announced.
  *
- * DI 0xF102 goes last because it is the least understood of the five - see DI_F102
- * in d101_frame.h - so it cannot disturb anything ahead of it.
+ * DI 0xF102 goes last, and is the odd one out: it answers with a fixed block of
+ * TAG-less values rather than records, so it joins no merged set and feeds no
+ * entity - it is decoded into the log and nothing more. See DI_F102 in
+ * d101_frame.h. Last also means it cannot disturb anything ahead of it, which is
+ * where it started before the block was understood.
  *
  * SAFETY: this component is read-only by construction. Every frame it can build
  * comes from build_read_request(), which hard-wires the DL/T 645 control code to
@@ -199,6 +202,11 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// log_unknown_tag_(): put everything needed to work the layout out in the log,
   /// rather than leave a bare "malformed" and an undecoded RX dump.
   void log_bad_records_(uint16_t di, ParseResult r, const ParsedResponse &resp) const;
+  /// Decode and log the DI 0xF102 fixed block. This is the only thing done with
+  /// it: the values carry no TAGs, so there is nothing for a `tag` entity to
+  /// select and no way yet to route them to one. Logging them is what makes the
+  /// page worth polling until that mechanism exists.
+  void log_f102_block_(const ParsedResponse &resp) const;
 
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);

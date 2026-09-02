@@ -16,12 +16,17 @@ Every cycle reads all five data identifiers, in this order:
     DI 0xF203  the tail of that record list, which does not fit one frame
     DI 0xF200  energy registers and clock
     DI 0xF201  status block
-    DI 0xF102  not established; believed to hold the per-phase power, reactive
-               power and power factor that DI 0xF202 has no room for
+    DI 0xF102  per-phase active and reactive power, voltage, current and
+               frequency, as a fixed block with no TAGs on the values
 
 DI 0xF203 resumes DI 0xF202 from a cursor the meter keeps and DI 0xF200 resets it,
 which is why the pair leads. Pages whose records fit the TAG layout are merged, so
 a `tag` entity does not care which one carried its value.
+
+DI 0xF102 is the exception: its values are identified by position, not by TAG, so
+there is nothing for a `tag` entity to select. It is decoded and logged (at DEBUG)
+and goes no further - exposing it needs a way to name a value that has no TAG, and
+that is not designed yet.
 """
 
 from esphome import pins
@@ -157,7 +162,8 @@ def validate_tag_entity(config):
 #   0xF201  status block
 #   0xF202  the same registers plus voltages, currents, power, frequency
 #   0xF203  the tail of the 0xF202 record list, resumed from the meter's cursor
-#   0xF102  unestablished; the 6-byte body is an assumption, not an observation
+#   0xF102  the fixed instantaneous block; the 6-byte body was an assumption
+#           until a meter answered it
 KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6, 0xF102: 6}
 
 MAX_REQUEST_BODY = 8
