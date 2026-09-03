@@ -1,17 +1,23 @@
 /*
  * Nartis RF-2 meter - ESPHome component.
  *
- * Emulates the НАРТИС-Д101-2 display: it sends the four constant DL/T 645 read
- * requests over the 443 MHz CMT2300A link and decodes what comes back. No
- * pairing, no session, no password, no encryption - see d101_frame.h for the
- * wire format and for the two indication lists those four requests read.
+ * Emulates the НАРТИС-Д101-2 display: it sends constant DL/T 645 read requests
+ * over the 443 MHz CMT2300A link and decodes what comes back. No pairing, no
+ * session, no password, no encryption - see d101_frame.h for the wire format, for
+ * the two indication lists, and for the two fixed blocks.
+ *
+ * Three sources, selected in YAML (see set_sources), because each costs airtime:
+ *
+ *   list A   DI 0xF200 + DI 0xF201    a pre-defined indication list, tagged
+ *   list B   DI 0xF202 + DI 0xF203    the other one
+ *   fixed    DI 0xF101 + DI 0xF102    positional blocks, no TAGs, log-only
  *
  * Layering:
  *   Cmt2300aHal   - radio (bit-bang SPI, register banks, TX/RX profiles)
  *   d101_frame.*  - envelope + DL/T 645 + item payload, pure protocol
  *   this file     - polling state machine and entity publishing
  *
- * One poll cycle walks the four list requests and then any configured probes,
+ * One poll cycle walks the selected requests and then any configured probes,
  * driven by a state machine from loop(), with every state bounded by a timeout:
  *
  *   IDLE -> TX_REQUEST -> WAIT_REPLY -> GAP -> TX_REQUEST -> ... -> PUBLISH -> IDLE
@@ -101,6 +107,20 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Override the channel frequency instead of deriving it from the serial.
   /// 0 = derive (the normal case).
   void set_frequency_override(uint32_t hz) { this->frequency_override_ = hz; }
+
+  /// Which sources a cycle reads. Each costs airtime, so this is how a meter that
+  /// only needs one of them stops paying for the rest:
+  ///
+  ///   list A   DI 0xF200 + DI 0xF201
+  ///   list B   DI 0xF202 + DI 0xF203
+  ///   fixed    DI 0xF101 + DI 0xF102 - positional blocks, no TAGs
+  ///
+  /// Enabling none is caught in the YAML, not here.
+  void set_sources(bool list_a, bool list_b, bool fixed) {
+    this->read_list_[static_cast<uint8_t>(ListId::A)] = list_a;
+    this->read_list_[static_cast<uint8_t>(ListId::B)] = list_b;
+    this->read_fixed_ = fixed;
+  }
 
   /// Diagnostic entity: true when the last poll cycle got everything it asked for.
   /// Optional - nullptr when the YAML declares no binary sensor.
@@ -243,15 +263,16 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
 
   /// One poll cycle is a list of exchanges, built at the start of every cycle so
   /// the state machine is just "transmit step, await reply, advance" regardless of
-  /// how many there are. There are only two kinds of exchange: one of the four
-  /// fixed list requests, or one of the user's diagnostic probes.
-  enum class StepKind : uint8_t { LIST, PROBE };
+  /// how many there are. Three kinds of exchange: a list request, a fixed-block
+  /// request, or one of the user's diagnostic probes.
+  enum class StepKind : uint8_t { LIST, FIXED, PROBE };
   struct Step {
     StepKind kind{StepKind::LIST};
-    /// Index into LIST_REQUESTS for LIST, into probes_ for PROBE.
+    /// Index into LIST_REQUESTS for LIST, FIXED_REQUESTS for FIXED, probes_ for
+    /// PROBE.
     uint8_t idx{0};
   };
-  std::array<Step, LIST_REQUEST_COUNT + MAX_PROBES> steps_{};
+  std::array<Step, LIST_REQUEST_COUNT + FIXED_REQUEST_COUNT + MAX_PROBES> steps_{};
   uint8_t step_count_{0};
   uint8_t step_idx_{0};
 
@@ -261,6 +282,20 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Warn once per request when a reply is framed as the other half. That is how a
   /// meter which lays its lists out differently shows up.
   void warn_unexpected_half_once_(uint8_t request_idx, const ParsedResponse &resp);
+
+  /// Take a reply to DI 0xF101 or DI 0xF102: keep the payload and log it decoded.
+  /// Nothing is published from a fixed block yet - it carries no TAGs, so there is
+  /// nothing for a `tag:` entity to select by - so this is read-and-report.
+  void handle_fixed_reply_(uint8_t fixed_idx, const ParsedResponse &resp);
+  void log_f101_() const;
+  /// Warn once when a fixed read never answers - the sign that a meter has no
+  /// handler for it at all.
+  void report_silent_fixed_();
+  void log_f102_() const;
+  /// Compare the fixed blocks against each other and against the list records.
+  /// Every check here is arithmetic that must hold if the layouts are right, so a
+  /// failure means a layout is wrong rather than the meter being odd.
+  void cross_check_fixed_() const;
 
   /// YAML-declared value widths, indexed by TAG; 0 = none. Consulted by the
   /// parser only after every built-in width has been ruled out.
@@ -278,6 +313,18 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// with one; the first to arrive is kept and a second is compared against it.
   uint8_t status_block_[STATUS_BLOCK_SIZE]{};
   bool status_ok_{false};
+
+  /// Which sources this cycle reads - see set_sources().
+  bool read_list_[LIST_COUNT]{};
+  bool read_fixed_{false};
+
+  /// This cycle's fixed blocks, kept whole. `f102_len_` is what identifies the
+  /// variant, so it is stored rather than the decoded shape: 63 bytes is the
+  /// three-phase layout, 23 the single-phase one, 0 nothing arrived.
+  uint8_t f101_raw_[sizeof(nartis_f101)]{};
+  bool f101_ok_{false};
+  uint8_t f102_raw_[sizeof(f102_3ph)]{};
+  uint8_t f102_len_{0};
 
   /// Bit per LIST_REQUESTS entry that answered this cycle. The bit IS the index
   /// into that table, so there is no second naming to keep in step.
@@ -309,6 +356,11 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Bit per request already warned about for answering as the other half; one
   /// line per boot, because it is a finding to report rather than an error.
   uint8_t warned_half_{0};
+  /// Bit per FIXED_REQUESTS entry asked for at all, and answered at least once.
+  /// Separate from requests_polled_/requests_seen_, which index LIST_REQUESTS.
+  uint8_t fixed_polled_{0};
+  uint8_t fixed_seen_{0};
+  bool warned_fixed_silent_{false};
   /// Bit per TAG (0x00..0x3F) already warned about; keeps the unconfirmed-width
   /// warning to one line per TAG per boot.
   /// Two words because the TAG space runs to 0x4F, which does not fit one.

@@ -122,6 +122,12 @@ const char *payload_shape_to_string(PayloadShape s) {
       return "records half: DI, COUNT, records";
     case PayloadShape::STATUS_HALF:
       return "status half: DI, leftover records, status block";
+    case PayloadShape::FIXED_F101:
+      return "fixed F101: DI, 2 energy groups of 9, status block";
+    case PayloadShape::FIXED_F102_3PH:
+      return "fixed F102 three-phase: DI, marker, 15 BCD values";
+    case PayloadShape::FIXED_F102_1PH:
+      return "fixed F102 single-phase: DI, lead, 5 BCD values";
     default:
       return "unknown";
   }
@@ -204,9 +210,28 @@ const uint8_t REQUEST_BODY_SHORT[1] = {0x00};
 const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT] = {
     {DI_LIST_B_RECORDS, ListId::B, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
     {DI_LIST_B_STATUS, ListId::B, ListPart::STATUS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    // {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    // {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
+    {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    // The one short body. Sending the long one here gets no reply at all - not
+    // even an error response - so the pairing matters.
+    {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
 };
+
+// Both fixed reads take the long body, the one DI 0xF102 was captured answering.
+// DI 0xF101 has not been seen on air at all; the long body is the better guess of
+// the two, being what three of the four list requests use.
+const FixedRequest FIXED_REQUESTS[FIXED_REQUEST_COUNT] = {
+    {DI_FIXED_F101, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    {DI_FIXED_F102, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+};
+
+uint8_t fixed_request_index(uint16_t di) {
+  for (uint8_t i = 0; i < FIXED_REQUEST_COUNT; i++) {
+    if (FIXED_REQUESTS[i].di == di) {
+      return i;
+    }
+  }
+  return FIXED_REQUEST_COUNT;
+}
 
 const char *list_id_to_string(ListId l) { return (l == ListId::A) ? "A" : "B"; }
 
@@ -282,10 +307,14 @@ size_t build_read_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERI
 
 size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BCD_SIZE], uint16_t di) {
   const uint8_t req = list_request_index(di);
-  if (req >= LIST_REQUEST_COUNT) {
-    return 0;  // not one of the four; a probe has to supply its own body
+  if (req < LIST_REQUEST_COUNT) {
+    return build_read_request(out, cap, serial_le, di, LIST_REQUESTS[req].body, LIST_REQUESTS[req].body_len);
   }
-  return build_read_request(out, cap, serial_le, di, LIST_REQUESTS[req].body, LIST_REQUESTS[req].body_len);
+  const uint8_t fixed = fixed_request_index(di);
+  if (fixed < FIXED_REQUEST_COUNT) {
+    return build_read_request(out, cap, serial_le, di, FIXED_REQUESTS[fixed].body, FIXED_REQUESTS[fixed].body_len);
+  }
+  return 0;  // body not known for this DI; a probe has to supply its own
 }
 
 /// Smallest LEN that could hold a 645 frame with an empty DATA field.
@@ -420,6 +449,33 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ParseResult::MALFORMED;  // need at least the echoed DI
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
+
+    /* A fixed block is neither framing: no COUNT, no TAGs, and a length that is
+     * part of the layout rather than a consequence of what fitted. So it is
+     * settled here, before the record framings are considered at all.
+     *
+     * DI narrows it to F101 or F102 and the length finishes the job - which is
+     * also the whole 3-phase/1-phase test for F102, there being nothing else in
+     * the reply that says which meter sent it. A length that matches neither is
+     * MALFORMED with `payload` kept, so the caller can dump the bytes: that is
+     * the case worth seeing, since it means a third layout exists.
+     */
+    if (out->di == DI_FIXED_F101 || out->di == DI_FIXED_F102) {
+      if (out->di == DI_FIXED_F101 && data_len == sizeof(nartis_f101)) {
+        out->shape = PayloadShape::FIXED_F101;
+      } else if (out->di == DI_FIXED_F102 && data_len == sizeof(f102_3ph)) {
+        out->shape = PayloadShape::FIXED_F102_3PH;
+      } else if (out->di == DI_FIXED_F102 && data_len == sizeof(f102_1ph)) {
+        out->shape = PayloadShape::FIXED_F102_1PH;
+      } else {
+        return ParseResult::MALFORMED;
+      }
+      // No records and no COUNT byte. The values live in `payload`, to be read
+      // through the structs in nartis_dlt645_f1xx.h.
+      out->count = 0;
+      out->announced_count = 0;
+      return ParseResult::OK;
+    }
 
     /* Which of the two framings is this?
      *

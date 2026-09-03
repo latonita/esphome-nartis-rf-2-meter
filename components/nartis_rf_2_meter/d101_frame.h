@@ -4,7 +4,7 @@
  * This is the display link: the same 443 MHz CMT2300A PHY the DLMS-HDLC bridge
  * uses, but carrying a DL/T 645-1997 frame directly instead of a type-0x5A
  * envelope. Nothing is encrypted, there is no session, no password and no
- * sequence number - the four request frames are constant for a given meter.
+ * sequence number - every request frame is constant for a given meter.
  *
  * Three nested layers:
  *
@@ -28,6 +28,8 @@
 
 #include <cstddef>
 #include <cstdint>
+
+#include "nartis_dlt645_f1xx.h"
 
 namespace esphome::nartis_rf_2_meter {
 
@@ -126,15 +128,54 @@ struct ListRequest {
   uint8_t body_len;
 };
 
-/// The two requests, in the order they go on air. List B leads because it is the
-/// superset, so where the lists overlap its records are the ones that land in the
-/// merged set first; each list's two halves stay together.
-static constexpr uint8_t LIST_REQUEST_COUNT = 2;
+/// All four list requests, in the order they go on air. List B leads because it
+/// is the superset, so where the lists overlap its records are the ones that land
+/// in the merged set first; each list's two halves stay together.
+///
+/// Being in this table means the request CAN be sent, not that it is: which
+/// sources a cycle actually polls is a YAML setting. The table stays whole so the
+/// parser can recognise a reply to any of them.
+static constexpr uint8_t LIST_REQUEST_COUNT = 4;
 extern const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT];
 
 /// Index of `di` in LIST_REQUESTS, or LIST_REQUEST_COUNT when it is not one of
-/// the four - which is how a probe's data identifier reads.
+/// the four - which is how a fixed block's or a probe's data identifier reads.
 uint8_t list_request_index(uint16_t di);
+
+/* ================================================================
+ * The fixed blocks: DI 0xF101 and DI 0xF102
+ * ================================================================
+ *
+ * A third source, and a different animal from the lists. No COUNT, no TAGs, no
+ * cursor: each answers with one struct of positional values whose length is
+ * fixed, so a value is identified by where it sits. nartis_dlt645_f1xx.h holds
+ * those layouts and is the single source of truth for their sizes.
+ *
+ *   DI 0xF101   energy accumulators - two groups of [total, T1..T8] - then the
+ *               10-byte status block. One layout on both meter types.
+ *   DI 0xF102   live P/Q/U/I/frequency. TWO layouts, and the length is what tells
+ *               them apart: 63 bytes of DATA is the three-phase block of 15
+ *               values, 23 bytes the single-phase block of 5.
+ *
+ * Length is therefore load-bearing rather than a sanity check, which is the same
+ * exact-fit principle the two list framings are told apart by.
+ */
+static constexpr uint16_t DI_FIXED_F101 = 0xF101;
+static constexpr uint16_t DI_FIXED_F102 = 0xF102;
+
+struct FixedRequest {
+  uint16_t di;
+  const uint8_t *body;
+  uint8_t body_len;
+};
+
+/// Both fixed reads, in air order. They carry no cursor, so unlike the list
+/// halves they can be sent in any order and at any point in a cycle.
+static constexpr uint8_t FIXED_REQUEST_COUNT = 2;
+extern const FixedRequest FIXED_REQUESTS[FIXED_REQUEST_COUNT];
+
+/// Index of `di` in FIXED_REQUESTS, or FIXED_REQUEST_COUNT when it is neither.
+uint8_t fixed_request_index(uint16_t di);
 
 /// Widest item value in TAG_TABLE is the 7-byte clock; the extra room is for a
 /// YAML-declared width.
@@ -200,6 +241,14 @@ enum class PayloadShape : uint8_t {
   /// block is always there, so the records end STATUS_BLOCK_SIZE bytes before the
   /// end of DATA.
   STATUS_HALF,
+  /// DI 0xF101: two energy groups then the 10-byte status block. `payload` holds
+  /// it whole - see struct nartis_f101 - and `items` is empty, since there are no
+  /// TAGs to walk.
+  FIXED_F101,
+  /// DI 0xF102, three-phase: marker then 15 BCD values. See struct f102_3ph.
+  FIXED_F102_3PH,
+  /// DI 0xF102, single-phase: lead byte then 5 BCD values. See struct f102_1ph.
+  FIXED_F102_1PH,
 };
 
 const char *payload_shape_to_string(PayloadShape s);

@@ -138,7 +138,7 @@ int main() {
       {0x1C, 4, TagEnc::BCD_LE, 1774, "17.74 A neutral"},
       {0x1D, 4, TagEnc::BCD_LE, 1286, "12.86 A"},
       {0x1E, 4, TagEnc::BCD_LE, 1117, "11.17 A"},
-      {0x20, 4, TagEnc::BCD_LE, 795, "7.95 kW"},
+      {0x20, 4, TagEnc::BCD_LE_SIGNED, 795, "7.95 kW"},
       {0x28, 4, TagEnc::BCD_LE, 4999, "49.99 Hz"},
   };
 
@@ -156,16 +156,23 @@ int main() {
       fail++;
       continue;
     }
+    // `raw` is a magnitude, so a signed BCD row is compared on its magnitude -
+    // every reference value here is an import reading and positive.
     uint32_t got = 0;
     bool ok = true;
+    const bool is_bcd = (e.enc == TagEnc::BCD_LE) || (e.enc == TagEnc::BCD_LE_SIGNED);
     if (e.enc == TagEnc::BCD_LE) {
       ok = item_as_bcd(*item, &got);
+    } else if (e.enc == TagEnc::BCD_LE_SIGNED) {
+      int32_t signed_got = 0;
+      ok = item_as_bcd_signed(*item, &signed_got);
+      got = static_cast<uint32_t>((signed_got < 0) ? -signed_got : signed_got);
     } else {
       got = item_as_u32(*item);
     }
     const bool pass = ok && got == e.raw && item->len == e.width;
     std::printf("%s  tag 0x%02X %u B %-6s raw %-9u %s\n", pass ? "PASS" : "FAIL", e.tag, item->len,
-                e.enc == TagEnc::BCD_LE ? "BCD" : "bin", got, e.shown);
+                is_bcd ? "BCD" : "bin", got, e.shown);
     if (!pass) {
       std::printf("      expected raw %u\n", e.raw);
       fail++;
@@ -331,8 +338,15 @@ int main() {
     for (uint16_t t = 0x00; t <= 0xFF; t++) {
       TagInfo info{};
       const bool known = tag_info(static_cast<uint8_t>(t), &info);
-      // Contiguous 0x00..0x47 apart from 0x2B, and nothing at all above 0x47.
-      const bool want = (t <= 0x47) && (t != 0x2B);
+      /* Contiguous 0x00..0x3F apart from 0x2B, and nothing at all above 0x3F.
+       *
+       * 0x2B is the display's LCD test rather than a value, so it has no width to
+       * walk by. Above 0x3F the vendor TAG list simply stops: 0x40..0x47 once had
+       * a row here on the guess that they were event counters, and refusing them
+       * is the point of removing it - a record with no known width has to abort
+       * the walk, since guessing one would misframe everything after it.
+       */
+      const bool want = (t <= 0x3F) && (t != 0x2B);
       if (known != want) {
         std::printf("FAIL  TAG 0x%02X is %s, expected %s\n", t, known ? "known" : "unknown",
                     want ? "known" : "unknown");
@@ -343,7 +357,7 @@ int main() {
         shape_ok = false;
       }
     }
-    check(shape_ok, "every TAG 0x00-0x47 but 0x2B has a usable width, and nothing above 0x47 does");
+    check(shape_ok, "every TAG 0x00-0x3F but 0x2B has a usable width, and nothing above 0x3F does");
 
     TagInfo info{};
     // The one row that breaks the pattern of its neighbours, so the one most
@@ -351,7 +365,10 @@ int main() {
     check(tag_info(0x2A, &info) && info.width == 2 && info.enc == TagEnc::INT_LE,
           "temperature 0x2A is 2 bytes of signed binary, not the 4-byte BCD around it");
     check(tag_info(0x24, &info) && info.enc == TagEnc::BCD_LE_SIGNED, "reactive power 0x24 is signed BCD");
-    check(tag_info(0x23, &info) && info.enc == TagEnc::BCD_LE, "active power 0x23 is plain BCD");
+    // Signed, and for the same reason as the reactive group: the vendor TAG list
+    // marks 0x20..0x23 "report with sign" too. Not yet seen negative on air -
+    // every capture is import - so this pins the decision, not an observation.
+    check(tag_info(0x23, &info) && info.enc == TagEnc::BCD_LE_SIGNED, "active power 0x23 is signed BCD as well");
     check(tag_info(0x00, &info) && info.enc == TagEnc::UINT_LE, "energy 0x00 is binary, the one non-BCD family");
     check(tag_info(0x29, &info) && info.width == 7 && info.enc == TagEnc::BCD_CLOCK, "the clock 0x29 is 7 bytes");
     check(!tag_info(0x48, &info), "the identity objects from 0x48 up have no single width to walk by");

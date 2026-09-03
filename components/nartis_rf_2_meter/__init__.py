@@ -11,12 +11,16 @@ four constant requests that read them. Entities therefore select a value by its
 1-byte item TAG, or by a field of the status block - there is no way to ask for
 something else.
 
-Each list is read with two requests, and every cycle sends all four:
+Each list is read with two requests, and there is a third source - the fixed
+blocks - read with two more. Which of the three a cycle sends is the `sources:`
+setting; by default that is list B alone:
 
     DI 0xF202   list B, records         tagged values, as many as fit one frame
     DI 0xF203   list B, status half     the records left over, then the status block
     DI 0xF200   list A, records
     DI 0xF201   list A, status half
+    DI 0xF101   fixed: energy groups of [total, T1..T8], then a status block
+    DI 0xF102   fixed: live P/Q/U/I/frequency; its length says 3-phase or 1-phase
 
 The order matters: a status half has to follow its own records half back to back,
 because the leftover records come from a cursor the meter drops as soon as
@@ -48,6 +52,8 @@ CONF_REQUEST_GAP = "request_gap"
 CONF_RF_RX_TIMEOUT = "rf_rx_timeout"
 CONF_RF_RETRIES = "rf_retries"
 CONF_RX_CENTER_OFFSET = "rx_center_offset"
+
+CONF_SOURCES = "sources"
 
 CONF_PROBE = "probe"
 CONF_DI = "di"
@@ -161,15 +167,54 @@ def validate_tag_entity(config):
     )
 
 
-# Data identifiers the component polls every cycle, with the request body each one
-# carries. Note the body length is per-DI, not fixed - 6 bytes for the pages, 1
-# byte for 0xF201 - so the body of an unknown DI has to be guessed.
+# Where values are read from. Each source costs airtime - two exchanges each, at
+# roughly a second apiece - so this is how a meter that needs only one of them
+# stops paying for the rest.
 #
-#   0xF200  energy registers + clock
-#   0xF201  status block
-#   0xF202  the same registers plus voltages, currents, power, frequency
-#   0xF203  the tail of the 0xF202 record list, resumed from the meter's cursor
-KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6}
+#   list_a   DI 0xF200 + DI 0xF201    one pre-defined indication list
+#   list_b   DI 0xF202 + DI 0xF203    the other
+#   fixed    DI 0xF101 + DI 0xF102    positional blocks: no COUNT, no TAGs
+#
+# Which list holds what is set per meter with the vendor tool. On the meter this
+# was developed against list B is a superset of list A, which is why it is the
+# default on its own; a meter whose lists are split differently wants both.
+#
+# `fixed` publishes nothing today. Both blocks identify their values by position
+# rather than by TAG, so there is no TAG for a `tag:` entity to select, and what
+# the source does is log the decoded block and cross-check it against the lists.
+# Enable it to see what a meter holds, or to settle the scale questions in
+# tags.md - not to feed an entity.
+SOURCE_LIST_A = "list_a"
+SOURCE_LIST_B = "list_b"
+SOURCE_FIXED = "fixed"
+SOURCES = [SOURCE_LIST_A, SOURCE_LIST_B, SOURCE_FIXED]
+
+
+def validate_sources(value):
+    """A list of sources: at least one, each named at most once."""
+    seen = []
+    for item in value:
+        if item in seen:
+            raise cv.Invalid(f"source '{item}' is listed twice")
+        seen.append(item)
+    if not seen:
+        raise cv.Invalid(
+            f"at least one source is required; choose from {', '.join(SOURCES)}"
+        )
+    return seen
+
+
+# Data identifiers whose request body is known, and how long that body is. Note
+# the length is per-DI, not fixed - 6 bytes everywhere except DI 0xF201, which
+# takes 1 - so the body of an unknown DI has to be guessed.
+#
+#   0xF200  list A, records half     tagged values, as many as fit one frame
+#   0xF201  list A, status half      the records left over, then the status block
+#   0xF202  list B, records half
+#   0xF203  list B, status half
+#   0xF101  fixed block: two energy groups of [total, T1..T8], then a status block
+#   0xF102  fixed block: live P/Q/U/I/frequency; length says 3-phase or 1-phase
+KNOWN_DI = {0xF200: 6, 0xF201: 1, 0xF202: 6, 0xF203: 6, 0xF101: 6, 0xF102: 6}
 
 MAX_REQUEST_BODY = 8
 
@@ -262,6 +307,9 @@ CONFIG_SCHEMA = cv.Schema(
         # are logged in full and drive no entity. Reads only - the DL/T 645 control
         # code is hard-wired, so no probe can turn into a write. That matters:
         # this link also carries a relay-close command.
+        cv.Optional(CONF_SOURCES, default=[SOURCE_LIST_B]): cv.All(
+            cv.ensure_list(cv.one_of(*SOURCES, lower=True)), validate_sources
+        ),
         cv.Optional(CONF_PROBE): cv.All(
             cv.ensure_list(PROBE_SCHEMA), cv.Length(min=1, max=8), validate_probes
         ),
@@ -293,6 +341,15 @@ async def to_code(config):
     cg.add(var.set_rf_rx_timeout_ms(config[CONF_RF_RX_TIMEOUT]))
     cg.add(var.set_rf_retries(config[CONF_RF_RETRIES]))
     cg.add(var.set_rx_center_offset(config[CONF_RX_CENTER_OFFSET]))
+
+    sources = config[CONF_SOURCES]
+    cg.add(
+        var.set_sources(
+            SOURCE_LIST_A in sources,
+            SOURCE_LIST_B in sources,
+            SOURCE_FIXED in sources,
+        )
+    )
 
     for probe in config.get(CONF_PROBE, []):
         cg.add(var.add_probe(probe[CONF_DI], probe[CONF_BODY]))

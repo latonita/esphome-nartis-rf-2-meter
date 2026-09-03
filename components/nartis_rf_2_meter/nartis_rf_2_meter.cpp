@@ -111,6 +111,230 @@ void NartisRf2MeterComponent::warn_unexpected_half_once_(uint8_t request_idx, co
   ESP_LOGW(TAG, "  RX line above - it means this meter frames its lists differently.");
 }
 
+/* The fixed blocks.
+ *
+ * Read-and-report for now: there is no TAG in either block for a `tag:` entity to
+ * select by, so nothing is published from them. What they are good for today is
+ * checking the list decode - the same quantities arrive here on an independent
+ * path, with the meter's own raw precision and its own scales - and telling a
+ * three-phase meter from a single-phase one, which DI 0xF102 does by length
+ * alone.
+ */
+void NartisRf2MeterComponent::handle_fixed_reply_(uint8_t fixed_idx, const ParsedResponse &resp) {
+  switch (resp.shape) {
+    case PayloadShape::FIXED_F101:
+      std::memcpy(this->f101_raw_, resp.payload, sizeof(this->f101_raw_));
+      this->f101_ok_ = true;
+      this->log_f101_();
+      return;
+
+    case PayloadShape::FIXED_F102_3PH:
+    case PayloadShape::FIXED_F102_1PH:
+      // Length is the variant, so it is what gets stored.
+      std::memcpy(this->f102_raw_, resp.payload, resp.payload_len);
+      this->f102_len_ = resp.payload_len;
+      this->log_f102_();
+      return;
+
+    default:
+      // parse_response() only ever hands these two data identifiers one of the
+      // shapes above, so this is unreachable - but a silent wrong branch here
+      // would look like a meter that answers nothing.
+      ESP_LOGW(TAG, "DI 0x%04X answered with shape '%s', which is not a fixed block", FIXED_REQUESTS[fixed_idx].di,
+               payload_shape_to_string(resp.shape));
+      return;
+  }
+}
+
+void NartisRf2MeterComponent::log_f101_() const {
+  nartis_f101 b{};
+  std::memcpy(&b, this->f101_raw_, sizeof(b));
+
+  /* Two groups of nine: [total, T1..T8]. Eight tariffs, where the TAG list only
+   * reaches four - so if these decode, this block is the only way to see T5..T8.
+   *
+   * Printed RAW, with no multiplier. Every block in the F10x family carries the
+   * firmware's own object units, and those are not the list's: F102 hands out
+   * x0.1 W where the list TAGs are x1, and what F101's energy objects are scaled
+   * by is not known at all. Applying the list's x0.001 kWh here would be a guess
+   * dressed up as a reading, so the raw counts are what goes in the log until a
+   * capture can be compared against the meter's own display.
+   */
+  struct Group {
+    const char *name;
+    const uint32_t *v;
+  };
+  const Group groups[2] = {{"0x20", b.group20}, {"0x30", b.group30}};
+
+  for (const Group &g : groups) {
+    char line[128];
+    size_t at = 0;
+    for (uint8_t i = 1; i < 9 && at + 1 < sizeof(line); i++) {
+      const int n = std::snprintf(line + at, sizeof(line) - at, "%sT%u=%" PRIu32, (i != 1) ? " " : "", i, g.v[i]);
+      if (n <= 0) {
+        break;
+      }
+      at += static_cast<size_t>(n);
+    }
+    ESP_LOGD(TAG, "F101 energy group %s: total=%" PRIu32, g.name, g.v[0]);
+    ESP_LOGD(TAG, "  %s", line);
+
+    // The one arithmetic check the block offers on its own. It only holds if the
+    // meter uses every tariff register it reports, so a mismatch is a hint rather
+    // than a fault - said at DEBUG for that reason.
+    uint32_t sum = 0;
+    for (uint8_t i = 1; i < 9; i++) {
+      sum += g.v[i];
+    }
+    if (sum != g.v[0]) {
+      ESP_LOGD(TAG, "  total != T1..T8 sum (%" PRIu32 ") - expected unless all eight tariffs are in use", sum);
+    }
+  }
+
+  ESP_LOGD(TAG, "F101 values above are raw object counts - the scale is not the list's x0.001 kWh");
+  ESP_LOGD(TAG, "F101 status block (10 B): %s",
+           format_hex_pretty(reinterpret_cast<const uint8_t *>(&b.status), sizeof(b.status)).c_str());
+}
+
+void NartisRf2MeterComponent::log_f102_() const {
+  if (this->f102_len_ == sizeof(f102_1ph)) {
+    f102_1ph b{};
+    std::memcpy(&b, this->f102_raw_, sizeof(b));
+    ESP_LOGI(TAG, "F102 is the SINGLE-PHASE layout (%u B of DATA, lead 0x%02X)", this->f102_len_, b.lead);
+    // Deliberately raw. The firmware pre-scales this variant unevenly - U by 10,
+    // I and f by 100, P and Q not at all - so a multiplier printed here would be
+    // a guess, and the raw values are what a capture can be checked against.
+    ESP_LOGD(TAG, "  P=%" PRId32 " Q=%" PRId32 " U=%" PRIu32 " I=%" PRId32 " f=%" PRIu32, bcd32_signed(&b.p),
+             bcd32_signed(&b.q), bcd32_value(&b.u), bcd32_signed(&b.i), bcd32_value(&b.freq));
+    return;
+  }
+
+  if (this->f102_len_ != sizeof(f102_3ph)) {
+    // parse_response() rejects any other length, so this cannot be reached from
+    // the air - only by a future caller filling f102_raw_ some other way.
+    ESP_LOGW(TAG, "F102 length %u matches neither layout", this->f102_len_);
+    return;
+  }
+
+  f102_3ph b{};
+  std::memcpy(&b, this->f102_raw_, sizeof(b));
+  ESP_LOGI(TAG, "F102 is the THREE-PHASE layout (%u B of DATA, marker 0x%02X)", this->f102_len_, b.marker);
+  ESP_LOGD(TAG, "  P     total %.1f, L1 %.1f, L2 %.1f, L3 %.1f W", bcd32_signed(&b.p_total) * 0.1,
+           bcd32_signed(&b.p_l1) * 0.1, bcd32_signed(&b.p_l2) * 0.1, bcd32_signed(&b.p_l3) * 0.1);
+  ESP_LOGD(TAG, "  Q     total %.1f, L1 %.1f, L2 %.1f, L3 %.1f var", bcd32_signed(&b.q_total) * 0.1,
+           bcd32_signed(&b.q_l1) * 0.1, bcd32_signed(&b.q_l2) * 0.1, bcd32_signed(&b.q_l3) * 0.1);
+  ESP_LOGD(TAG, "  U     L1 %.2f, L2 %.2f, L3 %.2f V", bcd32_value(&b.u_l1) * 0.01, bcd32_value(&b.u_l2) * 0.01,
+           bcd32_value(&b.u_l3) * 0.01);
+  ESP_LOGD(TAG, "  I     L1 %.2f, L2 %.2f, L3 %.2f A", bcd32_value(&b.i_l1) * 0.01, bcd32_value(&b.i_l2) * 0.01,
+           bcd32_value(&b.i_l3) * 0.01);
+  ESP_LOGD(TAG, "  f     %.2f Hz", bcd32_value(&b.freq) * 0.01);
+
+  /* Internal arithmetic: the per-phase values must add up to the totals. This is
+   * how the field order in this struct was pinned from a single capture, so a
+   * failure means the order is wrong - which makes it worth checking every time.
+   *
+   * The two totals do not get the same tolerance, because they did not behave the
+   * same way in the reference capture. Q summed exactly. P was 40 counts light of
+   * 14650 - 0.27%, the phases having been sampled a moment apart - so an exact
+   * test on P would cry wolf on every live reply.
+   */
+  const int32_t p_total = bcd32_signed(&b.p_total);
+  const int32_t q_total = bcd32_signed(&b.q_total);
+  const int32_t p_sum = bcd32_signed(&b.p_l1) + bcd32_signed(&b.p_l2) + bcd32_signed(&b.p_l3);
+  const int32_t q_sum = bcd32_signed(&b.q_l1) + bcd32_signed(&b.q_l2) + bcd32_signed(&b.q_l3);
+  const int32_t p_err = (p_total > p_sum) ? (p_total - p_sum) : (p_sum - p_total);
+  const int32_t p_mag = (p_total < 0) ? -p_total : p_total;
+  // 2% plus a floor, so a near-zero load is not judged on its own noise.
+  if (p_err > 20 + p_mag / 50) {
+    ESP_LOGW(TAG, "  P total %" PRId32 " != phase sum %" PRId32 " - the F102 field order is suspect", p_total, p_sum);
+  }
+  if (q_total != q_sum) {
+    ESP_LOGW(TAG, "  Q total %" PRId32 " != phase sum %" PRId32 " - the F102 field order is suspect", q_total, q_sum);
+  }
+}
+
+void NartisRf2MeterComponent::cross_check_fixed_() const {
+  // --- DI 0xF101's status block against a list's -----------------------------
+  //
+  // The list halves carry 11 bytes and F101 carries 10. If the extra byte is the
+  // leading 0x01 marker, the rest must match byte for byte, both being the same
+  // device state read moments apart. That is a claim worth testing rather than
+  // assuming, so it is tested here.
+  if (this->f101_ok_ && this->status_ok_) {
+    nartis_f101 b{};
+    std::memcpy(&b, this->f101_raw_, sizeof(b));
+    const uint8_t *f101_status = reinterpret_cast<const uint8_t *>(&b.status);
+    const bool same = std::memcmp(f101_status, this->status_block_ + 1, sizeof(b.status)) == 0;
+    ESP_LOGD(TAG, "F101 status vs the list block after its 0x%02X marker: %s", this->status_block_[0],
+             same ? "identical" : "DIFFERENT");
+    if (!same) {
+      ESP_LOGD(TAG, "  list  %s", format_hex_pretty(this->status_block_, STATUS_BLOCK_SIZE).c_str());
+      ESP_LOGD(TAG, "  F101  %s", format_hex_pretty(f101_status, sizeof(b.status)).c_str());
+    }
+  }
+
+  // --- DI 0xF102 against the list records ------------------------------------
+  //
+  // Every value in the three-phase block also has a TAG, so where a list carried
+  // that TAG the same quantity arrived twice by different paths. The two raw
+  // numbers then give the list's multiplier directly:
+  //
+  //     list_raw * list_scale = fixed_raw * fixed_scale
+  //
+  // which is the only measurement that settles the open x10 question on current
+  // and power - see tags.md. Printed as the implied list scale so it can be read
+  // straight off against TAG_TABLE.
+  //
+  // Note what this rests on: `fixed_scale` below is F102's own scale, which is
+  // NOT the list's for any of these quantities and is itself read out of the
+  // firmware rather than measured. So the numbers here are only as good as that,
+  // and the log says so - what makes them worth having anyway is that the ratio
+  // is a clean power of ten if both sources are understood, and something else
+  // entirely if either is not.
+  if (this->f102_len_ != sizeof(f102_3ph) || this->merged_count_ == 0) {
+    return;
+  }
+  f102_3ph b{};
+  std::memcpy(&b, this->f102_raw_, sizeof(b));
+
+  // Struct order, with the TAG that names the same quantity and this block's own
+  // scale. This is also the mapping a virtual-TAG fallback would need.
+  struct Pair {
+    uint8_t tag;
+    const bcd32_le *field;
+    double fixed_scale;
+    const char *unit;
+  };
+  const Pair pairs[] = {
+      {0x20, &b.p_total, 0.1, "W"},   {0x21, &b.p_l1, 0.1, "W"},    {0x22, &b.p_l2, 0.1, "W"},
+      {0x23, &b.p_l3, 0.1, "W"},      {0x24, &b.q_total, 0.1, "var"}, {0x25, &b.q_l1, 0.1, "var"},
+      {0x26, &b.q_l2, 0.1, "var"},    {0x27, &b.q_l3, 0.1, "var"},  {0x15, &b.u_l1, 0.01, "V"},
+      {0x16, &b.u_l2, 0.01, "V"},     {0x17, &b.u_l3, 0.01, "V"},   {0x1D, &b.i_l1, 0.01, "A"},
+      {0x1E, &b.i_l2, 0.01, "A"},     {0x1F, &b.i_l3, 0.01, "A"},   {0x28, &b.freq, 0.01, "Hz"},
+  };
+
+  bool any = false;
+  for (const Pair &p : pairs) {
+    const ParsedItem *item = this->find_merged_(p.tag);
+    if (item == nullptr) {
+      continue;
+    }
+    uint32_t list_raw = 0;
+    if (!item_as_bcd(*item, &list_raw) || list_raw == 0) {
+      continue;  // not BCD, or zero - either way no ratio to take
+    }
+    const uint32_t fixed_raw = bcd32_value(p.field);
+    if (!any) {
+      ESP_LOGD(TAG, "F102 vs the list records, per TAG. The scale shown is what the list's");
+      ESP_LOGD(TAG, "multiplier would have to be for the two to agree, taking F102 as x0.1 W /");
+      ESP_LOGD(TAG, "x0.1 var / x0.01 V / x0.01 A / x0.01 Hz - which are F102's own, not the list's:");
+      any = true;
+    }
+    ESP_LOGD(TAG, "  TAG 0x%02X: list %" PRIu32 ", F102 %" PRIu32 " -> list scale x%.4g %s", p.tag, list_raw,
+             fixed_raw, p.fixed_scale * static_cast<double>(fixed_raw) / static_cast<double>(list_raw), p.unit);
+  }
+}
+
 void NartisRf2MeterComponent::merge_records_(const ParsedResponse &resp) {
   for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
     const ParsedItem &item = resp.items[i];
@@ -145,6 +369,30 @@ const ParsedItem *NartisRf2MeterComponent::find_merged_(uint8_t tag) const {
     }
   }
   return nullptr;
+}
+
+void NartisRf2MeterComponent::report_silent_fixed_() {
+  // Same reasoning as report_silent_requests_(): a meter with no fixed-block
+  // handler answers nothing, which for a cycle or two is indistinguishable from a
+  // bad link. DI 0xF101 in particular has never been seen answering, so this is
+  // the line that will say whether it exists on a given meter.
+  if (this->warned_fixed_silent_ || this->cycles_ < REQUEST_SILENT_WARN_CYCLES) {
+    return;
+  }
+  const uint8_t silent = static_cast<uint8_t>(this->fixed_polled_ & ~this->fixed_seen_);
+  if (silent == 0) {
+    return;
+  }
+  this->warned_fixed_silent_ = true;
+  for (uint8_t i = 0; i < FIXED_REQUEST_COUNT; i++) {
+    if ((silent & (1u << i)) == 0) {
+      continue;
+    }
+    ESP_LOGW(TAG,
+             "Fixed block DI 0x%04X has not answered once in %" PRIu32 " cycle(s) - most likely this meter "
+             "does not implement it. It still costs one exchange per cycle",
+             FIXED_REQUESTS[i].di, this->cycles_);
+  }
 }
 
 void NartisRf2MeterComponent::report_silent_requests_() {
@@ -182,6 +430,9 @@ void NartisRf2MeterComponent::dump_config() {
                 this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
   ESP_LOGCONFIG(TAG, "  RX timeout: %" PRIu32 " ms, retries: %u, request gap: %" PRIu32 " ms", this->rf_rx_timeout_ms_,
                 this->rf_retries_, this->request_gap_ms_);
+  ESP_LOGCONFIG(TAG, "  Sources: list A %s, list B %s, fixed blocks %s",
+                YESNO(this->read_list_[static_cast<uint8_t>(ListId::A)]),
+                YESNO(this->read_list_[static_cast<uint8_t>(ListId::B)]), YESNO(this->read_fixed_));
   ESP_LOGCONFIG(TAG, "  Polling: list records %s, status blocks %s", YESNO(this->need_data_),
                 YESNO(this->need_data_ || this->need_status_));
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
@@ -196,6 +447,9 @@ void NartisRf2MeterComponent::dump_config() {
   // against a capture without having to catch a VERBOSE log line.
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> frame{};
   for (const ListRequest &req : LIST_REQUESTS) {
+    if (!this->read_list_[static_cast<uint8_t>(req.list)]) {
+      continue;  // not a source this cycle asks for, so not a frame we will send
+    }
     const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, req.di);
     const char *half = (req.part == ListPart::STATUS) ? "status " : "records";
     if (n == 0) {
@@ -203,6 +457,17 @@ void NartisRf2MeterComponent::dump_config() {
     } else {
       ESP_LOGCONFIG(TAG, "  List %s %s DI 0x%04X: %s", list_id_to_string(req.list), half, req.di,
                     format_hex_pretty(frame.data(), n).c_str());
+    }
+  }
+
+  if (this->read_fixed_) {
+    for (const FixedRequest &req : FIXED_REQUESTS) {
+      const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, req.di);
+      if (n == 0) {
+        ESP_LOGCONFIG(TAG, "  Fixed block DI 0x%04X: FAILED TO BUILD", req.di);
+      } else {
+        ESP_LOGCONFIG(TAG, "  Fixed block DI 0x%04X: %s", req.di, format_hex_pretty(frame.data(), n).c_str());
+      }
     }
   }
 
@@ -297,17 +562,25 @@ void NartisRf2MeterComponent::start_cycle_() {
   }
   this->attempt_ = 0;
 
+  this->f101_ok_ = false;
+  this->f102_len_ = 0;
+
   // Build this cycle's exchange list by walking LIST_REQUESTS in order. That
   // order is load-bearing - a status half has to follow its own records half back
   // to back, or the cursor holding the leftover records is already gone - so the
   // table is walked as it stands and nothing is inserted between a pair.
   //
-  // Capability-gated: a records half is only worth the airtime when something
-  // reads a TAG, but a status half is needed either way, since it carries both the
+  // Two gates, and both have to pass. The source gate is the YAML's: a list
+  // nobody selected is not asked for at all. The capability gate is what the
+  // entities need: a records half is only worth the airtime when something reads
+  // a TAG, but a status half is needed either way, since it carries both the
   // status block and the records that did not fit.
   this->step_count_ = 0;
   this->step_idx_ = 0;
   for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
+    if (!this->read_list_[static_cast<uint8_t>(LIST_REQUESTS[i].list)]) {
+      continue;
+    }
     const bool wanted = (LIST_REQUESTS[i].part == ListPart::RECORDS)
                             ? this->need_data_
                             : (this->need_data_ || this->need_status_);
@@ -315,6 +588,20 @@ void NartisRf2MeterComponent::start_cycle_() {
       this->steps_[this->step_count_++] = Step{StepKind::LIST, i};
     }
   }
+
+  // The fixed blocks go last. They hold no cursor of their own, so nothing about
+  // their position matters to them - but a request of any kind drops the lists'
+  // cursor, so they must not land between a records half and its status half.
+  //
+  // Not capability-gated: a fixed block carries no TAGs, so no entity can select
+  // from it yet. Asking for it is the point - the log is the product.
+  if (this->read_fixed_) {
+    for (uint8_t i = 0; i < FIXED_REQUEST_COUNT; i++) {
+      this->steps_[this->step_count_++] = Step{StepKind::FIXED, i};
+      this->fixed_polled_ |= static_cast<uint8_t>(1u << i);
+    }
+  }
+
   for (uint8_t i = 0; i < this->probe_count_; i++) {
     this->steps_[this->step_count_++] = Step{StepKind::PROBE, i};
   }
@@ -328,6 +615,9 @@ uint16_t NartisRf2MeterComponent::current_di_() const {
   const Step &step = this->steps_[this->step_idx_];
   if (step.kind == StepKind::PROBE) {
     return this->probes_[step.idx].di;
+  }
+  if (step.kind == StepKind::FIXED) {
+    return FIXED_REQUESTS[step.idx].di;
   }
   return LIST_REQUESTS[step.idx].di;
 }
@@ -466,6 +756,9 @@ void NartisRf2MeterComponent::handle_wait_() {
         // Nothing consumes a probe; the log is the whole point.
         ESP_LOGI(TAG, "PROBE DI 0x%04X ANSWERED: %u item(s)", di, resp.count);
         this->log_response_(resp);
+      } else if (step.kind == StepKind::FIXED) {
+        this->fixed_seen_ |= static_cast<uint8_t>(1u << step.idx);
+        this->handle_fixed_reply_(step.idx, resp);
       } else {
         ESP_LOGV(TAG, "DI 0x%04X: %u record(s), rssi %d dBm", di, resp.count, this->last_rssi_dbm_);
         this->log_response_(resp);
@@ -584,6 +877,8 @@ void NartisRf2MeterComponent::handle_publish_() {
     }
   }
 
+  this->cross_check_fixed_();
+
   // A list that announced more records than arrived is the interesting case: the
   // records half sent what fitted and the status half should have brought the
   // rest, so a shortfall means some are unaccounted for.
@@ -595,6 +890,7 @@ void NartisRf2MeterComponent::handle_publish_() {
   }
 
   this->report_silent_requests_();
+  this->report_silent_fixed_();
 
   // Which of the four answered, built from LIST_REQUESTS so the line cannot fall
   // out of step with what was actually asked.
@@ -622,13 +918,26 @@ void NartisRf2MeterComponent::handle_publish_() {
   // Deliberately lenient about which list answered: a meter configured with only
   // one of the two is fully read from that one, so requiring both would peg this
   // entity to false forever. A status half is not required for data either.
+  //
+  // With no list source selected at all there is nothing to require: entities do
+  // go stale, but reporting failure every cycle for a configuration the user
+  // chose says nothing they can act on. The fixed blocks are left out for the
+  // same reason from the other side - they publish nothing, so their arrival
+  // cannot make an entity fresh, and DI 0xF101 not existing on a meter is not a
+  // cycle failure.
   bool any_records = false;
+  bool any_list = false;
   for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
+    if (!this->read_list_[static_cast<uint8_t>(LIST_REQUESTS[i].list)]) {
+      continue;
+    }
+    any_list = true;
     if (LIST_REQUESTS[i].part == ListPart::RECORDS && (this->answered_ & (1u << i)) != 0) {
       any_records = true;
     }
   }
-  this->publish_cycle_outcome_((!this->need_data_ || any_records) && (!this->need_status_ || this->status_ok_));
+  this->publish_cycle_outcome_(!any_list ||
+                               ((!this->need_data_ || any_records) && (!this->need_status_ || this->status_ok_)));
 }
 
 void NartisRf2MeterComponent::publish_cycle_outcome_(bool ok) {
