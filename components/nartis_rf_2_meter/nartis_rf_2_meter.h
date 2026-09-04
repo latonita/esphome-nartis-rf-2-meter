@@ -214,9 +214,6 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
 
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);
-  /// Warn once per TAG when publishing a value whose width has not actually
-  /// been seen on this link, naming where the width came from.
-  void warn_unconfirmed_tag_once_(uint8_t tag, TagConfidence conf);
 
   Cmt2300aHal hal_;
 
@@ -361,10 +358,6 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint8_t fixed_polled_{0};
   uint8_t fixed_seen_{0};
   bool warned_fixed_silent_{false};
-  /// Bit per TAG (0x00..0x3F) already warned about; keeps the unconfirmed-width
-  /// warning to one line per TAG per boot.
-  /// Two words because the TAG space runs to 0x4F, which does not fit one.
-  uint64_t warned_tags_[2]{};
 
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> tx_buf_{};
   size_t tx_len_{0};

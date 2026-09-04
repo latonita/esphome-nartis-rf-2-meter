@@ -1074,20 +1074,6 @@ void NartisRf2MeterComponent::note_tag_width_(uint8_t tag, StatusField field, ui
   this->tag_width_[tag] = width;
 }
 
-void NartisRf2MeterComponent::warn_unconfirmed_tag_once_(uint8_t tag, TagConfidence conf) {
-  if (tag >= TAG_WIDTH_TABLE_SIZE) {
-    return;
-  }
-  const uint64_t bit = 1ULL << (tag % 64);
-  uint64_t &word = this->warned_tags_[tag / 64];
-  if ((word & bit) != 0) {
-    return;
-  }
-  word |= bit;
-  ESP_LOGW(TAG, "TAG 0x%02X: value width not yet seen on this link (%s) - check the value looks sane", tag,
-           tag_confidence_to_string(conf));
-}
-
 void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
   if (this->merged_count_ == 0) {
     return;  // nothing arrived this cycle; leave the entity at its previous state
@@ -1105,10 +1091,6 @@ void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
   if (!tag_info(e.tag, &info, this->tag_width_)) {
     return;  // cannot happen: the parser would have aborted on an unknown TAG
   }
-  if (info.conf != TagConfidence::OBSERVED) {
-    this->warn_unconfirmed_tag_once_(e.tag, info.conf);
-  }
-
   if (e.sensor != nullptr) {
     switch (info.enc) {
       case TagEnc::UINT_LE:

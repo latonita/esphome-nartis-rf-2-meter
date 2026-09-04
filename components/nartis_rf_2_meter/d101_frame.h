@@ -270,18 +270,6 @@ enum class TagEnc : uint8_t {
 /// counts - far past anything a meter reports in these registers.
 static constexpr uint8_t BCD_SIGN_BIT = 0x80;
 
-/// Where a TAG's width and encoding came from. Only OBSERVED has been seen on
-/// this radio link; the others can still be wrong.
-enum class TagConfidence : uint8_t {
-  /// Decoded from captured D101-2 traffic.
-  OBSERVED,
-  /// From the vendor's TAG table, but no frame carrying it has been captured.
-  DOCUMENTED,
-  /// The sources disagree about what this TAG holds. The width is agreed, so the
-  /// record can still be walked past - it is the meaning that is unsettled.
-  CONFLICTING,
-};
-
 /// One past the highest TAG the vendor table describes (0x4F), and so the size of
 /// every per-TAG array here.
 static constexpr size_t TAG_WIDTH_TABLE_SIZE = 0x50;
@@ -289,15 +277,11 @@ static constexpr size_t TAG_WIDTH_TABLE_SIZE = 0x50;
 struct TagInfo {
   uint8_t width;
   TagEnc enc;
-  TagConfidence conf;
   /// Multiplier from raw units to `unit`, for the log line only - published
   /// values stay raw so the YAML decides the scaling with a `multiply` filter.
   float scale;
   const char *unit;
 };
-
-/// Human-readable provenance, for the log.
-const char *tag_confidence_to_string(TagConfidence c);
 
 /// Look up an item TAG's width, encoding and scale. Returns false when the TAG is
 /// unknown - the caller must then abort the parse, because without a width there

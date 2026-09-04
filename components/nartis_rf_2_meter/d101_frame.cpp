@@ -14,19 +14,6 @@ const ParsedItem *ParsedResponse::find(uint8_t tag) const {
   return nullptr;
 }
 
-const char *tag_confidence_to_string(TagConfidence c) {
-  switch (c) {
-    case TagConfidence::OBSERVED:
-      return "observed on this link";
-    case TagConfidence::DOCUMENTED:
-      return "from the vendor TAG table, not yet seen on this link";
-    case TagConfidence::CONFLICTING:
-      return "the sources disagree about what this TAG holds";
-    default:
-      return "unknown";
-  }
-}
-
 namespace {
 
 /* The TAG table.
@@ -40,23 +27,19 @@ namespace {
  * YAML decides the unit with a `multiply` filter, which is why a scale being
  * uncertain is not a correctness problem here.
  *
- * Two rows are worth reading twice before trusting:
- *
- *   - 0x20..0x27, the power group. The vendor table's multiplier puts these in
- *     units of 10 W / 10 var. On one meter a cross-check against the raw objects
- *     (P ~ U*I*PF, and P against the energy rate) fitted 1 W instead, so builds
- *     or CT variants differ by a factor of ten. Check the per-phase P against
- *     P_total on your own meter before believing the absolute value.
- *   - 0x2C..0x2F, where the firmware calls the group one thing and the manual
- *     another. The width is agreed, so the records still walk; the meaning does
- *     not, hence CONFLICTING.
+ * One row is worth reading twice before trusting: 0x20..0x27, the power group.
+ * The vendor table's multiplier puts these in units of 10 W / 10 var. On one
+ * meter a cross-check against the raw objects (P ~ U*I*PF, and P against the
+ * energy rate) fitted 1 W instead, so builds or CT variants differ by a factor of
+ * ten. Check the per-phase P against P_total on your own meter before believing
+ * the absolute value - or read the same quantity from DI 0xF102, whose scales are
+ * independent, and take the ratio.
  */
 struct TagRange {
   uint8_t first;
   uint8_t last;
   uint8_t width;
   TagEnc enc;
-  TagConfidence conf;
   float scale;
   const char *unit;
 };
@@ -65,30 +48,30 @@ constexpr TagRange TAG_TABLE[] = {
     // Energy accumulators. Binary little-endian - the one family that is not BCD.
     // 0x00..0x07 are active import/export; the rest of the range is reactive and
     // other cumulative registers, so the log unit covers both.
-    {0x00, 0x09, 4, TagEnc::UINT_LE, TagConfidence::OBSERVED, 0.001f, "kWh"},
-    {0x0A, 0x13, 4, TagEnc::UINT_LE, TagConfidence::DOCUMENTED, 0.001f, "kvarh"},
+    {0x00, 0x09, 4, TagEnc::UINT_LE, 0.001f, "kWh"},
+    {0x0A, 0x13, 4, TagEnc::UINT_LE, 0.001f, "kvarh"},
 
     // Voltages: 0x14 single-phase, 0x15..0x17 per phase, 0x18..0x1A line-to-line.
-    {0x14, 0x14, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
-    {0x15, 0x17, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.1f, "V"},
-    {0x18, 0x1A, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.1f, "V"},
+    {0x14, 0x14, 4, TagEnc::BCD_LE, 0.1f, "V"},
+    {0x15, 0x17, 4, TagEnc::BCD_LE, 0.1f, "V"},
+    {0x18, 0x1A, 4, TagEnc::BCD_LE, 0.1f, "V"},
 
     // Currents: 0x1B single-phase, 0x1C neutral, 0x1D..0x1F per phase.
-    {0x1B, 0x1F, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "A"},
+    {0x1B, 0x1F, 4, TagEnc::BCD_LE, 0.001f, "A"},
 
     // Power, total then per phase. Reactive is the only signed BCD on the wire.
-    {0x20, 0x23, 4, TagEnc::BCD_LE_SIGNED, TagConfidence::OBSERVED, 1.0f, "W"},
-    {0x24, 0x27, 4, TagEnc::BCD_LE_SIGNED, TagConfidence::OBSERVED, 1.0f, "var"},
+    {0x20, 0x23, 4, TagEnc::BCD_LE_SIGNED, 1.0f, "W"},
+    {0x24, 0x27, 4, TagEnc::BCD_LE_SIGNED, 1.0f, "var"},
 
-    {0x28, 0x28, 4, TagEnc::BCD_LE, TagConfidence::OBSERVED, 0.01f, "Hz"},
-    {0x29, 0x29, 7, TagEnc::BCD_CLOCK, TagConfidence::OBSERVED, 1.0f, ""},
+    {0x28, 0x28, 4, TagEnc::BCD_LE, 0.01f, "Hz"},
+    {0x29, 0x29, 7, TagEnc::BCD_CLOCK, 1.0f, ""},
     // Temperature is binary two's-complement and 2 bytes wide, not the 4-byte BCD
     // its neighbours use - the one row in this table that breaks the pattern.
-    {0x2A, 0x2A, 2, TagEnc::INT_LE, TagConfidence::OBSERVED, 0.1f, "\302\260C"},
+    {0x2A, 0x2A, 2, TagEnc::INT_LE, 0.1f, "\302\260C"},
 
     // 0x2B skipped, special use-case for D101-2 LCD test
-    {0x2C, 0x35, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "kWh"}, // active energy import (sum + by 4 tariffs), then export, end of last period
-    {0x36, 0x3F, 4, TagEnc::BCD_LE, TagConfidence::DOCUMENTED, 0.001f, "kvarh"}, // reactive energy import  (sum + by 4 tariffs), then export end of last period
+    {0x2C, 0x35, 4, TagEnc::BCD_LE, 0.001f, "kWh"}, // active energy import (sum + by 4 tariffs), then export, end of last period
+    {0x36, 0x3F, 4, TagEnc::BCD_LE, 0.001f, "kvarh"}, // reactive energy import  (sum + by 4 tariffs), then export end of last period
     // 0x48..0x4F are identity and configuration objects whose widths vary per
     // object, so there is no single width to walk them by. A YAML `bytes:` is the
     // only way to read one.
@@ -102,7 +85,7 @@ bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
   }
   for (const TagRange &r : TAG_TABLE) {
     if (tag >= r.first && tag <= r.last) {
-      *out = TagInfo{r.width, r.enc, r.conf, r.scale, r.unit};
+      *out = TagInfo{r.width, r.enc, r.scale, r.unit};
       return true;
     }
   }
@@ -110,7 +93,7 @@ bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
   // meter's indication set has that the vendor table does not. A width declared
   // in YAML fills the gap - consulted last, so it can never shadow a row above.
   if (tag_width_overrides != nullptr && tag < TAG_WIDTH_TABLE_SIZE && tag_width_overrides[tag] != 0) {
-    *out = TagInfo{tag_width_overrides[tag], TagEnc::USER, TagConfidence::DOCUMENTED, 1.0f, ""};
+    *out = TagInfo{tag_width_overrides[tag], TagEnc::USER, 1.0f, ""};
     return true;
   }
   return false;
