@@ -129,8 +129,9 @@ struct ListRequest {
 };
 
 /// All four list requests, in the order they go on air. List B leads because it
-/// is the superset, so where the lists overlap its records are the ones that land
-/// in the merged set first; each list's two halves stay together.
+/// is the superset; each list's two halves stay together, which is the one
+/// ordering rule that matters - a status half needs its own records half
+/// immediately before it.
 ///
 /// Being in this table means the request CAN be sent, not that it is: which
 /// sources a cycle actually polls is a YAML setting. The table stays whole so the
@@ -277,8 +278,11 @@ static constexpr size_t TAG_WIDTH_TABLE_SIZE = 0x50;
 struct TagInfo {
   uint8_t width;
   TagEnc enc;
-  /// Multiplier from raw units to `unit`, for the log line only - published
-  /// values stay raw so the YAML decides the scaling with a `multiply` filter.
+  /// Multiplier from the raw counts on the wire to `unit`. Load-bearing: it is
+  /// what an entity's published value is scaled by, so a wrong entry here is a
+  /// wrong reading rather than a wrong log line. It is also what lets one entity
+  /// be fed from either source - see FixedValue, whose scales land a value from a
+  /// fixed block in this same unit.
   float scale;
   const char *unit;
 };
@@ -293,6 +297,56 @@ struct TagInfo {
 /// YAML-declared widths, consulted only for TAGs with no built-in entry, so a
 /// stray entry cannot shadow a known width.
 bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides = nullptr);
+
+/* Mapping a fixed block onto TAGs.
+ *
+ * A fixed block has no TAG for a `tag:` entity to select by. What makes it
+ * addressable anyway is that most of what DI 0xF102 holds is the same meter
+ * object the TAG list also publishes - so each field can be named by the TAG that
+ * names that object, and the two sources then fill one value between them.
+ *
+ * Two things each entry has to carry, and both are the whole point:
+ *
+ *   - the TAG, decided by which meter OBJECT the field is, not by the vendor's
+ *     label for it. The two disagree for the current group; see F102_3PH_MAP.
+ *   - this block's own scale. Every F10x block is in its own units and none of
+ *     them is the list's, so `raw * scale` is what puts a value from either
+ *     source into the one unit tag_info() names for that TAG. Without this the
+ *     sources would silently differ by powers of ten.
+ *
+ * Both blocks are mapped. DI 0xF101 is the reactive-energy half of the picture -
+ * the lists carry active energy and no reactive, this block the other way round -
+ * so between them an entity can have either. See F101_MAP for how its scale was
+ * pinned, which took two captures rather than one.
+ */
+struct FixedValue {
+  uint8_t tag;
+  /// Byte offset of the 4-byte field within the DATA block, DI echo included.
+  uint8_t offset;
+  /// How to read those four bytes. BCD_LE / BCD_LE_SIGNED for DI 0xF102,
+  /// UINT_LE for DI 0xF101's binary accumulators.
+  TagEnc enc;
+  /// Raw counts -> the unit tag_info() gives this TAG.
+  float scale;
+};
+
+static constexpr uint8_t F102_3PH_VALUE_COUNT = 15;
+static constexpr uint8_t F102_1PH_VALUE_COUNT = 2;
+static constexpr uint8_t F101_VALUE_COUNT = 10;
+extern const FixedValue F102_3PH_MAP[F102_3PH_VALUE_COUNT];
+extern const FixedValue F102_1PH_MAP[F102_1PH_VALUE_COUNT];
+extern const FixedValue F101_MAP[F101_VALUE_COUNT];
+
+/// The mapping for whichever DI 0xF102 layout `payload_len` identifies, in struct
+/// order. Returns the entry count and sets `*out`; 0 and nullptr for a length
+/// that is neither layout.
+uint8_t f102_value_map(uint8_t payload_len, const FixedValue **out);
+
+/// Read one mapped value out of a stored fixed-block DATA field, scaled into the
+/// unit its TAG names. False when a BCD field is not valid BCD, or when the entry
+/// reaches past `payload_len` - which would mean the map and the layout it
+/// describes have drifted apart.
+bool fixed_value(const uint8_t *payload, uint8_t payload_len, const FixedValue &v, float *out);
 
 struct ParsedItem {
   uint8_t tag{0};
@@ -444,5 +498,13 @@ bool item_as_bcd_signed(const ParsedItem &item, int32_t *out);
 /// Format a BCD_CLOCK item as "YYYY-MM-DD HH:MM:SS". Returns false if the item
 /// is not a 7-byte clock or the buffer is too small (needs 20 bytes).
 bool item_clock_to_string(const ParsedItem &item, char *out, size_t cap);
+
+/// Decode a list record into the unit its TAG names, applying TagInfo::scale.
+/// This is the list's half of the two paths a value can arrive by; fixed_value()
+/// is the other, and both end in the same unit.
+///
+/// False when the encoding is not a scalar - BCD_CLOCK - or when the bytes are
+/// not valid for it. Either way there is nothing to publish.
+bool item_as_scaled(const ParsedItem &item, const TagInfo &info, float *out);
 
 }  // namespace esphome::nartis_rf_2_meter

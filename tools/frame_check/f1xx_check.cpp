@@ -5,12 +5,16 @@
 // identification - it is what tells the three-phase F102 from the single-phase
 // one - and that is what most of this file exercises.
 //
-// The F102 three-phase case is a real capture from meter 023240271060. F101 has
-// never been seen on air, so its case is assembled from the layout in
-// nartis_dlt645_f1xx.h; that is enough to pin the parser's length arithmetic,
-// which is all the parser does with it.
+// The F102 three-phase case is a real capture from meter 023240271060. F101 is
+// assembled from the layout in nartis_dlt645_f1xx.h - its own capture came later
+// and only confirmed the length arithmetic, which is all the parser does with it.
+//
+// The last section covers the other half of a fixed block being useful: the map
+// from its positional fields onto TAGs, and the scales that put a value from here
+// and the same value from a list record into one unit.
 #include "d101_frame.h"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
@@ -205,8 +209,7 @@ int main() {
       data[base + 2] = (uint8_t) ((total >> 16) & 0xFF);
       data[base + 3] = (uint8_t) ((total >> 24) & 0xFF);
     }
-    // The status block, taken from the captured list one with its leading 0x01
-    // marker removed - which is the alignment the component tests at runtime.
+    // The status block, arbitrary bytes - all this case pins is where it sits.
     static const uint8_t STATUS10[10] = {0x00, 0x22, 0x84, 0x00, 0x08, 0x01, 0x1F, 0x00, 0x03, 0x01};
     std::memcpy(data + 2 + 72, STATUS10, sizeof(STATUS10));
 
@@ -232,9 +235,52 @@ int main() {
     check(blk.group30[1] == 2001 && blk.group30[8] == 2008, "group 0x30 tariffs land in order");
     check(blk.group20[0] == sum20 && blk.group30[0] == sum30, "each group's total is its eight tariffs");
     check(std::memcmp(&blk.status, STATUS10, sizeof(STATUS10)) == 0, "the 10-byte status block is the trailing bytes");
-    // The claim the component checks against a live list block: 11 = 1 + 10.
+    // A live capture showed the list's 11 bytes to be these 10 plus a trailing
+    // 0x01, so the sizes have to differ by exactly one.
     check(STATUS_BLOCK_SIZE == sizeof(blk.status) + 1,
-          "the list's status block is exactly one byte longer than F101's - its 0x01 marker");
+          "the list's status block is exactly one byte longer than F101's");
+
+    /* The map onto TAGs. Ten of the eighteen accumulators: the TAG list stops at
+     * T4, so T5..T8 have nowhere to go.
+     *
+     * The offsets are checked against the struct rather than restated, and the
+     * order matters as much as the values - group 0x20 is reactive import and
+     * lands on 0x0A..0x0E, group 0x30 export on 0x0F..0x13.
+     */
+    check(F101_VALUE_COUNT == 10, "ten of the eighteen accumulators are mapped");
+    bool map_ok = true;
+    for (uint8_t i = 0; i < F101_VALUE_COUNT; i++) {
+      const FixedValue &fv = F101_MAP[i];
+      const bool import_half = i < 5;
+      const size_t want_off = (import_half ? offsetof(nartis_f101, group20) : offsetof(nartis_f101, group30)) +
+                              4u * (import_half ? i : (i - 5));
+      const uint8_t want_tag = (uint8_t) (0x0A + i);
+      TagInfo info{};
+      if (fv.offset != want_off || fv.tag != want_tag || fv.enc != TagEnc::UINT_LE || fv.scale != 0.001f ||
+          !tag_info(want_tag, &info) || info.width != 4 || std::strcmp(info.unit, "kvarh") != 0) {
+        std::printf("      entry %u: TAG 0x%02X off %u\n", i, fv.tag, fv.offset);
+        map_ok = false;
+      }
+    }
+    check(map_ok, "all ten land on TAGs 0x0A-0x13 at their struct offsets, x0.001 kvarh");
+
+    // Read through the map, binary rather than BCD - the encoding that separates
+    // this block from DI 0xF102. Group 0x20 T1 was filled with 1001 counts.
+    float value = 0.0f;
+    check(fixed_value(r2.payload, r2.payload_len, F101_MAP[1], &value) && value > 1.0005f && value < 1.0015f,
+          "1001 raw counts read as binary LE and scale to 1.001 kvarh");
+    check(fixed_value(r2.payload, r2.payload_len, F101_MAP[6], &value) && value > 2.0005f && value < 2.0015f,
+          "and group 0x30 T1's 2001 counts to 2.001 kvarh");
+    // 0xEE would be a bad nibble in BCD; here it is just a large number, which is
+    // the point of the encoding field.
+    uint8_t bad[sizeof(nartis_f101)];
+    std::memcpy(bad, r2.payload, sizeof(bad));
+    // 1001 = 0x03E9, so replacing the low byte gives 0x03EE = 1006.
+    bad[F101_MAP[1].offset] = 0xEE;
+    check(fixed_value(bad, sizeof(bad), F101_MAP[1], &value) && value > 1.0055f && value < 1.0065f,
+          "a byte that is not BCD is still a valid binary count");
+    check(!fixed_value(r2.payload, (uint8_t) (F101_MAP[9].offset + 3), F101_MAP[9], &value),
+          "an entry reaching past the block is still refused");
   }
 
   std::printf("\n== length is the identification ==\n");
@@ -295,24 +341,205 @@ int main() {
     check(build_request(buf, sizeof(buf), serial, 0xF1FF) == 0, "an unknown DI still refuses to build");
   }
 
-  std::printf("\n== the F102 fields all have a TAG that names the same quantity ==\n");
+  std::printf("\n== the map from F102 fields onto TAGs ==\n");
   {
-    // The mapping a virtual-TAG fallback would use. Every one has to exist in
-    // TAG_TABLE with a 4-byte width, or there would be nothing to publish it as.
-    const uint8_t tags[15] = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
-                              0x15, 0x1D, 0x16, 0x1E, 0x17, 0x1F, 0x28};
-    bool ok = true;
-    for (uint8_t t : tags) {
-      TagInfo info{};
-      if (!tag_info(t, &info) || info.width != 4) {
-        std::printf("      TAG 0x%02X has no 4-byte entry\n", t);
-        ok = false;
+    const FixedValue *m = nullptr;
+    check(f102_value_map(sizeof(f102_3ph), &m) == F102_3PH_VALUE_COUNT && m == F102_3PH_MAP,
+          "63 bytes of DATA selects the three-phase map");
+    check(f102_value_map(sizeof(f102_1ph), &m) == F102_1PH_VALUE_COUNT && m == F102_1PH_MAP,
+          "23 bytes selects the single-phase map");
+    // Same length-is-everything rule as the parser: a length that is neither
+    // layout has to map to nothing rather than to the nearest layout.
+    bool refused = true;
+    for (uint8_t len : {(uint8_t) 0, (uint8_t) 22, (uint8_t) 24, (uint8_t) 62, (uint8_t) 64}) {
+      const FixedValue *any = F102_3PH_MAP;
+      if (f102_value_map(len, &any) != 0 || any != nullptr) {
+        std::printf("      length %u mapped to something\n", len);
+        refused = false;
       }
     }
-    check(ok, "all 15 map onto a 4-byte TAG");
+    check(refused, "and every other length maps to nothing, nullptr included");
+
+    // Each entry must name a TAG the decoder knows at the width the field is, or
+    // there would be nothing to publish the value as.
+    bool shape = true;
+    for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
+      TagInfo info{};
+      if (!tag_info(F102_3PH_MAP[i].tag, &info) || info.width != sizeof(bcd32_le)) {
+        std::printf("      TAG 0x%02X has no 4-byte entry\n", F102_3PH_MAP[i].tag);
+        shape = false;
+      }
+    }
+    for (uint8_t i = 0; i < F102_1PH_VALUE_COUNT; i++) {
+      TagInfo info{};
+      if (!tag_info(F102_1PH_MAP[i].tag, &info) || info.width != sizeof(bcd32_le)) {
+        std::printf("      1ph TAG 0x%02X has no 4-byte entry\n", F102_1PH_MAP[i].tag);
+        shape = false;
+      }
+    }
+    check(shape, "every mapped TAG exists in TAG_TABLE as a 4-byte value");
+
+    // A TAG twice in one map would mean two fields racing for one entity, with
+    // the winner decided by table order - so it is worth ruling out rather than
+    // reading off by eye.
+    bool unique = true;
+    for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
+      for (uint8_t j = (uint8_t) (i + 1); j < F102_3PH_VALUE_COUNT; j++) {
+        if (F102_3PH_MAP[i].tag == F102_3PH_MAP[j].tag) {
+          std::printf("      TAG 0x%02X appears twice\n", F102_3PH_MAP[i].tag);
+          unique = false;
+        }
+        if (F102_3PH_MAP[i].offset == F102_3PH_MAP[j].offset) {
+          std::printf("      offset %u appears twice\n", F102_3PH_MAP[i].offset);
+          unique = false;
+        }
+      }
+    }
+    check(unique, "no TAG and no offset is mapped twice");
+
+    /* The offsets are the map's grip on the layout, so they are checked against
+     * the struct itself rather than restated. Every field of the three-phase
+     * block is mapped, in struct order.
+     */
+    const size_t want[F102_3PH_VALUE_COUNT] = {
+        offsetof(f102_3ph, p_total), offsetof(f102_3ph, p_l1), offsetof(f102_3ph, p_l2),
+        offsetof(f102_3ph, p_l3),    offsetof(f102_3ph, q_total), offsetof(f102_3ph, q_l1),
+        offsetof(f102_3ph, q_l2),    offsetof(f102_3ph, q_l3), offsetof(f102_3ph, u_l1),
+        offsetof(f102_3ph, u_l2),    offsetof(f102_3ph, u_l3), offsetof(f102_3ph, i_l1),
+        offsetof(f102_3ph, i_l2),    offsetof(f102_3ph, i_l3), offsetof(f102_3ph, freq),
+    };
+    bool offs = true;
+    for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
+      if (F102_3PH_MAP[i].offset != want[i]) {
+        std::printf("      entry %u: offset %u, struct says %u\n", i, F102_3PH_MAP[i].offset, (unsigned) want[i]);
+        offs = false;
+      }
+    }
+    check(offs, "all 15 offsets are the struct's own, so every field is mapped");
+
+    // The current group is mapped by object, not by the vendor's label - which is
+    // why 0x1C is in and 0x1F is out. Stated as a check because it is a decision
+    // rather than a transcription, and a future edit should have to face it.
+    bool cur = true;
+    for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
+      if (F102_3PH_MAP[i].tag == 0x1F) {
+        cur = false;
+      }
+    }
+    check(cur && F102_3PH_MAP[11].tag == 0x1C && F102_3PH_MAP[12].tag == 0x1D && F102_3PH_MAP[13].tag == 0x1E,
+          "the currents map to TAGs 0x1C/0x1D/0x1E and nothing maps to 0x1F");
+
+    // Encodings: every DI 0xF102 field is BCD, and only the power group is signed.
+    // A voltage or a frequency with the top bit set is a bad reading, not a
+    // negative volt, so treating that bit as a sign there would turn a fault into
+    // a plausible number.
+    bool encs = true;
+    for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
+      const bool signed_group = F102_3PH_MAP[i].tag >= 0x20 && F102_3PH_MAP[i].tag <= 0x27;
+      const TagEnc want = signed_group ? TagEnc::BCD_LE_SIGNED : TagEnc::BCD_LE;
+      if (F102_3PH_MAP[i].enc != want) {
+        std::printf("      TAG 0x%02X: wrong encoding\n", F102_3PH_MAP[i].tag);
+        encs = false;
+      }
+    }
+    check(encs, "every F102 field is BCD, and only the power group is signed");
   }
 
-  std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF101/0xF102 FIXED BLOCKS DECODE CORRECTLY" : "FAILURES",
+  std::printf("\n== the capture, read through the map ==\n");
+  {
+    /* The point of the scales: these are the numbers an entity is handed, in the
+     * unit tag_info() names for the TAG - not the raw counts. So this is the same
+     * capture as the first section, read the way the component reads it.
+     */
+    struct Want {
+      uint8_t tag;
+      float value;
+      const char *unit;
+    };
+    const Want wants[F102_3PH_VALUE_COUNT] = {
+        {0x20, 1465.0f, "W"},   {0x21, 336.0f, "W"},    {0x22, 244.0f, "W"},
+        {0x23, 881.0f, "W"},    {0x24, -118.0f, "var"}, {0x25, -131.0f, "var"},
+        {0x26, -9.0f, "var"},   {0x27, 22.0f, "var"},   {0x15, 234.81f, "V"},
+        {0x16, 236.43f, "V"},   {0x17, 234.46f, "V"},   {0x1C, 1.59f, "A"},
+        {0x1D, 1.28f, "A"},     {0x1E, 3.87f, "A"},     {0x28, 49.98f, "Hz"},
+    };
+    bool all_ok = true;
+    for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
+      float got = 0.0f;
+      TagInfo info{};
+      const bool ok = fixed_value(r.payload, r.payload_len, F102_3PH_MAP[i], &got) &&
+                      tag_info(F102_3PH_MAP[i].tag, &info);
+      // A hundredth is the finest raw step any of these has, so anything closer
+      // would be testing float arithmetic rather than the map.
+      const float err = (got > wants[i].value) ? (got - wants[i].value) : (wants[i].value - got);
+      if (!ok || F102_3PH_MAP[i].tag != wants[i].tag || err > 0.005f ||
+          std::strcmp(info.unit, wants[i].unit) != 0) {
+        std::printf("      TAG 0x%02X: got %.3f %s, want %.3f %s\n", F102_3PH_MAP[i].tag, got,
+                    ok ? info.unit : "?", wants[i].value, wants[i].unit);
+        all_ok = false;
+      }
+    }
+    check(all_ok, "all 15 scale into the unit their TAG names");
+
+    // The two sources have to meet in that unit, which is the whole reason the
+    // scales are on the entries. TAG 0x15 arrived in both: 2348 raw counts in the
+    // list at x0.1 V against 23481 here at x0.01 V.
+    ParsedItem list_u{};
+    list_u.tag = 0x15;
+    list_u.len = 4;
+    list_u.raw[0] = 0x48;  // BCD, least-significant pair first: 2348
+    list_u.raw[1] = 0x23;
+    TagInfo u_info{};
+    float from_list = 0.0f;
+    float from_fixed = 0.0f;
+    check(tag_info(0x15, &u_info) && item_as_scaled(list_u, u_info, &from_list) &&
+              fixed_value(r.payload, r.payload_len, F102_3PH_MAP[8], &from_fixed),
+          "TAG 0x15 decodes from a list record and from the fixed block");
+    const float gap = (from_list > from_fixed) ? (from_list - from_fixed) : (from_fixed - from_list);
+    std::printf("      list %.2f V, F102 %.2f V\n", from_list, from_fixed);
+    check(gap < 0.5f, "and the two land within half a volt of each other - one unit, two paths");
+
+    // Refusals. A field the meter left unset reads back as a plausible number if
+    // the nibbles are not checked, and an entry that reaches past the block would
+    // read whatever follows it in memory.
+    uint8_t bad[sizeof(f102_3ph)];
+    std::memcpy(bad, r.payload, sizeof(bad));
+    bad[F102_3PH_MAP[8].offset] = 0xEE;
+    float sink = 0.0f;
+    check(!fixed_value(bad, sizeof(bad), F102_3PH_MAP[8], &sink), "a non-BCD nibble is refused, not read");
+    FixedValue past = F102_3PH_MAP[14];
+    past.offset = (uint8_t) (sizeof(f102_3ph) - 3);
+    check(!fixed_value(r.payload, r.payload_len, past, &sink), "an entry reaching past the block is refused");
+    check(!fixed_value(r.payload, sizeof(f102_1ph), F102_3PH_MAP[14], &sink),
+          "and so is the three-phase map read against a single-phase length");
+  }
+
+  std::printf("\n== item_as_scaled ==\n");
+  {
+    // The list's half of the same job. The clock is the one TAG with no scalar
+    // reading, and it has to say so rather than return a number, because a
+    // seven-byte date read as an integer would publish happily.
+    ParsedItem clock{};
+    clock.tag = 0x29;
+    clock.len = 7;
+    TagInfo info{};
+    float sink = 0.0f;
+    check(tag_info(0x29, &info) && !item_as_scaled(clock, info, &sink), "a clock has no scaled reading");
+
+    // Signed BCD keeps its sign through the scale - the export direction on the
+    // power group depends on it.
+    ParsedItem q{};
+    q.tag = 0x24;
+    q.len = 4;
+    q.raw[0] = 0x80;  // -118.0 var: 1180 counts with the sign bit set
+    q.raw[1] = 0x11;
+    q.raw[3] = 0x80;
+    float value = 0.0f;
+    check(tag_info(0x24, &info) && item_as_scaled(q, info, &value) && value < -1179.0f && value > -1181.0f,
+          "a negative reactive power stays negative through the scale");
+  }
+
+  std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF101/0xF102 FIXED BLOCKS DECODE AND MAP CORRECTLY" : "FAILURES",
               fail);
   return fail == 0 ? 0 : 1;
 }

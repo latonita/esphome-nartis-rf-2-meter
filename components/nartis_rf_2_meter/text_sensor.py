@@ -3,6 +3,10 @@
 Same selection as the numeric platform, plus the two text-only values: item TAG
 0x29 (the meter clock, formatted "YYYY-MM-DD HH:MM:SS") and `status: raw`, a hex
 dump of the whole status block.
+
+A numeric TAG on this platform prints the same scaled number the numeric platform
+would publish, to three decimals. A TAG too wide for a scalar prints its bytes as
+hex instead, there being no number to give.
 """
 
 import esphome.codegen as cg

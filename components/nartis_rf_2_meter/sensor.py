@@ -1,7 +1,13 @@
 """Nartis RF-2 meter - numeric sensor platform.
 
-Each entity selects either an energy register from DI 0xF200 by its item `tag`,
-or a numeric field of the DI 0xF201 `status` block. Exactly one of the two.
+Each entity selects either a value by its item `tag` - from whichever configured
+source carried it - or a numeric field of the `status` block. Exactly one of the
+two.
+
+The published state is already scaled to the unit `tags.md` gives for that TAG, so
+set `unit_of_measurement` to match and do not add a `multiply` filter. A `tag`
+read with a `bytes:` override is the exception: its unit is unknown, so it is
+published raw and a filter is the only way to scale it.
 """
 
 import esphome.codegen as cg

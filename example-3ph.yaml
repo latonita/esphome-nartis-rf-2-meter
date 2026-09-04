@@ -1,0 +1,317 @@
+esphome:
+  name: nartis-rf-2-reader
+  friendly_name: Nartis RF-2 Meter Reader
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: VERBOSE
+  tx_buffer_size: 2048
+  logs:
+    sensor: DEBUG
+    binary_sensor: INFO
+    wifi: INFO
+    ledc: INFO
+    mdns: INFO
+    template: INFO
+    api.service: INFO
+    api: INFO
+    i2c: INFO
+    i2c.idf: INFO
+    adc.common: INFO
+
+debug:
+
+# Fill in your own secrets to enable these.
+#api:
+#  encryption:
+#    key: !secret api_encryption_key
+#ota:
+#  - platform: esphome
+#    password: !secret ota_password
+#wifi:
+#  ssid: !secret wifi_ssid
+#  password: !secret wifi_password
+
+external_components:
+ - source: github://latonita/esphome-nartis-rf-2-meter
+   components: [nartis_rf_2_meter]
+   refresh: 1s
+
+# CMT2300A RF transceiver wiring (ESP32 GPIOs - adjust to your board).
+nartis_rf_2_meter:
+  id: nartis
+  address: "023240123456"
+
+  pin_sdio: GPIO23
+  pin_sclk: GPIO18
+  pin_csb: GPIO27
+  pin_fcsb: GPIO26
+  pin_gpio3: GPIO14
+
+  update_interval: 120s
+  rf_rx_timeout: 1700ms
+
+  # list_b carries the active energy, voltage, current, P total, frequency and
+  # clock; fixed adds what no list on this meter sends - reactive energy from
+  # DI 0xF101, per-phase active and all reactive power from DI 0xF102.
+  sources: [fixed, list_b]
+
+# Values arrive already scaled to the unit below - no `multiply` filter.
+sensor:
+  # --- Active energy, import (A+) -- list_b ---------------------------------
+  - platform: nartis_rf_2_meter
+    name: "Active energy total"          # Активная энергия, импорт, всего
+    tag: 0x00
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy T1"             # Тариф 1 (день)
+    tag: 0x01
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy T2"             # Тариф 2 (ночь)
+    tag: 0x02
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  # --- Active energy, export (A-) -- list_b ---------------------------------
+  - platform: nartis_rf_2_meter
+    name: "Active energy export total"   # Активная энергия, экспорт, всего
+    tag: 0x05
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy export T1"
+    tag: 0x06
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy export T2"
+    tag: 0x07
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  # --- Reactive energy -- all from DI 0xF101, which no list carries ---------
+  # T3/T4 are TAGs 0x0D/0x0E and 0x12/0x13; add them if more than two are in use.
+  - platform: nartis_rf_2_meter
+    name: "Reactive energy import total"   # Реактивная энергия, импорт, всего
+    tag: 0x0A
+    unit_of_measurement: kvarh
+    accuracy_decimals: 3
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive energy import T1"
+    tag: 0x0B
+    unit_of_measurement: kvarh
+    accuracy_decimals: 3
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive energy import T2"
+    tag: 0x0C
+    unit_of_measurement: kvarh
+    accuracy_decimals: 3
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive energy export total"   # Реактивная энергия, экспорт, всего
+    tag: 0x0F
+    unit_of_measurement: kvarh
+    accuracy_decimals: 3
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive energy export T1"
+    tag: 0x10
+    unit_of_measurement: kvarh
+    accuracy_decimals: 3
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive energy export T2"
+    tag: 0x11
+    unit_of_measurement: kvarh
+    accuracy_decimals: 3
+    state_class: total_increasing
+
+  # --- Phase voltages -- list_b (0.1 V steps) -------------------------------
+  - platform: nartis_rf_2_meter
+    name: "Voltage L1"                   # Напряжение фазы A
+    tag: 0x15
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Voltage L2"                   # Напряжение фазы B
+    tag: 0x16
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Voltage L3"                   # Напряжение фазы C
+    tag: 0x17
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  # --- Phase currents -- list_b (1 mA steps) --------------------------------
+  # The vendor TAG list labels these one TAG higher and calls 0x1C the neutral
+  # current; the object ids and the DI 0xF102 cross-check both say otherwise.
+  - platform: nartis_rf_2_meter
+    name: "Current L1"                   # Ток фазы A
+    tag: 0x1C
+    unit_of_measurement: A
+    accuracy_decimals: 3
+    device_class: current
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Current L2"                   # Ток фазы B
+    tag: 0x1D
+    unit_of_measurement: A
+    accuracy_decimals: 3
+    device_class: current
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Current L3"                   # Ток фазы C
+    tag: 0x1E
+    unit_of_measurement: A
+    accuracy_decimals: 3
+    device_class: current
+    state_class: measurement
+
+  # --- Active power -- 0x20 from list_b, the phases from DI 0xF102 ----------
+  - platform: nartis_rf_2_meter
+    name: "Active power"                 # Активная мощность, сумма по фазам
+    tag: 0x20
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Active power L1"
+    tag: 0x21
+    unit_of_measurement: W
+    accuracy_decimals: 1
+    device_class: power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Active power L2"
+    tag: 0x22
+    unit_of_measurement: W
+    accuracy_decimals: 1
+    device_class: power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Active power L3"
+    tag: 0x23
+    unit_of_measurement: W
+    accuracy_decimals: 1
+    device_class: power
+    state_class: measurement
+
+  # --- Reactive power -- all four from DI 0xF102, signed --------------------
+  - platform: nartis_rf_2_meter
+    name: "Reactive power"               # Реактивная мощность, сумма по фазам
+    tag: 0x24
+    unit_of_measurement: var
+    accuracy_decimals: 1
+    device_class: reactive_power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive power L1"
+    tag: 0x25
+    unit_of_measurement: var
+    accuracy_decimals: 1
+    device_class: reactive_power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive power L2"
+    tag: 0x26
+    unit_of_measurement: var
+    accuracy_decimals: 1
+    device_class: reactive_power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Reactive power L3"
+    tag: 0x27
+    unit_of_measurement: var
+    accuracy_decimals: 1
+    device_class: reactive_power
+    state_class: measurement
+
+  # --- Frequency -- list_b --------------------------------------------------
+  - platform: nartis_rf_2_meter
+    name: "Frequency"                    # Частота сети
+    tag: 0x28
+    unit_of_measurement: Hz
+    accuracy_decimals: 2
+    device_class: frequency
+    state_class: measurement
+
+  # --- Status block ---------------------------------------------------------
+  - platform: nartis_rf_2_meter
+    name: "Active tariff"                # Текущий тариф
+    status: active_tariff
+    icon: mdi:counter
+    entity_category: diagnostic
+
+  - platform: nartis_rf_2_meter
+    name: "Tariff count"                 # Число тарифов
+    status: tariff_count
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: nartis_rf_2_meter
+    name: "Meter clock"                  # Часы счётчика
+    tag: 0x29
+    icon: mdi:clock-outline
+    entity_category: diagnostic
+
+  # Hex dump of the whole 11-byte status block - useful for reporting the bytes
+  # that are still unexplained.
+  # - platform: nartis_rf_2_meter
+  #   name: "Status raw"
+  #   status: raw
+  #   entity_category: diagnostic
+
+binary_sensor:
+  # False when the last cycle did not get everything it asked for. Worth having:
+  # the numeric entities hold their previous state on a failed cycle, so a stale
+  # reading is otherwise indistinguishable from a fresh one.
+  - platform: nartis_rf_2_meter
+    name: "Last read OK"

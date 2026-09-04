@@ -113,12 +113,11 @@ void NartisRf2MeterComponent::warn_unexpected_half_once_(uint8_t request_idx, co
 
 /* The fixed blocks.
  *
- * Read-and-report for now: there is no TAG in either block for a `tag:` entity to
- * select by, so nothing is published from them. What they are good for today is
- * checking the list decode - the same quantities arrive here on an independent
- * path, with the meter's own raw precision and its own scales - and telling a
- * three-phase meter from a single-phase one, which DI 0xF102 does by length
- * alone.
+ * Neither carries a TAG - a value is identified by where it sits - so each is
+ * stored whole here and turned into TAGs later, by the maps in d101_frame.cpp.
+ * Between them they hold what the lists do not: DI 0xF101 the reactive energy
+ * registers, DI 0xF102 the per-phase power. The reply length is also what tells a
+ * three-phase meter from a single-phase one.
  */
 void NartisRf2MeterComponent::handle_fixed_reply_(uint8_t fixed_idx, const ParsedResponse &resp) {
   switch (resp.shape) {
@@ -150,49 +149,48 @@ void NartisRf2MeterComponent::log_f101_() const {
   nartis_f101 b{};
   std::memcpy(&b, this->f101_raw_, sizeof(b));
 
-  /* Two groups of nine: [total, T1..T8]. Eight tariffs, where the TAG list only
-   * reaches four - so if these decode, this block is the only way to see T5..T8.
+  /* Two groups of nine: [total, T1..T8], reactive energy import and export - see
+   * F101_MAP for how that was established.
    *
-   * Printed RAW, with no multiplier. Every block in the F10x family carries the
-   * firmware's own object units, and those are not the list's: F102 hands out
-   * x0.1 W where the list TAGs are x1, and what F101's energy objects are scaled
-   * by is not known at all. Applying the list's x0.001 kWh here would be a guess
-   * dressed up as a reading, so the raw counts are what goes in the log until a
-   * capture can be compared against the meter's own display.
+   * Same shape as the F102 report: one line per quantity, aligned label, values
+   * scaled, unit at the end. All nine of each group are printed even though only
+   * total and T1..T4 have a TAG, because this line is the only place T5..T8
+   * appear at all.
    */
   struct Group {
     const char *name;
     const uint32_t *v;
   };
-  const Group groups[2] = {{"0x20", b.group20}, {"0x30", b.group30}};
+  const Group groups[2] = {{"R+", b.group20}, {"R-", b.group30}};
 
+  ESP_LOGD(TAG, "F101 reactive energy (%u B of DATA)", static_cast<unsigned>(sizeof(b)));
   for (const Group &g : groups) {
-    char line[128];
-    size_t at = 0;
-    for (uint8_t i = 1; i < 9 && at + 1 < sizeof(line); i++) {
-      const int n = std::snprintf(line + at, sizeof(line) - at, "%sT%u=%" PRIu32, (i != 1) ? " " : "", i, g.v[i]);
+    // Nine values at up to "T8 4294967.295, " each, so the buffer is sized for
+    // the worst case rather than the observed one.
+    char line[192];
+    int at = std::snprintf(line, sizeof(line), "total %.3f", g.v[0] * 0.001);
+    for (uint8_t i = 1; i < 9 && at > 0 && at < static_cast<int>(sizeof(line)); i++) {
+      const int n = std::snprintf(line + at, sizeof(line) - static_cast<size_t>(at), ", T%u %.3f", i, g.v[i] * 0.001);
       if (n <= 0) {
         break;
       }
-      at += static_cast<size_t>(n);
+      at += n;
     }
-    ESP_LOGD(TAG, "F101 energy group %s: total=%" PRIu32, g.name, g.v[0]);
-    ESP_LOGD(TAG, "  %s", line);
+    ESP_LOGD(TAG, "  %-5s %s kvarh", g.name, line);
 
-    // The one arithmetic check the block offers on its own. It only holds if the
-    // meter uses every tariff register it reports, so a mismatch is a hint rather
-    // than a fault - said at DEBUG for that reason.
+    // The one arithmetic check the block offers on its own, and unlike F102's it
+    // is exact: both numbers come out of the same reply, so nothing has moved
+    // between them. Only prints when it fails.
     uint32_t sum = 0;
     for (uint8_t i = 1; i < 9; i++) {
       sum += g.v[i];
     }
     if (sum != g.v[0]) {
-      ESP_LOGD(TAG, "  total != T1..T8 sum (%" PRIu32 ") - expected unless all eight tariffs are in use", sum);
+      ESP_LOGD(TAG, "  %-5s total != T1..T8 sum (%.3f kvarh) - decode is suspect", g.name, sum * 0.001);
     }
   }
 
-  ESP_LOGD(TAG, "F101 values above are raw object counts - the scale is not the list's x0.001 kWh");
-  ESP_LOGD(TAG, "F101 status block (10 B): %s",
+  ESP_LOGD(TAG, "  stat  %s",
            format_hex_pretty(reinterpret_cast<const uint8_t *>(&b.status), sizeof(b.status)).c_str());
 }
 
@@ -229,128 +227,40 @@ void NartisRf2MeterComponent::log_f102_() const {
            bcd32_value(&b.i_l3) * 0.01);
   ESP_LOGD(TAG, "  f     %.2f Hz", bcd32_value(&b.freq) * 0.01);
 
-  /* Internal arithmetic: the per-phase values must add up to the totals. This is
-   * how the field order in this struct was pinned from a single capture, so a
-   * failure means the order is wrong - which makes it worth checking every time.
-   *
-   * The two totals do not get the same tolerance, because they did not behave the
-   * same way in the reference capture. Q summed exactly. P was 40 counts light of
-   * 14650 - 0.27%, the phases having been sampled a moment apart - so an exact
-   * test on P would cry wolf on every live reply.
-   */
-  const int32_t p_total = bcd32_signed(&b.p_total);
-  const int32_t q_total = bcd32_signed(&b.q_total);
-  const int32_t p_sum = bcd32_signed(&b.p_l1) + bcd32_signed(&b.p_l2) + bcd32_signed(&b.p_l3);
-  const int32_t q_sum = bcd32_signed(&b.q_l1) + bcd32_signed(&b.q_l2) + bcd32_signed(&b.q_l3);
-  const int32_t p_err = (p_total > p_sum) ? (p_total - p_sum) : (p_sum - p_total);
-  const int32_t p_mag = (p_total < 0) ? -p_total : p_total;
-  // 2% plus a floor, so a near-zero load is not judged on its own noise.
-  if (p_err > 20 + p_mag / 50) {
-    ESP_LOGW(TAG, "  P total %" PRId32 " != phase sum %" PRId32 " - the F102 field order is suspect", p_total, p_sum);
-  }
-  if (q_total != q_sum) {
-    ESP_LOGW(TAG, "  Q total %" PRId32 " != phase sum %" PRId32 " - the F102 field order is suspect", q_total, q_sum);
-  }
-}
-
-void NartisRf2MeterComponent::cross_check_fixed_() const {
-  // --- DI 0xF101's status block against a list's -----------------------------
-  //
-  // The list halves carry 11 bytes and F101 carries 10. If the extra byte is the
-  // leading 0x01 marker, the rest must match byte for byte, both being the same
-  // device state read moments apart. That is a claim worth testing rather than
-  // assuming, so it is tested here.
-  if (this->f101_ok_ && this->status_ok_) {
-    nartis_f101 b{};
-    std::memcpy(&b, this->f101_raw_, sizeof(b));
-    const uint8_t *f101_status = reinterpret_cast<const uint8_t *>(&b.status);
-    const bool same = std::memcmp(f101_status, this->status_block_ + 1, sizeof(b.status)) == 0;
-    ESP_LOGD(TAG, "F101 status vs the list block after its 0x%02X marker: %s", this->status_block_[0],
-             same ? "identical" : "DIFFERENT");
-    if (!same) {
-      ESP_LOGD(TAG, "  list  %s", format_hex_pretty(this->status_block_, STATUS_BLOCK_SIZE).c_str());
-      ESP_LOGD(TAG, "  F101  %s", format_hex_pretty(f101_status, sizeof(b.status)).c_str());
-    }
-  }
-
-  // --- DI 0xF102 against the list records ------------------------------------
-  //
-  // Every value in the three-phase block also has a TAG, so where a list carried
-  // that TAG the same quantity arrived twice by different paths. The two raw
-  // numbers then give the list's multiplier directly:
-  //
-  //     list_raw * list_scale = fixed_raw * fixed_scale
-  //
-  // which is the only measurement that settles the open x10 question on current
-  // and power - see tags.md. Printed as the implied list scale so it can be read
-  // straight off against TAG_TABLE.
-  //
-  // Note what this rests on: `fixed_scale` below is F102's own scale, which is
-  // NOT the list's for any of these quantities and is itself read out of the
-  // firmware rather than measured. So the numbers here are only as good as that,
-  // and the log says so - what makes them worth having anyway is that the ratio
-  // is a clean power of ten if both sources are understood, and something else
-  // entirely if either is not.
-  if (this->f102_len_ != sizeof(f102_3ph) || this->merged_count_ == 0) {
-    return;
-  }
-  f102_3ph b{};
-  std::memcpy(&b, this->f102_raw_, sizeof(b));
-
-  // Struct order, with the TAG that names the same quantity and this block's own
-  // scale. This is also the mapping a virtual-TAG fallback would need.
-  struct Pair {
-    uint8_t tag;
-    const bcd32_le *field;
-    double fixed_scale;
-    const char *unit;
-  };
-  const Pair pairs[] = {
-      {0x20, &b.p_total, 0.1, "W"},   {0x21, &b.p_l1, 0.1, "W"},    {0x22, &b.p_l2, 0.1, "W"},
-      {0x23, &b.p_l3, 0.1, "W"},      {0x24, &b.q_total, 0.1, "var"}, {0x25, &b.q_l1, 0.1, "var"},
-      {0x26, &b.q_l2, 0.1, "var"},    {0x27, &b.q_l3, 0.1, "var"},  {0x15, &b.u_l1, 0.01, "V"},
-      {0x16, &b.u_l2, 0.01, "V"},     {0x17, &b.u_l3, 0.01, "V"},   {0x1D, &b.i_l1, 0.01, "A"},
-      {0x1E, &b.i_l2, 0.01, "A"},     {0x1F, &b.i_l3, 0.01, "A"},   {0x28, &b.freq, 0.01, "Hz"},
-  };
-
-  bool any = false;
-  for (const Pair &p : pairs) {
-    const ParsedItem *item = this->find_merged_(p.tag);
-    if (item == nullptr) {
-      continue;
-    }
-    uint32_t list_raw = 0;
-    if (!item_as_bcd(*item, &list_raw) || list_raw == 0) {
-      continue;  // not BCD, or zero - either way no ratio to take
-    }
-    const uint32_t fixed_raw = bcd32_value(p.field);
-    if (!any) {
-      ESP_LOGD(TAG, "F102 vs the list records, per TAG. The scale shown is what the list's");
-      ESP_LOGD(TAG, "multiplier would have to be for the two to agree, taking F102 as x0.1 W /");
-      ESP_LOGD(TAG, "x0.1 var / x0.01 V / x0.01 A / x0.01 Hz - which are F102's own, not the list's:");
-      any = true;
-    }
-    ESP_LOGD(TAG, "  TAG 0x%02X: list %" PRIu32 ", F102 %" PRIu32 " -> list scale x%.4g %s", p.tag, list_raw,
-             fixed_raw, p.fixed_scale * static_cast<double>(fixed_raw) / static_cast<double>(list_raw), p.unit);
-  }
+  // The per-phase values summing to the totals is what pinned this field order,
+  // but it is a one-off proof and not a per-reply test: the meter samples the
+  // phases and the total a moment apart, so a live sum is only ever approximate
+  // and any threshold tight enough to catch a swapped field also fires on an
+  // ordinary reply. The order is checked against the reference capture in
+  // f1xx_check instead, where the numbers hold still.
 }
 
 void NartisRf2MeterComponent::merge_records_(const ParsedResponse &resp) {
   for (uint8_t i = 0; i < resp.count && i < MAX_ITEMS; i++) {
     const ParsedItem &item = resp.items[i];
-    const ParsedItem *seen = this->find_merged_(item.tag);
-    if (seen != nullptr) {
-      // The lists overlap, and list B - the superset - is read first, so the
-      // records list A repeats are already held and the first copy stands. They
-      // have to agree, though: a disagreement means one of the two decodes is
-      // wrong, which is worth saying out loud.
-      if (seen->len != item.len || std::memcmp(seen->raw, item.raw, item.len) != 0) {
-        ESP_LOGW(TAG, "TAG 0x%02X differs between pages: kept %s, DI 0x%04X sent %s", item.tag,
-                 format_hex_pretty(seen->raw, seen->len).c_str(), resp.di,
-                 format_hex_pretty(item.raw, item.len).c_str());
+
+    /* The lists overlap, so a TAG can arrive twice in a cycle. The later copy
+     * wins, and it is not a close call: the pages are read seconds apart and
+     * these are live registers, so the two disagreeing is the meter having moved
+     * on rather than a decode going wrong. A capture of both lists had the energy
+     * counter one count higher on the second page and the clock five seconds
+     * later - exactly what should happen.
+     *
+     * So there is nothing to compare and nothing to warn about; the newest
+     * reading is simply the one to publish.
+     */
+    bool replaced = false;
+    for (uint8_t j = 0; j < this->merged_count_; j++) {
+      if (this->merged_[j].tag == item.tag) {
+        this->merged_[j] = item;
+        replaced = true;
+        break;
       }
+    }
+    if (replaced) {
       continue;
     }
+
     if (this->merged_count_ >= MAX_MERGED_ITEMS) {
       // Unreachable for 6-bit TAGs, since duplicates are folded above and there
       // are only 64 of them. Bounded anyway rather than trusted.
@@ -435,6 +345,10 @@ void NartisRf2MeterComponent::dump_config() {
                 YESNO(this->read_list_[static_cast<uint8_t>(ListId::B)]), YESNO(this->read_fixed_));
   ESP_LOGCONFIG(TAG, "  Polling: list records %s, status blocks %s", YESNO(this->need_data_),
                 YESNO(this->need_data_ || this->need_status_));
+  // Worth stating outright: it decides whether a `multiply` filter in the YAML is
+  // right or doubles the scaling, and the two sources are only interchangeable
+  // because of it.
+  ESP_LOGCONFIG(TAG, "  Values are published scaled to the unit in tags.md - no multiply filter needed");
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
   LOG_PIN("  SDIO pin: ", this->pin_sdio_);
   LOG_PIN("  SCLK pin: ", this->pin_sclk_);
@@ -853,6 +767,8 @@ void NartisRf2MeterComponent::finish_exchange_() {
 }
 
 void NartisRf2MeterComponent::handle_publish_() {
+  this->resolve_values_();
+
   for (const auto &e : this->entries_) {
     if (e.reads_status()) {
       this->publish_from_status_(e);
@@ -877,7 +793,6 @@ void NartisRf2MeterComponent::handle_publish_() {
     }
   }
 
-  this->cross_check_fixed_();
 
   // A list that announced more records than arrived is the interesting case: the
   // records half sent what fitted and the status half should have brought the
@@ -1074,124 +989,167 @@ void NartisRf2MeterComponent::note_tag_width_(uint8_t tag, StatusField field, ui
   this->tag_width_[tag] = width;
 }
 
-void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
-  if (this->merged_count_ == 0) {
-    return;  // nothing arrived this cycle; leave the entity at its previous state
+namespace {
+
+const char *value_source_to_string(ValueSource s) {
+  switch (s) {
+    case ValueSource::LIST:
+      return "list";
+    case ValueSource::FIXED:
+      return "F102";
+    default:
+      return "none";
+  }
+}
+
+}  // namespace
+
+void NartisRf2MeterComponent::resolve_values_() {
+  for (ValueSlot &slot : this->values_) {
+    slot = ValueSlot{};
   }
 
-  const ParsedItem *item = this->find_merged_(e.tag);
-  if (item == nullptr) {
-    // No longer a page-selection question - all three were asked for, so this TAG
-    // is simply not in the meter's indication set.
-    ESP_LOGD(TAG, "TAG 0x%02X is not in this meter's indication set", e.tag);
-    return;
+  /* The list goes in first, so it wins wherever both sources carry a TAG.
+   *
+   * Not because it is the better reading - a fixed block is the meter's own
+   * object at the meter's own precision - but because it is the pinned one: every
+   * TAG the list carries has had its scale checked against a capture, and it is
+   * the only source for the energy registers, the clock and the status block.
+   * Letting the fresher source win instead would make which scale a value went
+   * through depend on which requests happened to answer that cycle, and a value
+   * that is seconds stale is a much smaller problem than one whose units move.
+   */
+  for (uint8_t i = 0; i < this->merged_count_; i++) {
+    const ParsedItem &item = this->merged_[i];
+    if (item.tag >= this->values_.size()) {
+      continue;
+    }
+    TagInfo info{};
+    if (!tag_info(item.tag, &info, this->tag_width_)) {
+      continue;  // unreachable: the parser aborts the page on an unknown TAG
+    }
+    float value = 0.0f;
+    if (!item_as_scaled(item, info, &value)) {
+      // The clock is not a scalar and the text path reads it straight out of
+      // merged_, so it is expected here. Anything else failed its own encoding,
+      // which is worth one line - a bad nibble means the framing is off.
+      if (info.enc != TagEnc::BCD_CLOCK) {
+        ESP_LOGW(TAG, "TAG 0x%02X: %u byte(s) not valid for its encoding: %s", item.tag, item.len,
+                 format_hex_pretty(item.raw, item.len).c_str());
+      }
+      continue;
+    }
+    this->values_[item.tag] = ValueSlot{value, ValueSource::LIST};
+  }
+
+  /* Then the fixed blocks, filling only what no list carried.
+   *
+   * On a three-phase meter reading list B that is the per-phase power from
+   * DI 0xF102 - the list carries TAG 0x20 and none of 0x21..0x27, and the block
+   * has all eight - plus the reactive energy from DI 0xF101, which no list on that
+   * meter carries at all. With no list configured it is everything they map.
+   */
+  const FixedValue *f102_map = nullptr;
+  const uint8_t f102_count = f102_value_map(this->f102_len_, &f102_map);
+  this->fill_values_from_fixed_(this->f102_raw_, this->f102_len_, f102_map, f102_count, "F102");
+
+  if (this->f101_ok_) {
+    this->fill_values_from_fixed_(this->f101_raw_, sizeof(this->f101_raw_), F101_MAP, F101_VALUE_COUNT, "F101");
+  }
+}
+
+void NartisRf2MeterComponent::fill_values_from_fixed_(const uint8_t *payload, uint8_t payload_len,
+                                                      const FixedValue *map, uint8_t count, const char *what) {
+  for (uint8_t i = 0; i < count; i++) {
+    const FixedValue &fv = map[i];
+    if (fv.tag >= this->values_.size() || this->values_[fv.tag].src != ValueSource::NONE) {
+      continue;
+    }
+    float value = 0.0f;
+    if (!fixed_value(payload, payload_len, fv, &value)) {
+      ESP_LOGW(TAG, "%s: the field mapped to TAG 0x%02X did not decode", what, fv.tag);
+      continue;
+    }
+    this->values_[fv.tag] = ValueSlot{value, ValueSource::FIXED};
+  }
+}
+
+const ValueSlot *NartisRf2MeterComponent::find_value_(uint8_t tag) const {
+  if (tag >= this->values_.size() || this->values_[tag].src == ValueSource::NONE) {
+    return nullptr;
+  }
+  return &this->values_[tag];
+}
+
+void NartisRf2MeterComponent::publish_from_data_(const SensorEntry &e) {
+  if (this->merged_count_ == 0 && this->f102_len_ == 0) {
+    return;  // nothing arrived this cycle; leave the entity at its previous state
   }
 
   TagInfo info{};
   if (!tag_info(e.tag, &info, this->tag_width_)) {
     return;  // cannot happen: the parser would have aborted on an unknown TAG
   }
+
+  // Already scaled, and already decided between the sources - so nothing below
+  // needs to know which one answered, beyond saying so in the log.
+  const ValueSlot *slot = this->find_value_(e.tag);
   if (e.sensor != nullptr) {
-    switch (info.enc) {
-      case TagEnc::UINT_LE:
-      case TagEnc::USER: {
-        // Published raw. Scaling is left to a `multiply` filter so the YAML
-        // says what unit the entity is in.
-        const uint32_t value = item_as_u32(*item);
-        e.sensor->publish_state(static_cast<float>(value));
-        ESP_LOGD(TAG, "  -> '%s' = %" PRIu32, e.sensor->get_name().c_str(), value);
-        break;
-      }
-      case TagEnc::INT_LE: {
-        const int32_t value = item_as_i32(*item);
-        e.sensor->publish_state(static_cast<float>(value));
-        ESP_LOGD(TAG, "  -> '%s' = %" PRId32, e.sensor->get_name().c_str(), value);
-        break;
-      }
-      case TagEnc::BCD_LE: {
-        uint32_t value = 0;
-        if (!item_as_bcd(*item, &value)) {
-          ESP_LOGW(TAG, "TAG 0x%02X: value is not valid BCD: %s", e.tag,
-                   format_hex_pretty(item->raw, item->len).c_str());
-          break;
-        }
-        e.sensor->publish_state(static_cast<float>(value));
-        ESP_LOGD(TAG, "  -> '%s' = %" PRIu32, e.sensor->get_name().c_str(), value);
-        break;
-      }
-      case TagEnc::BCD_LE_SIGNED: {
-        int32_t value = 0;
-        if (!item_as_bcd_signed(*item, &value)) {
-          ESP_LOGW(TAG, "TAG 0x%02X: value is not valid signed BCD: %s", e.tag,
-                   format_hex_pretty(item->raw, item->len).c_str());
-          break;
-        }
-        e.sensor->publish_state(static_cast<float>(value));
-        ESP_LOGD(TAG, "  -> '%s' = %" PRId32, e.sensor->get_name().c_str(), value);
-        break;
-      }
-      default:
-        ESP_LOGW(TAG, "TAG 0x%02X is not a numeric value - use a text_sensor", e.tag);
-        break;
+    if (slot != nullptr) {
+      e.sensor->publish_state(slot->value);
+      ESP_LOGD(TAG, "  -> '%s' = %.3f %s (%s)", e.sensor->get_name().c_str(), slot->value, info.unit,
+               value_source_to_string(slot->src));
+    } else if (info.enc == TagEnc::BCD_CLOCK) {
+      ESP_LOGW(TAG, "TAG 0x%02X is a date and time, not a number - use a text_sensor", e.tag);
+    } else {
+      // Not a page-selection question: every configured source was asked. So
+      // either this TAG is not one the meter reports, or its record arrived
+      // undecodable - resolve_values_() will have said which.
+      ESP_LOGD(TAG, "TAG 0x%02X: no configured source carried it", e.tag);
     }
   }
 
-  if (e.text_sensor != nullptr) {
-    char buf[24];
-    switch (info.enc) {
-      case TagEnc::BCD_CLOCK:
-        if (item_clock_to_string(*item, buf, sizeof(buf))) {
-          e.text_sensor->publish_state(buf);
-          ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
-        } else {
-          ESP_LOGW(TAG, "TAG 0x%02X: clock is not valid BCD: %s", e.tag,
-                   format_hex_pretty(item->raw, item->len).c_str());
-        }
-        break;
-      case TagEnc::INT_LE:
-        std::snprintf(buf, sizeof(buf), "%" PRId32, item_as_i32(*item));
-        e.text_sensor->publish_state(buf);
-        ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
-        break;
-      case TagEnc::BCD_LE: {
-        uint32_t value = 0;
-        if (!item_as_bcd(*item, &value)) {
-          ESP_LOGW(TAG, "TAG 0x%02X: value is not valid BCD: %s", e.tag,
-                   format_hex_pretty(item->raw, item->len).c_str());
-          break;
-        }
-        std::snprintf(buf, sizeof(buf), "%" PRIu32, value);
-        e.text_sensor->publish_state(buf);
-        ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
-        break;
-      }
-      case TagEnc::BCD_LE_SIGNED: {
-        int32_t value = 0;
-        if (!item_as_bcd_signed(*item, &value)) {
-          ESP_LOGW(TAG, "TAG 0x%02X: value is not valid signed BCD: %s", e.tag,
-                   format_hex_pretty(item->raw, item->len).c_str());
-          break;
-        }
-        std::snprintf(buf, sizeof(buf), "%" PRId32, value);
-        e.text_sensor->publish_state(buf);
-        ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
-        break;
-      }
-      default:
-        if (item->len > 4) {
-          // Too wide for a scalar, so hand over the raw bytes rather than
-          // invent a number.
-          const std::string hex = format_hex_pretty(item->raw, item->len);
-          e.text_sensor->publish_state(hex);
-          ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), hex.c_str());
-        } else {
-          std::snprintf(buf, sizeof(buf), "%" PRIu32, item_as_u32(*item));
-          e.text_sensor->publish_state(buf);
-          ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
-        }
-        break;
-    }
+  if (e.text_sensor == nullptr) {
+    return;
   }
+
+  char buf[32];
+
+  // The clock is the one TAG with no scalar reading at all, so it is the one that
+  // still goes straight to the record it came from.
+  if (info.enc == TagEnc::BCD_CLOCK) {
+    const ParsedItem *item = this->find_merged_(e.tag);
+    if (item == nullptr) {
+      ESP_LOGD(TAG, "TAG 0x%02X: no configured source carried it", e.tag);
+    } else if (item_clock_to_string(*item, buf, sizeof(buf))) {
+      e.text_sensor->publish_state(buf);
+      ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), buf);
+    } else {
+      ESP_LOGW(TAG, "TAG 0x%02X: clock is not valid BCD: %s", e.tag,
+               format_hex_pretty(item->raw, item->len).c_str());
+    }
+    return;
+  }
+
+  if (slot != nullptr) {
+    // The same scaled number the numeric path publishes, so the two agree.
+    std::snprintf(buf, sizeof(buf), "%.3f", slot->value);
+    e.text_sensor->publish_state(buf);
+    ESP_LOGD(TAG, "  -> '%s' = %s %s (%s)", e.text_sensor->get_name().c_str(), buf, info.unit,
+             value_source_to_string(slot->src));
+    return;
+  }
+
+  // No scalar reading, but bytes did arrive: a value too wide for a scalar lands
+  // here, and handing over the bytes beats inventing a number.
+  const ParsedItem *item = this->find_merged_(e.tag);
+  if (item == nullptr) {
+    ESP_LOGD(TAG, "TAG 0x%02X: no configured source carried it", e.tag);
+    return;
+  }
+  const std::string hex = format_hex_pretty(item->raw, item->len);
+  e.text_sensor->publish_state(hex);
+  ESP_LOGD(TAG, "  -> '%s' = %s", e.text_sensor->get_name().c_str(), hex.c_str());
 }
 
 void NartisRf2MeterComponent::publish_from_status_(const SensorEntry &e) {

@@ -77,6 +77,23 @@ enum class StatusField : uint8_t {
   RAW,
 };
 
+/// Which source filled a value this cycle. NONE also means "nothing did".
+enum class ValueSource : uint8_t { NONE = 0, LIST, FIXED };
+
+/* One TAG's value for this cycle, already in the unit tag_info() names for that
+ * TAG - volts, amps, watts, kWh.
+ *
+ * This is the join between the sources. A TAG is the name of a quantity, not of a
+ * place in a frame, so the same TAG can be carried by a list record or by a field
+ * of a fixed block, in different raw units. Each source scales into this slot, and
+ * an entity reads the slot - so the YAML says which quantity it wants and nothing
+ * about where the meter keeps it.
+ */
+struct ValueSlot {
+  float value{0.0f};
+  ValueSource src{ValueSource::NONE};
+};
+
 struct SensorEntry {
   esphome::sensor::Sensor *sensor{nullptr};
   esphome::text_sensor::TextSensor *text_sensor{nullptr};
@@ -181,9 +198,9 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Leave the current exchange and move to the next step of the cycle, skipping
   /// any step this cycle has since decided it does not need.
   void finish_exchange_();
-  /// Fold a decoded TAG page into this cycle's merged record set. The first page
-  /// to carry a TAG wins; a later page repeating it is only cross-checked, since
-  /// DI 0xF202 is a superset of DI 0xF200 and the two must agree.
+  /// Fold a decoded TAG page into this cycle's merged record set. Where the lists
+  /// overlap the LAST page to carry a TAG wins, being the freshest reading of a
+  /// register that moves between the two.
   void merge_records_(const ParsedResponse &resp);
   /// Merged record for `tag`, or nullptr.
   const ParsedItem *find_merged_(uint8_t tag) const;
@@ -211,6 +228,17 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// log_unknown_tag_(): put everything needed to work the layout out in the log,
   /// rather than leave a bare "malformed" and an undecoded RX dump.
   void log_bad_records_(uint16_t di, ParseResult r, const ParsedResponse &resp) const;
+
+  /// Fold everything this cycle received into values_, scaled. One pass, run
+  /// before any entity is touched, so every entity in a cycle sees one consistent
+  /// set - and so the choice of source is made once, in one place.
+  void resolve_values_();
+  /// Fold one fixed block's mapped fields into values_, skipping any TAG a list
+  /// already filled. `what` names the block in a decode warning.
+  void fill_values_from_fixed_(const uint8_t *payload, uint8_t payload_len, const FixedValue *map, uint8_t count,
+                               const char *what);
+  /// This cycle's value for `tag`, or nullptr when no source carried it.
+  const ValueSlot *find_value_(uint8_t tag) const;
 
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);
@@ -292,7 +320,6 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Compare the fixed blocks against each other and against the list records.
   /// Every check here is arithmetic that must hold if the layouts are right, so a
   /// failure means a layout is wrong rather than the meter being odd.
-  void cross_check_fixed_() const;
 
   /// YAML-declared value widths, indexed by TAG; 0 = none. Consulted by the
   /// parser only after every built-in width has been ruled out.
@@ -305,6 +332,12 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   static constexpr size_t MAX_MERGED_ITEMS = TAG_WIDTH_TABLE_SIZE;
   std::array<ParsedItem, MAX_MERGED_ITEMS> merged_{};
   uint8_t merged_count_{0};
+
+  /// This cycle's values, indexed by TAG and already scaled. Built by
+  /// resolve_values_() from merged_ and from the fixed blocks; the only thing an
+  /// entity reads. Indexed rather than searched because the TAG space is small
+  /// enough to hold whole, which also makes "nobody filled this one" free to ask.
+  std::array<ValueSlot, TAG_WIDTH_TABLE_SIZE> values_{};
 
   /// The status block from this cycle, and whether one arrived. Both lists end
   /// with one; the first to arrive is kept and a second is compared against it.
