@@ -29,8 +29,8 @@ struct bcd32_le { uint8_t b[4]; };
 typedef uint32_t u32le;
 
 // -------- shared 10-byte status/identity block --------
-// Appended by F101 (tail) and F104 (head). Field meanings partly reverse-engineered;
-// see DTSD341_DLT645_F2xx.md §5f. On 3ph, temp_or_id = obj 0x5EC0 (internal °C);
+// Appended by F101 (tail) and F104 (head). Field meanings are assumptions.
+// On 3ph, temp_or_id = obj 0x5EC0 (internal °C);
 // on 1ph the corresponding object is 0x5EB8.
 struct dlt645_status10 {
     uint8_t  zero0;        // always 0x00
@@ -45,13 +45,13 @@ struct dlt645_status10 {
 // ============================================================
 //  F101 — energy accumulators + status   (DI = 0xF101)
 //  Layout is IDENTICAL on 1ph and 3ph (values differ; 1ph phases are single).
-//  Two energy group-objects, each expanded to 9 raw-LE u32 = [total, T1..T8].
+//  Two energy group-objects (R+/R-), each expanded to 9 raw-LE u32 = [total, T1..T8].
 //  Total DATA length L = 84 (payload 0x52 = 82, + 2-byte DI).
 // ============================================================
 struct nartis_f101 {
     uint8_t  di[2];             // DI echo: 01 F1  (LE = 0xF101)
-    u32le    group20[9];        // obj 0x20 energy group: [total, T1..T8], raw LE
-    u32le    group30[9];        // obj 0x30 energy group: [total, T1..T8], raw LE
+    u32le    group20[9];        // obj 0x20 R+ energy group: [total, T1..T8], raw LE
+    u32le    group30[9];        // obj 0x30 R- energy group: [total, T1..T8], raw LE
     dlt645_status10 status;     // shared 10-byte status block
 };
 typedef nartis_f101 f101_1ph;   // same layout on 1-phase...

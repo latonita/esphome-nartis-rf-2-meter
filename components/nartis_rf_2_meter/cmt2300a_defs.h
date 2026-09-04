@@ -1,11 +1,9 @@
 /*
- * CMT2300A Register Definitions - d101-2 / 443.9 MHz profile.
+ * CMT2300A register definitions - d101-2 profile.
  *
- * Register banks and radio config are the authoritative RFPDK export for
- * 443.9 MHz / GFSK / 1.2 kbps, +20 dBm: narrow (~4 kHz) TX deviation and a
- * separate wide (~28 kHz) RX profile centred on the meter's reply.
- *
- * Register addresses/names mirror the CMOSTEK datasheet and cmt2300a_defs.h.
+ * The banks are the RFPDK export for 443.9 MHz / GFSK / 1.2 kbps, +20 dBm: narrow
+ * (~4 kHz) TX deviation and a separate wide RX profile centred on the meter's
+ * reply. Register names mirror the CMOSTEK datasheet.
  */
 
 #pragma once
@@ -26,14 +24,7 @@ namespace esphome::nartis_rf_2_meter {
  *       k > CHANNEL_STEP_BREAK
  *
  * so the k=18 -> 19 step is 800 kHz and every other one is 700 kHz. That break is
- * on-air evidence rather than a reading of the display's register writes: serial
- * ...596 (k=20) answers on 449.600 and is silent on 449.500, and k=12 and k=13
- * pin the base below it. A capture of the display's own SPI traffic suggested a
- * uniform grid; where the meter actually transmits settles it.
- *
- * This lives with the radio definitions because it names a channel, not a frame -
- * and here it stays free of the HAL headers, so the host-side frame checks can
- * assert the grid without a radio.
+ * on-air evidence rather than a reading of the display's register writes.
  */
 static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
 static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
@@ -179,11 +170,9 @@ static constexpr float RX_CODE_HZ = 6.199f;
 /* ================================================================
  * Frequency-bank computation (CMOSTEK AN199).
  *
- * Every meter channel (435.5-451.7 MHz; see frequency_from_serial above) lies in
- * the 420-510 MHz PLL band, so the divider / VCO-bank selection AND all modem
- * banks (incl. AFC_OVF_TH) are constant across channels - only FREQ_RX_N/K and
- * FREQ_TX_N/K change. Verified byte-for-byte against RFPDK exports at
- * 435.5 / 439.7 / 443.9 / 447.4 / 451.7 MHz.
+ * Every meter channel (435.5-451.7 MHz) lies in the 420-510 MHz PLL band, so the
+ * divider / VCO-bank selection and every modem bank are constant across channels -
+ * only FREQ_RX_N/K and FREQ_TX_N/K change.
  *
  *   FREQ_LO_tx = f_rf ;   FREQ_LO_rx = f_rf + XTAL/92 (superhet IF)
  *   word = floor(FREQ_LO * DIVIDER / XTAL * 2^20) ;  N = word>>20 ;  K = word & 0xFFFFF
@@ -197,6 +186,25 @@ static constexpr uint8_t FREQ_VCO_BANK = 0x1;         // <2:0>, 420-510 MHz
 static constexpr uint8_t FREQ_DIVX_CODE = 0x1;        // <2:0>, 420-510 MHz
 static constexpr uint8_t FREQ_PALDO_SEL = 0x0;        // TX < 500 MHz
 static constexpr uint8_t FREQ_FSK_SWT = 0x0;          // RFPDK-fixed bit (0x1F bit7), freq-independent
+
+/// Fill the 8-byte frequency bank for `rf_hz`: TX LO = f_rf, RX LO = f_rf + IF.
+inline void freq_bank_from_hz(uint32_t rf_hz, uint8_t out[FREQUENCY_BANK_SIZE]) {
+  const auto word = [](uint32_t lo_hz) -> uint32_t {
+    return static_cast<uint32_t>(((static_cast<uint64_t>(lo_hz) * FREQ_DIVIDER) << 20) / XTAL_HZ);
+  };
+  const uint32_t w_rx = word(rf_hz + FREQ_IF_HZ);
+  const uint32_t w_tx = word(rf_hz);
+  const uint32_t k_rx = w_rx & 0xFFFFF;
+  const uint32_t k_tx = w_tx & 0xFFFFF;
+  out[0] = static_cast<uint8_t>(w_rx >> 20);                                                              // 0x18 RX_N
+  out[1] = static_cast<uint8_t>(k_rx & 0xFF);                                                             // 0x19
+  out[2] = static_cast<uint8_t>((k_rx >> 8) & 0xFF);                                                      // 0x1A
+  out[3] = static_cast<uint8_t>((FREQ_PALDO_SEL << 7) | (FREQ_DIVX_CODE << 4) | ((k_rx >> 16) & 0x0F));   // 0x1B
+  out[4] = static_cast<uint8_t>(w_tx >> 20);                                                              // 0x1C TX_N
+  out[5] = static_cast<uint8_t>(k_tx & 0xFF);                                                             // 0x1D
+  out[6] = static_cast<uint8_t>((k_tx >> 8) & 0xFF);                                                      // 0x1E
+  out[7] = static_cast<uint8_t>((FREQ_FSK_SWT << 7) | (FREQ_VCO_BANK << 4) | ((k_tx >> 16) & 0x0F));      // 0x1F
+}
 
 /* ================================================================
  * d101-2 / 443.9 MHz register banks (RFPDK export, from the proven test app).
@@ -213,13 +221,10 @@ static constexpr uint8_t DATA_RATE_TX_BANK[24] = {
     0x19, 0x0C, 0x00, 0xBB, 0xC8, 0x9B, 0x0A, 0x0B, 0x9F, 0x39, 0x29, 0x29,
     0xC0, 0xA2, 0x54, 0x53, 0x00, 0x00, 0xB4, 0x00, 0x00, 0x01, 0x00, 0x00
 };
-// RX profile: matched to the meter's reply - 25 kHz deviation, 1.2 kbps, AFC on
-// (loaded by rx init; TX stays narrow). RFPDK export 2026-07-24 with Rx Xtal Tol
-// tightened to 5 ppm so Auto-Select picks a narrower channel filter: the reply is
-// a very high modulation-index signal (+-25 kHz dev at 1.2 kbps, h~=41) and arrives
-// weak, so a tighter filter cuts noise -> fewer discriminator spurious edges -> the
-// counting CDR stops slipping bits. Diff vs the prior 28 kHz/20 ppm bank: reg 0x24
-// E2->CA, 0x26 11->0F (dev 28->25 kHz), 0x27 0B->02 (bandwidth). Same baud, freq bank.
+// RX profile matched to the meter's reply: 25 kHz deviation, 1.2 kbps, AFC on, and
+// a narrow channel filter (Rx Xtal Tol 5 ppm). The reply is a very high
+// modulation-index signal (h~=41) and arrives weak, so the tighter filter cuts the
+// discriminator spurious edges that made the counting CDR slip bits.
 static constexpr uint8_t DATA_RATE_RX_BANK[24] = {
     0x19, 0x0C, 0x10, 0xBB, 0xCA, 0xDE, 0x0F, 0x02, 0xDF, 0x26, 0x29, 0x29,
     0xC0, 0xA2, 0x54, 0x53, 0x00, 0x00, 0xB4, 0x00, 0x00, 0x01, 0x00, 0x00
@@ -233,12 +238,6 @@ static constexpr uint8_t BASEBAND_BANK[29] = {
 };
 static constexpr uint8_t TX_BANK[11] = {  // +20 dBm (4 kHz dev ramp)
     0x50, 0x85, 0x02, 0x00, 0x86, 0xD0, 0x00, 0x8A, 0x18, 0x3F, 0x7F
-};
-// FREQUENCY bank = [RX-LO 4B][TX 4B]. Reference value for 443.900 MHz (RFPDK
-// export). The bank is now computed per channel at runtime (see compute_freq_bank_
-// / AN199 above); this constant is the k=12 anchor the formula reproduces exactly.
-static constexpr uint8_t FREQ_443M9[8] = {
-    0x44, 0x60, 0x5F, 0x15,  0x44, 0x4A, 0xAD, 0x14
 };
 // clang-format on
 

@@ -1,12 +1,12 @@
 /*
- * CMT2300A Hardware Abstraction Layer - d101-2 / 443.9 MHz.
+ * CMT2300A hardware abstraction layer - bit-bang 3-wire SPI.
  *
- * Bit-bang 3-wire SPI driver for the CMT2300A. Fixed 443.9 MHz. Asymmetric channel:
- *   - TX: narrow ~4 kHz deviation, HW sync blended to 0x55, real 98 f3 carried in
- *     the FIFO payload behind a 0x55 pad, bytes bit-reversed (LSB-first on air).
- *   - RX: wide ~28 kHz deviation centred on the reply, 2-byte sync 19 CF, chip
- *     does the bit-reversal (PAYLOAD_BIT_ORDER=1), fixed-length capture, drained
- *     in 15-byte chunks off the GPIO3/INT2 = RX_FIFO_TH line.
+ * Asymmetric channel:
+ *   - TX: narrow ~4 kHz deviation, HW sync blended to 0x55, the real 98 f3 carried
+ *     in the FIFO payload behind a 0x55 pad, bytes bit-reversed (LSB-first on air).
+ *   - RX: wide deviation centred on the reply, 2-byte sync 19 CF, chip does the
+ *     bit-reversal (PAYLOAD_BIT_ORDER=1), fixed-length capture drained in 15-byte
+ *     chunks off the GPIO3/INT2 = RX_FIFO_TH line.
  *
  * Pins: SDIO (bidir data), SCLK, CSB (register CS), FCSB (FIFO CS), GPIO3 (INT2).
  */
@@ -31,44 +31,35 @@ class Cmt2300aHal {
                 esphome::InternalGPIOPin *csb, esphome::InternalGPIOPin *fcsb,
                 esphome::InternalGPIOPin *gpio3);
 
-  /// Set the RF channel frequency (Hz) and (re)compute the 8-byte frequency bank
-  /// via the AN199 formula. Call before init() (init() writes the computed bank).
-  /// Defaults to 443.9 MHz if never called.
+  /// RF channel in Hz; recomputes the frequency bank via AN199. Call before init(),
+  /// which is what writes it. Defaults to 443.9 MHz.
   void set_frequency(uint32_t freq_hz);
 
-  /// Base init: soft reset, write the 6 register banks (computed frequency +
-  /// narrow-TX resting profile) and the common post-config patches. Returns true
-  /// on success.
+  /// Soft reset, write the six register banks and the common post-config patches.
   bool init();
 
-  /// Read product ID (0x66 for CMT2300A) - wiring/comms sanity check.
+  /// Read the product ID (0x66 for CMT2300A) - a wiring sanity check.
   bool is_chip_connected();
 
-  /// Transmit one d101-2 frame (starts with 98 f3, ends with its CRC). Applies the
-  /// TX profile, prepends a 0x55 pad, bit-reverses to LSB-first on air, fills the
-  /// FIFO, and blocks until TX_DONE or ~600 ms. Returns true on TX_DONE. Parks the
+  /// Transmit one d101-2 frame (98 f3 .. CRC). Applies the TX profile, pads,
+  /// bit-reverses, fills the FIFO and blocks until TX_DONE or ~600 ms. Parks the
   /// chip in standby afterwards.
   bool transmit(const uint8_t *frame, size_t len);
 
-  /// Enter RX centred at (rf_freq_hz_ + off_codes * 6.199 Hz): applies the wide RX
-  /// profile + 2-byte sync + chip bit-order, then RFS -> RX. Returns true if RX
-  /// was entered.
+  /// Enter RX centred at rf_freq_hz_ + off_codes * 6.199 Hz.
   bool begin_rx(int off_codes);
 
-  /// True while >= FIFO threshold (15) unread bytes sit in the RX FIFO
-  /// (GPIO3 = INT2 = RX_FIFO_TH, active-high).
+  /// True while >= FIFO threshold (15) unread bytes sit in the RX FIFO.
   bool rx_fifo_threshold();
 
-  /// Drain full 15-byte chunks from the RX FIFO while the threshold line is
-  /// asserted, up to buf_size / max_chunks. Returns bytes appended.
+  /// Drain full 15-byte chunks while the threshold line is asserted, up to
+  /// buf_size / max_chunks. Returns bytes appended.
   size_t drain_rx(uint8_t *buf, size_t buf_size, uint8_t max_chunks = 5);
 
-  /// Read RSSI in dBm (signed).
   int8_t get_rssi_dbm();
 
   bool go_standby();
 
-  /// LSB<->MSB bit reversal of one byte (LSB-first on-air conversion).
   static uint8_t reverse8(uint8_t b);
 
  private:

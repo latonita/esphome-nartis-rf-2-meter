@@ -1,17 +1,13 @@
 // Decode checks for the fixed blocks, DI 0xF101 and DI 0xF102.
 //
 // These are not record pages: no COUNT, no TAGs, and a length that belongs to the
-// layout rather than to whatever fitted in the frame. So length is the whole
-// identification - it is what tells the three-phase F102 from the single-phase
-// one - and that is what most of this file exercises.
+// layout rather than to whatever fitted. Length is the whole identification - it is
+// what tells the three-phase F102 from the single-phase one - and that is what most of
+// this file exercises. The last section covers the map from a block's positional
+// fields onto TAGs, and the scales that put both sources into one unit.
 //
-// The F102 three-phase case is a real capture from meter 023240271060. F101 is
-// assembled from the layout in nartis_dlt645_f1xx.h - its own capture came later
-// and only confirmed the length arithmetic, which is all the parser does with it.
-//
-// The last section covers the other half of a fixed block being useful: the map
-// from its positional fields onto TAGs, and the scales that put a value from here
-// and the same value from a list record into one unit.
+// The F102 three-phase case is a real capture from meter 023240271060; F101 is
+// assembled from the layout in nartis_dlt645_f1xx.h.
 #include "d101_frame.h"
 
 #include <cstddef>
@@ -39,10 +35,9 @@ static size_t unhex(const char *hex, uint8_t *out, size_t cap) {
   return n;
 }
 
-/// Wrap a de-offset payload in a DL/T 645 read response and a radio envelope,
-/// exactly as parse_response() expects to receive it: from the LEN byte onwards.
-/// Same helper as f202_check.cpp - it lives in the tests because the component
-/// has no business building frames the meter is supposed to send.
+/// Wrap a de-offset payload in a DL/T 645 read response and a radio envelope, exactly
+/// as parse_response() expects it: from the LEN byte onwards. Same helper as
+/// f202_check.cpp.
 static size_t build_response(uint8_t *out, size_t cap, const uint8_t serial[SERIAL_BCD_SIZE], const uint8_t *data,
                              size_t data_len) {
   const size_t env_len = D101_HDR_AFTER_LEN + DLT645_OVERHEAD + data_len;
@@ -84,10 +79,9 @@ int main() {
 
   std::printf("== DI 0xF102, the captured three-phase block ==\n");
 
-  /* Captured off the air from meter 023240271060, from the LEN byte on, with the
-   * nine bytes of radio tail past the CRC left in. Those are kept deliberately: a
-   * real capture carries them, so the parser has to find the end of the frame
-   * from the length fields rather than from where the buffer stops.
+  /* Captured off the air from meter 023240271060, from the LEN byte on, with the nine
+   * bytes of radio tail past the CRC left in: the parser has to find the end of the
+   * frame from the length fields rather than from where the buffer stops.
    */
   static const char *const CAPTURE =
       "4E00014F6860102740320268813F35243483793433936633337357333343"
@@ -137,10 +131,8 @@ int main() {
   }
   check(all, "all 15 positional values decode to the captured numbers");
 
-  // The two internal cross-checks that pinned the field order from this single
-  // capture. Q is exact; P is 40 counts light of 14650 because the phases are
-  // sampled a moment apart, which is why the component tolerates 2% on P and
-  // nothing on Q.
+  // The two internal cross-checks that pinned the field order. Q is exact; P is 40
+  // counts light because the phases are sampled a moment apart, hence 2% on P.
   const int32_t q_sum = bcd32_signed(&b.q_l1) + bcd32_signed(&b.q_l2) + bcd32_signed(&b.q_l3);
   const int32_t p_sum = bcd32_signed(&b.p_l1) + bcd32_signed(&b.p_l2) + bcd32_signed(&b.p_l3);
   check(q_sum == bcd32_signed(&b.q_total), "reactive: phases sum to the total exactly");
@@ -149,8 +141,7 @@ int main() {
               bcd32_signed(&b.q_total) * 0.1, bcd32_value(&b.u_l1) * 0.01, bcd32_value(&b.i_l1) * 0.01,
               bcd32_value(&b.freq) * 0.01);
 
-  // Sign lives in the top byte and costs the top digit; the reactive values are
-  // the only negatives in the capture.
+  // Sign lives in the top byte and costs the top digit.
   check(bcd32_value(&b.q_total) == 1180, "the unsigned reading drops the sign bit rather than reading it as a digit");
 
   std::printf("\n== DI 0xF102, single-phase ==\n");
@@ -190,8 +181,7 @@ int main() {
     std::memset(data, 0, sizeof(data));
     data[0] = 0x01;  // DI little-endian: 0xF101
     data[1] = 0xF1;
-    // Two groups of nine raw little-endian u32. Fill them so total = sum of the
-    // eight tariffs, which is the one check the block offers on its own.
+    // Two groups of nine raw little-endian u32, filled so total = sum of the tariffs.
     for (uint8_t g = 0; g < 2; g++) {
       const size_t base = 2 + g * 36;
       uint32_t total = 0;
@@ -235,17 +225,13 @@ int main() {
     check(blk.group30[1] == 2001 && blk.group30[8] == 2008, "group 0x30 tariffs land in order");
     check(blk.group20[0] == sum20 && blk.group30[0] == sum30, "each group's total is its eight tariffs");
     check(std::memcmp(&blk.status, STATUS10, sizeof(STATUS10)) == 0, "the 10-byte status block is the trailing bytes");
-    // A live capture showed the list's 11 bytes to be these 10 plus a trailing
-    // 0x01, so the sizes have to differ by exactly one.
+    // A live capture showed the list's 11 bytes to be these 10 plus a trailing 0x01.
     check(STATUS_BLOCK_SIZE == sizeof(blk.status) + 1,
           "the list's status block is exactly one byte longer than F101's");
 
-    /* The map onto TAGs. Ten of the eighteen accumulators: the TAG list stops at
-     * T4, so T5..T8 have nowhere to go.
-     *
-     * The offsets are checked against the struct rather than restated, and the
-     * order matters as much as the values - group 0x20 is reactive import and
-     * lands on 0x0A..0x0E, group 0x30 export on 0x0F..0x13.
+    /* The map onto TAGs. Ten of the eighteen accumulators - the TAG list stops at T4.
+     * Order matters as much as the values: group 0x20 is reactive import and lands on
+     * 0x0A..0x0E, group 0x30 export on 0x0F..0x13.
      */
     check(F101_VALUE_COUNT == 10, "ten of the eighteen accumulators are mapped");
     bool map_ok = true;
@@ -264,15 +250,13 @@ int main() {
     }
     check(map_ok, "all ten land on TAGs 0x0A-0x13 at their struct offsets, x0.001 kvarh");
 
-    // Read through the map, binary rather than BCD - the encoding that separates
-    // this block from DI 0xF102. Group 0x20 T1 was filled with 1001 counts.
+    // Read through the map, binary rather than BCD. Group 0x20 T1 holds 1001 counts.
     float value = 0.0f;
     check(fixed_value(r2.payload, r2.payload_len, F101_MAP[1], &value) && value > 1.0005f && value < 1.0015f,
           "1001 raw counts read as binary LE and scale to 1.001 kvarh");
     check(fixed_value(r2.payload, r2.payload_len, F101_MAP[6], &value) && value > 2.0005f && value < 2.0015f,
           "and group 0x30 T1's 2001 counts to 2.001 kvarh");
-    // 0xEE would be a bad nibble in BCD; here it is just a large number, which is
-    // the point of the encoding field.
+    // 0xEE would be a bad nibble in BCD; here it is just a large number.
     uint8_t bad[sizeof(nartis_f101)];
     std::memcpy(bad, r2.payload, sizeof(bad));
     // 1001 = 0x03E9, so replacing the low byte gives 0x03EE = 1006.
@@ -285,8 +269,7 @@ int main() {
 
   std::printf("\n== length is the identification ==\n");
   {
-    // One byte either side of each layout has to be refused, not read as a
-    // records page. That is what makes the length load-bearing.
+    // One byte either side of each layout has to be refused, not read as a records page.
     const size_t lengths[] = {sizeof(f102_1ph) - 1, sizeof(f102_1ph) + 1, sizeof(f102_3ph) - 1, sizeof(f102_3ph) + 1};
     for (size_t want : lengths) {
       uint8_t data[128];
@@ -321,8 +304,7 @@ int main() {
       std::snprintf(msg, sizeof(msg), "build_request() knows DI 0x%04X", di);
       check(n > 0, msg);
     }
-    // Both fixed reads take the long body, so they differ from each other in the
-    // DI alone - and from the list requests only in the DI too.
+    // Both fixed reads take the long body, so they differ in the DI alone.
     uint8_t f101[64], f102[64];
     const size_t n101 = build_request(f101, sizeof(f101), serial, DI_FIXED_F101);
     const size_t n102 = build_request(f102, sizeof(f102), serial, DI_FIXED_F102);
@@ -348,8 +330,7 @@ int main() {
           "63 bytes of DATA selects the three-phase map");
     check(f102_value_map(sizeof(f102_1ph), &m) == F102_1PH_VALUE_COUNT && m == F102_1PH_MAP,
           "23 bytes selects the single-phase map");
-    // Same length-is-everything rule as the parser: a length that is neither
-    // layout has to map to nothing rather than to the nearest layout.
+    // A length that is neither layout has to map to nothing, not the nearest layout.
     bool refused = true;
     for (uint8_t len : {(uint8_t) 0, (uint8_t) 22, (uint8_t) 24, (uint8_t) 62, (uint8_t) 64}) {
       const FixedValue *any = F102_3PH_MAP;
@@ -360,8 +341,7 @@ int main() {
     }
     check(refused, "and every other length maps to nothing, nullptr included");
 
-    // Each entry must name a TAG the decoder knows at the width the field is, or
-    // there would be nothing to publish the value as.
+    // Each entry must name a TAG the decoder knows, at the width the field is.
     bool shape = true;
     for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
       TagInfo info{};
@@ -379,9 +359,8 @@ int main() {
     }
     check(shape, "every mapped TAG exists in TAG_TABLE as a 4-byte value");
 
-    // A TAG twice in one map would mean two fields racing for one entity, with
-    // the winner decided by table order - so it is worth ruling out rather than
-    // reading off by eye.
+    // A TAG twice in one map would mean two fields racing for one entity, with the
+    // winner decided by table order.
     bool unique = true;
     for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
       for (uint8_t j = (uint8_t) (i + 1); j < F102_3PH_VALUE_COUNT; j++) {
@@ -397,9 +376,8 @@ int main() {
     }
     check(unique, "no TAG and no offset is mapped twice");
 
-    /* The offsets are the map's grip on the layout, so they are checked against
-     * the struct itself rather than restated. Every field of the three-phase
-     * block is mapped, in struct order.
+    /* The offsets are the map's grip on the layout, so they are checked against the
+     * struct itself. Every field of the three-phase block is mapped, in struct order.
      */
     const size_t want[F102_3PH_VALUE_COUNT] = {
         offsetof(f102_3ph, p_total), offsetof(f102_3ph, p_l1), offsetof(f102_3ph, p_l2),
@@ -417,9 +395,8 @@ int main() {
     }
     check(offs, "all 15 offsets are the struct's own, so every field is mapped");
 
-    // The current group is mapped by object, not by the vendor's label - which is
-    // why 0x1C is in and 0x1F is out. Stated as a check because it is a decision
-    // rather than a transcription, and a future edit should have to face it.
+    // The current group is mapped by object, not by the vendor's label - which is why
+    // 0x1C is in and 0x1F is out. A decision, so it is stated as a check.
     bool cur = true;
     for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
       if (F102_3PH_MAP[i].tag == 0x1F) {
@@ -429,10 +406,8 @@ int main() {
     check(cur && F102_3PH_MAP[11].tag == 0x1C && F102_3PH_MAP[12].tag == 0x1D && F102_3PH_MAP[13].tag == 0x1E,
           "the currents map to TAGs 0x1C/0x1D/0x1E and nothing maps to 0x1F");
 
-    // Encodings: every DI 0xF102 field is BCD, and only the power group is signed.
-    // A voltage or a frequency with the top bit set is a bad reading, not a
-    // negative volt, so treating that bit as a sign there would turn a fault into
-    // a plausible number.
+    // Every DI 0xF102 field is BCD and only the power group is signed: a voltage with
+    // the top bit set is a bad reading, not a negative volt.
     bool encs = true;
     for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
       const bool signed_group = F102_3PH_MAP[i].tag >= 0x20 && F102_3PH_MAP[i].tag <= 0x27;
@@ -447,9 +422,8 @@ int main() {
 
   std::printf("\n== the capture, read through the map ==\n");
   {
-    /* The point of the scales: these are the numbers an entity is handed, in the
-     * unit tag_info() names for the TAG - not the raw counts. So this is the same
-     * capture as the first section, read the way the component reads it.
+    /* The point of the scales: these are the numbers an entity is handed, in the unit
+     * tag_info() names for the TAG - the same capture read the way the component does.
      */
     struct Want {
       uint8_t tag;
@@ -469,8 +443,7 @@ int main() {
       TagInfo info{};
       const bool ok = fixed_value(r.payload, r.payload_len, F102_3PH_MAP[i], &got) &&
                       tag_info(F102_3PH_MAP[i].tag, &info);
-      // A hundredth is the finest raw step any of these has, so anything closer
-      // would be testing float arithmetic rather than the map.
+      // A hundredth is the finest raw step any of these has.
       const float err = (got > wants[i].value) ? (got - wants[i].value) : (wants[i].value - got);
       if (!ok || F102_3PH_MAP[i].tag != wants[i].tag || err > 0.005f ||
           std::strcmp(info.unit, wants[i].unit) != 0) {
@@ -481,9 +454,8 @@ int main() {
     }
     check(all_ok, "all 15 scale into the unit their TAG names");
 
-    // The two sources have to meet in that unit, which is the whole reason the
-    // scales are on the entries. TAG 0x15 arrived in both: 2348 raw counts in the
-    // list at x0.1 V against 23481 here at x0.01 V.
+    // The two sources have to meet in that unit. TAG 0x15 arrived in both: 2348 raw
+    // counts in the list at x0.1 V against 23481 here at x0.01 V.
     ParsedItem list_u{};
     list_u.tag = 0x15;
     list_u.len = 4;
@@ -499,9 +471,8 @@ int main() {
     std::printf("      list %.2f V, F102 %.2f V\n", from_list, from_fixed);
     check(gap < 0.5f, "and the two land within half a volt of each other - one unit, two paths");
 
-    // Refusals. A field the meter left unset reads back as a plausible number if
-    // the nibbles are not checked, and an entry that reaches past the block would
-    // read whatever follows it in memory.
+    // Refusals: an unset field reads back as a plausible number if the nibbles are not
+    // checked, and an entry reaching past the block would read whatever follows it.
     uint8_t bad[sizeof(f102_3ph)];
     std::memcpy(bad, r.payload, sizeof(bad));
     bad[F102_3PH_MAP[8].offset] = 0xEE;
@@ -516,9 +487,8 @@ int main() {
 
   std::printf("\n== item_as_scaled ==\n");
   {
-    // The list's half of the same job. The clock is the one TAG with no scalar
-    // reading, and it has to say so rather than return a number, because a
-    // seven-byte date read as an integer would publish happily.
+    // The clock is the one TAG with no scalar reading, and it has to say so - a 7-byte
+    // date read as an integer would publish happily.
     ParsedItem clock{};
     clock.tag = 0x29;
     clock.len = 7;
@@ -526,8 +496,7 @@ int main() {
     float sink = 0.0f;
     check(tag_info(0x29, &info) && !item_as_scaled(clock, info, &sink), "a clock has no scaled reading");
 
-    // Signed BCD keeps its sign through the scale - the export direction on the
-    // power group depends on it.
+    // Signed BCD keeps its sign through the scale.
     ParsedItem q{};
     q.tag = 0x24;
     q.len = 4;
@@ -537,6 +506,43 @@ int main() {
     float value = 0.0f;
     check(tag_info(0x24, &info) && item_as_scaled(q, info, &value) && value < -1179.0f && value > -1181.0f,
           "a negative reactive power stays negative through the scale");
+
+    /* One record per family, raw bytes -> the number an entity is handed. This is the
+     * last step before publish_state(), so a scale edited here by eye - the power
+     * group was long open at a factor of ten - shows up as a wrong reading.
+     */
+    struct ScaleCase {
+      uint8_t tag;
+      uint8_t len;
+      uint8_t raw[4];
+      float want;
+      const char *unit;
+    };
+    const ScaleCase cases[] = {
+        {0x00, 4, {0x35, 0x4B, 0xC9, 0x00}, 13191.989f, "kWh"},   // binary LE, x0.001
+        {0x15, 4, {0x48, 0x23, 0x00, 0x00}, 234.8f, "V"},         // BCD, x0.1
+        {0x1C, 4, {0x00, 0x15, 0x00, 0x00}, 1.5f, "A"},           // BCD, x0.001
+        {0x20, 4, {0x65, 0x14, 0x00, 0x00}, 1465.0f, "W"},        // signed BCD, x1
+        {0x28, 4, {0x00, 0x50, 0x00, 0x00}, 50.0f, "Hz"},         // BCD, x0.01
+        {0x2A, 2, {0xF3, 0xFF, 0x00, 0x00}, -1.3f, "\302\260C"},  // signed binary, x0.1
+    };
+    bool families_ok = true;
+    for (const ScaleCase &c : cases) {
+      ParsedItem item{};
+      item.tag = c.tag;
+      item.len = c.len;
+      std::memcpy(item.raw, c.raw, c.len);
+      TagInfo ti{};
+      float got = 0.0f;
+      const bool ok = tag_info(c.tag, &ti) && item_as_scaled(item, ti, &got);
+      const float slack = 0.0005f * ((c.want < 0.0f) ? -c.want : c.want) + 0.001f;
+      if (!ok || got - c.want > slack || c.want - got > slack || std::strcmp(ti.unit, c.unit) != 0) {
+        std::printf("FAIL  TAG 0x%02X scaled to %.3f %s, expected %.3f %s\n", c.tag, got, ok ? ti.unit : "?", c.want,
+                    c.unit);
+        families_ok = false;
+      }
+    }
+    check(families_ok, "every family scales into the unit its TAG names");
   }
 
   std::printf("\n%s (%d failure(s))\n", fail == 0 ? "DI 0xF101/0xF102 FIXED BLOCKS DECODE AND MAP CORRECTLY" : "FAILURES",

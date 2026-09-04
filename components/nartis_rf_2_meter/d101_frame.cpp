@@ -17,22 +17,9 @@ const ParsedItem *ParsedResponse::find(uint8_t tag) const {
 
 namespace {
 
-/* The TAG table.
- *
- * A record is TAG followed by its value with no length field, so the width here
- * is what makes the rest of a page readable at all - get one wrong and every
- * record after it is garbage. The rows are contiguous TAG ranges because the
- * meter groups its registers that way: one row per family, ascending.
- *
- * `scale` is what an entity publishes, so a wrong one here is a wrong reading and
- * not just a wrong log line. It is also what lets a value from DI 0xF102 land in
- * the same unit as the list's - see FixedValue in the header.
- *
- * The power group at 0x20..0x27 was long open at a factor of ten, the vendor
- * table putting it in units of 10 W / 10 var. It is x1: on a live three-phase
- * meter the same quantities read out of DI 0xF102, whose scales are independent,
- * agreed with these rows to within 0.3%, and 234 V against 1.5/1.6/4.0 A cannot
- * carry the 15 kW that x10 would claim.
+/* The TAG table. A record is a TAG followed by its value with no length field, so
+ * a wrong width garbles every record after it and a wrong scale is a wrong
+ * published reading. Rows are contiguous TAG ranges, one per register family.
  */
 struct TagRange {
   uint8_t first;
@@ -44,9 +31,7 @@ struct TagRange {
 };
 
 constexpr TagRange TAG_TABLE[] = {
-    // Energy accumulators. Binary little-endian - the one family that is not BCD.
-    // 0x00..0x07 are active import/export; the rest of the range is reactive and
-    // other cumulative registers, so the log unit covers both.
+    // Energy accumulators - the one family that is binary, not BCD.
     {0x00, 0x09, 4, TagEnc::UINT_LE, 0.001f, "kWh"},
     {0x0A, 0x13, 4, TagEnc::UINT_LE, 0.001f, "kvarh"},
 
@@ -64,16 +49,14 @@ constexpr TagRange TAG_TABLE[] = {
 
     {0x28, 0x28, 4, TagEnc::BCD_LE, 0.01f, "Hz"},
     {0x29, 0x29, 7, TagEnc::BCD_CLOCK, 1.0f, ""},
-    // Temperature is binary two's-complement and 2 bytes wide, not the 4-byte BCD
-    // its neighbours use - the one row in this table that breaks the pattern.
+    // Temperature: 2-byte signed binary, unlike its 4-byte BCD neighbours.
     {0x2A, 0x2A, 2, TagEnc::INT_LE, 0.1f, "\302\260C"},
 
     // 0x2B skipped, special use-case for D101-2 LCD test
     {0x2C, 0x35, 4, TagEnc::BCD_LE, 0.001f, "kWh"}, // active energy import (sum + by 4 tariffs), then export, end of last period
     {0x36, 0x3F, 4, TagEnc::BCD_LE, 0.001f, "kvarh"}, // reactive energy import  (sum + by 4 tariffs), then export end of last period
-    // 0x48..0x4F are identity and configuration objects whose widths vary per
-    // object, so there is no single width to walk them by. A YAML `bytes:` is the
-    // only way to read one.
+    // 0x48..0x4F are identity/config objects of varying width - a YAML `bytes:`
+    // is the only way to read one.
 };
 
 }  // namespace
@@ -88,9 +71,7 @@ bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
       return true;
     }
   }
-  // Not in the table: 0x2B, the identity objects at 0x48..0x4F, or a TAG this
-  // meter's indication set has that the vendor table does not. A width declared
-  // in YAML fills the gap - consulted last, so it can never shadow a row above.
+  // A YAML-declared width fills the gap, consulted last so it cannot shadow a row.
   if (tag_width_overrides != nullptr && tag < TAG_WIDTH_TABLE_SIZE && tag_width_overrides[tag] != 0) {
     *out = TagInfo{tag_width_overrides[tag], TagEnc::USER, 1.0f, ""};
     return true;
@@ -193,13 +174,10 @@ const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT] = {
     {DI_LIST_B_RECORDS, ListId::B, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
     {DI_LIST_B_STATUS, ListId::B, ListPart::STATUS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
     {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    // The one short body. Sending the long one here gets no reply at all - not
-    // even an error response - so the pairing matters.
+    // The one short body; sending the long one here gets no reply at all.
     {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
 };
 
-// Both fixed reads take the long body, and both have since been captured
-// answering it, so neither is a guess any more.
 const FixedRequest FIXED_REQUESTS[FIXED_REQUEST_COUNT] = {
     {DI_FIXED_F101, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
     {DI_FIXED_F102, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
@@ -216,34 +194,14 @@ uint8_t fixed_request_index(uint16_t di) {
 
 /* DI 0xF102, three-phase: all fifteen values, in struct order.
  *
- * The scales are this block's own - x0.1 W, x0.1 var, x0.01 V, x0.01 A,
- * x0.01 Hz - and they are NOT the list's for any of these quantities. That is
- * what these entries are for: after scaling, a value from here and the same value
- * from a list record are both in the unit TAG_TABLE names, so an entity cannot
- * tell which source filled it.
+ * The scales are this block's own - x0.1 W, x0.1 var, x0.01 V, x0.01 A, x0.01 Hz -
+ * and none of them is the list's, so scaling here is what lets an entity be fed
+ * from either source.
  *
- * What this source actually adds on the meters seen so far is the per-phase power:
- * list B carries TAG 0x20 and none of 0x21..0x27, while this block has all eight.
- *
- * The current group is mapped by OBJECT, and that contradicts the vendor's own
- * label column, which calls TAG 0x1C "neutral current" and puts L1/L2/L3 on
- * 0x1D/0x1E/0x1F. Three things say the objects are right:
- *
- *   - F102's i_l1/i_l2/i_l3 are objects 0x151/0x152/0x153, and those are the
- *     objects the TAG list gives to 0x1C/0x1D/0x1E. The voltage group is keyed
- *     the same way (0x131/0x132/0x133 -> TAGs 0x15/0x16/0x17) and there the
- *     labels agree, so the keying itself is not in doubt.
- *   - in a live capture the list's 0x1C and 0x1D matched this block's L1 and L2
- *     to within 0.8% four seconds later. Under the label reading every phase
- *     would have had to move by tens of percent in those four seconds.
- *   - over those same four seconds P_total rose 1227 W, and the only phase that
- *     moved under the object reading was L3 - by 5.21 A at 233 V, or 1214 W. The
- *     label reading leaves the rise unaccounted for.
- *
- * So TAG 0x1F is deliberately absent: whatever object it is - the TAG list gives
- * it 0x0E07, one of the pair the single-phase rows use - it is not this block's
- * L3, and mapping L3 onto it would put phase C's current where a user following
- * the vendor labels expects it and nowhere near where the list puts it.
+ * The current group is mapped by OBJECT, which contradicts the vendor's label
+ * column: this block's i_l1/i_l2/i_l3 are objects 0x151/0x152/0x153, the objects
+ * the TAG list gives to 0x1C/0x1D/0x1E, and a live capture agreed to within 0.8%.
+ * TAG 0x1F is therefore deliberately absent - it is a different object.
  */
 const FixedValue F102_3PH_MAP[F102_3PH_VALUE_COUNT] = {
     {0x20, offsetof(f102_3ph, p_total), TagEnc::BCD_LE_SIGNED, 0.1f},  // P total    x0.1 W   -> W
@@ -265,60 +223,26 @@ const FixedValue F102_3PH_MAP[F102_3PH_VALUE_COUNT] = {
 
 /* DI 0xF102, single-phase: power only.
  *
- * P and Q are the two fields the firmware appends in their native object units,
- * the same units the three-phase block uses, so they scale the same way.
- *
- * U, I and frequency are deliberately unmapped. The firmware pre-divides them -
- * U by 10, I and frequency by 100 - which taken against the native object scales
- * would leave the fields in units of 0.1 V, 1 A and 1 Hz. One-amp and one-hertz
- * resolution is not a reading a meter would offer, so one of the two halves of
- * that arithmetic is wrong, and no single-phase capture exists to say which.
- * log_f102_() prints all five raw for exactly that reason.
- *
- * The two entries below rest on objects 0x00C1 and 0x00F1 meaning the same thing
- * on both meter types. A list carries TAG 0x20 too, so on a single-phase meter
- * the two published values can be read against each other - a factor of ten
- * apart would say this assumption is wrong.
+ * P and Q are in the same native object units the three-phase block uses. U, I and
+ * frequency are deliberately unmapped: the firmware pre-divides them, which
+ * against the native scales would leave 1 A and 1 Hz resolution, and no
+ * single-phase capture exists to say which half of that is wrong. log_f102_()
+ * prints all five raw for that reason.
  */
 const FixedValue F102_1PH_MAP[F102_1PH_VALUE_COUNT] = {
     {0x20, offsetof(f102_1ph, p), TagEnc::BCD_LE_SIGNED, 0.1f},  // P  x0.1 W   -> W
     {0x24, offsetof(f102_1ph, q), TagEnc::BCD_LE_SIGNED, 0.1f},  // Q  x0.1 var -> var
 };
 
-/* DI 0xF101: the reactive energy registers.
+/* DI 0xF101: the reactive energy registers, two groups of nine [total, T1..T8] as
+ * raw 32-bit binary. Only the first five of each are mapped - the TAG list stops
+ * at T4. Object groups 0x20 and 0x30 are the two reactive directions, which is
+ * also why this block exists: the lists carry active energy and no reactive.
  *
- * Two groups of nine, [total, T1..T8], as raw 32-bit binary rather than BCD.
- * Only the first five of each are mapped - the TAG list stops at T4, so T5..T8
- * have no TAG to be published under and stay in the log.
- *
- * WHICH registers these are. The block gives them as object groups 0x20 and 0x30,
- * and the list numbers its energy families 0x0001 for active import, 0x0011 for
- * active export - so 0x0021 and 0x0031 are the two reactive directions, which are
- * these. Hence import -> TAGs 0x0A..0x0E, export -> 0x0F..0x13. That also
- * explains why the block exists at all: the lists carry active energy and no
- * reactive, this block reactive and no active.
- *
- * THE SCALE, x0.001 kvarh, was measured rather than assumed, and it took two
- * captures 76 minutes apart because a single one says nothing about units:
- *
- *   - group 0x30 advanced 153 counts. At x0.001 kvarh that is 121 var averaged
- *     over the interval, against the 106 and 126 var DI 0xF102 measured at the
- *     two ends. No other power of ten is within two orders of magnitude.
- *   - the same arithmetic on TAG 0x00, whose scale is already known, gives 1535 W
- *     against a measured 1465 and 1526 W - the same ~3% excess, so the method is
- *     sound and the load was simply a little higher between the samples.
- *
- * What this does NOT settle is the direction of each group. Group 0x30 was the
- * one advancing while Q was negative throughout, so it is the export register on
- * the usual sign convention, and group 0x20 sat still - which fits, but means the
- * import assignment rests on the object numbering alone. If reactive import and
- * export ever look swapped on a meter, this is the line to doubt.
- *
- * The direct comparison is not available yet: list B holds fifteen records and
- * none of them is a reactive energy TAG, so there is no list-side value to check
- * these against. List A has never been read on the reference meter - if it
- * carries 0x0A..0x13, one cycle with `sources: [list_a, fixed]` settles the
- * direction outright, the list value and the group being the same register.
+ * The x0.001 kvarh scale was measured over two captures 76 minutes apart, against
+ * the power DI 0xF102 reported at both ends; no other power of ten is close. The
+ * direction of each group rests on the object numbering alone - if reactive import
+ * and export ever look swapped, this is the line to doubt.
  */
 const FixedValue F101_MAP[F101_VALUE_COUNT] = {
     {0x0A, offsetof(nartis_f101, group20) + 0, TagEnc::UINT_LE, 0.001f},   // R+ total
@@ -334,8 +258,7 @@ const FixedValue F101_MAP[F101_VALUE_COUNT] = {
 };
 
 uint8_t f102_value_map(uint8_t payload_len, const FixedValue **out) {
-  // Same length-is-the-identification rule parse_response() uses, and for the
-  // same reason: nothing else in the reply says which layout it is.
+  // Length is the identification: nothing else in the reply says which layout.
   if (payload_len == sizeof(f102_3ph)) {
     *out = F102_3PH_MAP;
     return F102_3PH_VALUE_COUNT;
@@ -357,8 +280,6 @@ bool fixed_value(const uint8_t *payload, uint8_t payload_len, const FixedValue &
   }
 
   if (v.enc == TagEnc::UINT_LE) {
-    // DI 0xF101's accumulators: plain little-endian binary, so every byte value
-    // is legal and there is nothing to validate.
     uint32_t raw = 0;
     for (uint8_t i = 0; i < 4; i++) {
       raw |= static_cast<uint32_t>(payload[v.offset + i]) << (8 * i);
@@ -371,8 +292,7 @@ bool fixed_value(const uint8_t *payload, uint8_t payload_len, const FixedValue &
   std::memcpy(&field, payload + v.offset, sizeof(field));
 
   // bcd32_value() masks the sign bit but does not reject a non-decimal nibble, so
-  // the digits are checked here. A field the meter left unset would otherwise read
-  // back as a plausible number.
+  // an unset field would otherwise read back as a plausible number.
   for (uint8_t i = 0; i < sizeof(field.b); i++) {
     const uint8_t b = (i == 3) ? static_cast<uint8_t>(field.b[i] & ~BCD_SIGN_BIT) : field.b[i];
     if ((b & 0x0F) > 9 || (b >> 4) > 9) {
@@ -472,14 +392,12 @@ size_t build_request(uint8_t *out, size_t cap, const uint8_t serial_le[SERIAL_BC
 
 /// Smallest LEN that could hold a 645 frame with an empty DATA field.
 static constexpr size_t MIN_ENV_LEN = D101_HDR_AFTER_LEN + DLT645_OVERHEAD;
-/// How far into the buffer to look for the LEN byte. The radio normally hands
-/// back a buffer starting exactly at LEN; a couple of slipped bytes at the head
-/// of a weak capture are common enough to be worth scanning for.
+/// How far into the buffer to look for the LEN byte - a weak capture can slip a
+/// couple of bytes in at the head.
 static constexpr size_t MAX_START_SCAN = 3;
 
 namespace {
 
-/// Outcome of walking a {TAG, value} record stream.
 struct ItemWalk {
   uint8_t count{0};                       ///< records written to `out`
   size_t end{0};                          ///< payload offset just past the last one
@@ -489,14 +407,9 @@ struct ItemWalk {
 };
 
 /// Decode records from `payload[start .. end)`, at most `max_records` of them,
-/// into `out` (which must hold MAX_ITEMS entries).
-///
-/// `end` is where the records stop, which is not always the end of DATA: on a
-/// status half the last STATUS_BLOCK_SIZE bytes are the block, not a record.
-///
-/// Records carry no length field, so a TAG of unknown width ends the walk - there
-/// is no way to find where the next record starts. `count` and `end` then describe
-/// how far it got, which is what the caller needs in order to log the rest.
+/// into `out` (which must hold MAX_ITEMS entries). `end` is where the records
+/// stop, which on a status half is STATUS_BLOCK_SIZE bytes before the end of DATA.
+/// An unknown TAG ends the walk; `count` and `end` then say how far it got.
 ItemWalk walk_items(const uint8_t *payload, size_t end, size_t start, size_t max_records, ParsedItem *out,
                     const uint8_t *tag_width_overrides) {
   ItemWalk w{};
@@ -516,8 +429,7 @@ ItemWalk walk_items(const uint8_t *payload, size_t end, size_t start, size_t max
       return w;
     }
     if (pos + 1 + info.width > end) {
-      // Cut mid-record. Unlike stopping short by whole records this is not
-      // something a meter does deliberately, so it is a framing error.
+      // Cut mid-record - a framing error, unlike stopping short by whole records.
       w.result = ParseResult::MALFORMED;
       return w;
     }
@@ -577,9 +489,8 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ParseResult::BAD_CHECKSUM;
     }
 
-    // Strip the +0x33 transmission offset. A run of 0x33 bytes is just zeroes -
-    // this is what makes the raw payload look deceptively BCD-ish. Kept in `out`
-    // so the caller can log it even when item decoding fails below.
+    // Strip the +0x33 transmission offset, and keep the result in `out` so the
+    // caller can log it even when item decoding fails below.
     *out = ParsedResponse{};
     out->control = f[8];
     out->payload_len = static_cast<uint8_t>((data_len < MAX_PAYLOAD) ? data_len : MAX_PAYLOAD);
@@ -591,9 +502,8 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return ParseResult::MALFORMED;  // longer than anything this protocol should send
     }
 
-    // Control code. Bit 7 marks the reply direction; bit 6 means the meter
-    // refused. On a refusal DATA carries error bytes, not items, so stop here
-    // with the payload kept for the caller to log.
+    // Bit 7 marks the reply direction, bit 6 a refusal - whose DATA carries error
+    // bytes, not items.
     if (f[8] != DLT645_C_READ_RSP) {
       return ((f[8] & 0x80) != 0) ? ParseResult::ERROR_RESPONSE : ParseResult::NOT_RESPONSE;
     }
@@ -603,15 +513,10 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
 
-    /* A fixed block is neither framing: no COUNT, no TAGs, and a length that is
-     * part of the layout rather than a consequence of what fitted. So it is
-     * settled here, before the record framings are considered at all.
-     *
-     * DI narrows it to F101 or F102 and the length finishes the job - which is
-     * also the whole 3-phase/1-phase test for F102, there being nothing else in
-     * the reply that says which meter sent it. A length that matches neither is
-     * MALFORMED with `payload` kept, so the caller can dump the bytes: that is
-     * the case worth seeing, since it means a third layout exists.
+    /* A fixed block is neither record framing, so it is settled first: the DI
+     * narrows it to F101 or F102 and the length finishes the job, which is also the
+     * whole 3-phase/1-phase test. A length matching neither is MALFORMED with
+     * `payload` kept, since it would mean a third layout exists.
      */
     if (out->di == DI_FIXED_F101 || out->di == DI_FIXED_F102) {
       if (out->di == DI_FIXED_F101 && data_len == sizeof(nartis_f101)) {
@@ -623,41 +528,29 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       } else {
         return ParseResult::MALFORMED;
       }
-      // No records and no COUNT byte. The values live in `payload`, to be read
-      // through the structs in nartis_dlt645_f1xx.h.
       out->count = 0;
       out->announced_count = 0;
       return ParseResult::OK;
     }
 
-    /* Which of the two framings is this?
-     *
-     * The request settles it - a records half answers with records, a status half
-     * with leftover records and then the block - but the reading is verified, not
-     * assumed: a page stops on a record boundary, so the right reading is the one
-     * that consumes DATA exactly. The expected framing is tried first and the
-     * other kept as a fallback, which is what lets a meter that answers a request
-     * the other way round be identified rather than read as garbage. A probe's
-     * data identifier is in neither half and is read as records.
+    /* Which of the two framings is this? The request settles it, but the reading
+     * is verified rather than assumed: a page stops on a record boundary, so the
+     * right reading is the one that consumes DATA exactly. The expected framing is
+     * tried first and the other kept as a fallback.
      */
     const uint8_t req = list_request_index(out->di);
     const bool expect_status = (req < LIST_REQUEST_COUNT) && (LIST_REQUESTS[req].part == ListPart::STATUS);
 
-    // Records end here under each framing; walk_items() stops there and the fit
-    // is judged against it.
     const auto records_end = [&](PayloadShape shape) -> size_t {
       return (shape == PayloadShape::STATUS_HALF) ? data_len - STATUS_BLOCK_SIZE : data_len;
     };
 
     const auto try_shape = [&](PayloadShape shape) -> ItemWalk {
       if (shape == PayloadShape::STATUS_HALF) {
-        // DI(2) plus the block is the shortest a status half can be, and that is
-        // the shape of a reply with nothing left over to continue.
+        // DI(2) plus the block is the shortest a status half can be.
         if (data_len < 2 + STATUS_BLOCK_SIZE) {
           return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};
         }
-        // No COUNT byte, so the byte budget is the only bound; a record is at
-        // least 2 bytes, so this never truncates a real list.
         const size_t end = records_end(shape);
         return walk_items(payload, end, 2, end, out->items, tag_width_overrides);
       }
@@ -688,9 +581,8 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       }
     }
     if (!exact) {
-      // Neither reading landed on a boundary. Report the expected one's own
-      // failure - its diagnostics are what a reader can act on - and re-run it so
-      // out->items holds whatever it did decode.
+      // Neither reading landed on a boundary. Report the expected one's failure and
+      // re-run it so out->items holds whatever it did decode.
       shape = candidates[0];
       walk = try_shape(shape);
     }
@@ -710,8 +602,7 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
       return walk.result;
     }
     if (!exact) {
-      // Every record read cleanly, yet bytes are left over: DATA holds a whole
-      // record that no reading accounted for, so a width above must be wrong.
+      // Every record read cleanly yet bytes are left over, so a width must be wrong.
       return ParseResult::MALFORMED;
     }
     return ParseResult::OK;
@@ -769,8 +660,8 @@ bool item_as_bcd_signed(const ParsedItem &item, int32_t *out) {
   }
   const bool negative = (item.raw[item.len - 1] & BCD_SIGN_BIT) != 0;
   int32_t v = 0;
-  // Least-significant BCD pair first, so walk the bytes backwards; the sign bit
-  // is masked off the first byte read, which is the most significant one.
+  // Least-significant pair first, so walk backwards; the sign bit is masked off the
+  // first byte read, which is the most significant one.
   for (uint8_t i = item.len; i > 0; i--) {
     uint8_t b = item.raw[i - 1];
     if (i == item.len) {
@@ -816,9 +707,8 @@ bool item_as_scaled(const ParsedItem &item, const TagInfo &info, float *out) {
   }
   switch (info.enc) {
     case TagEnc::UINT_LE:
-    // A YAML-declared width comes with no unit and a scale of 1, so this reads it
-    // raw - the only honest thing to do with a TAG the decoder does not know, and
-    // it leaves a `multiply` filter as the way to scale it.
+    // A YAML-declared width has no unit and a scale of 1, so read it raw and leave
+    // a `multiply` filter as the way to scale it.
     case TagEnc::USER:
       *out = static_cast<float>(item_as_u32(item)) * info.scale;
       return true;
@@ -842,7 +732,7 @@ bool item_as_scaled(const ParsedItem &item, const TagInfo &info, float *out) {
       return true;
     }
     default:
-      // BCD_CLOCK, and anything added later without a thought for this switch.
+      // BCD_CLOCK is not a scalar.
       return false;
   }
 }

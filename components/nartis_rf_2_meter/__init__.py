@@ -14,14 +14,11 @@ default list B alone:
 A status half must follow its own records half back to back: the leftover records
 come from a cursor the meter drops as soon as anything else is asked.
 
-An entity selects a value by its 1-byte item TAG, or by a status-block field -
-there is no way to ask for anything else. A TAG names a quantity rather than a
-place in a frame, so it also joins the sources: every reply is folded into one
-value per TAG, the list winning where both carry one.
-
-Published values are already scaled to the unit tags.md gives for the TAG, so a
-`multiply` filter would scale them twice. A TAG read with `bytes:` is the
-exception - unknown unit, published raw.
+An entity selects a value by its 1-byte item TAG, or by a status-block field. Every
+reply is folded into one value per TAG, the list winning where both sources carry
+one, and published already scaled to the unit tags.md gives - so a `multiply`
+filter would scale it twice. A TAG read with `bytes:` is the exception: unknown
+unit, published raw.
 """
 
 from esphome import pins
@@ -64,9 +61,8 @@ NartisRf2MeterComponent = nartis_rf_2_meter_ns.class_(
 )
 StatusField = nartis_rf_2_meter_ns.enum("StatusField", is_class=True)
 
-# Both names are UNCONFIRMED - inferred from byte positions in one capture, where
-# the firmware layout calls the same bytes device state. Prefer `raw` when working
-# out what a meter actually sends. Real temperature is `tag: 0x2A`.
+# Both names are UNCONFIRMED - inferred from byte positions in one capture, where the
+# firmware layout calls the same bytes device state. Real temperature is `tag: 0x2A`.
 STATUS_FIELDS = {
     "active_tariff": StatusField.ACTIVE_TARIFF,
     "tariff_count": StatusField.TARIFF_COUNT,
@@ -76,17 +72,14 @@ STATUS_FIELDS_TEXT = {
     "raw": StatusField.RAW,
 }
 
-# TAGs with a built-in width in TAG_TABLE (d101_frame.cpp), which is the one place
-# widths, encodings and scales live; this mirrors only what config has to validate.
-# Records carry no length field, so a TAG of unknown width cannot even be skipped -
-# it destroys framing for the rest of the payload, hence `bytes:` before use.
+# Mirrors TAG_TABLE in d101_frame.cpp, which is the one place widths, encodings and
+# scales live. A TAG of unknown width destroys framing for the rest of the payload,
+# since records carry no length field - hence `bytes:` before use.
 TAG_CLOCK = 0x29
 TAG_NO_WIDTH = {0x2B} | set(range(0x40, 0x50))
 TAG_KNOWN = set(range(0x00, 0x50)) - TAG_NO_WIDTH
 TAG_NUMERIC = TAG_KNOWN - {TAG_CLOCK}
 
-# Any TAG in range is accepted: a meter configured with the vendor tool can send
-# any of them.
 TAG_MIN = 0x00
 TAG_MAX = 0x4F
 # MAX_ITEM_WIDTH in d101_frame.h.
@@ -128,10 +121,9 @@ def validate_tag_entity(config):
     )
 
 
-# Each source costs two exchanges, ~1 s apiece, so this is how a meter that needs
-# only one stops paying for the rest. Which list holds what is set per meter with
-# the vendor tool; list B was a superset of list A on the reference meter, hence
-# the default. `fixed` publishes what no list carried - chiefly per-phase power.
+# Each source costs two exchanges, ~1 s apiece. Which list holds what is set per
+# meter with the vendor tool; list B was a superset of list A on the reference meter,
+# hence the default. `fixed` publishes what no list carried - chiefly per-phase power.
 SOURCE_LIST_A = "list_a"
 SOURCE_LIST_B = "list_b"
 SOURCE_FIXED = "fixed"
@@ -160,8 +152,7 @@ MAX_REQUEST_BODY = 8
 PROBE_SCHEMA = cv.Schema(
     {
         cv.Required(CONF_DI): cv.hex_int_range(min=0, max=0xFFFF),
-        # Defaults to a single 0x00, the shape DI 0xF201 uses - the most plausible
-        # "no filter" body for a new DI.
+        # Defaults to a single 0x00, the shape DI 0xF201 uses.
         cv.Optional(CONF_BODY, default=[0x00]): cv.All(
             cv.ensure_list(cv.hex_uint8_t), cv.Length(min=0, max=MAX_REQUEST_BODY)
         ),
@@ -210,36 +201,34 @@ CONFIG_SCHEMA = cv.Schema(
             cv.frequency, cv.Range(min=430000000, max=460000000)
         ),
         # Also separates a records half from the status half that continues it, and
-        # the meter's cursor has to survive it - so if a status half comes back with
-        # no leftover records on a working link, try a shorter gap first.
+        # the meter's cursor has to survive it - if a status half comes back with no
+        # leftover records on a working link, try a shorter gap first.
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,
-        # Per on-air attempt. A good reply completes ~965 ms after transmit starts
-        # on the reference meter, with real spread above it; 1000 ms cut into that.
+        # Per on-air attempt. A good reply completes ~965 ms after transmit starts on
+        # the reference meter, with real spread above it.
         cv.Optional(
             CONF_RF_RX_TIMEOUT, default="1800ms"
         ): cv.positive_time_period_milliseconds,
         # Total on-air attempts = 1 + rf_retries.
         cv.Optional(CONF_RF_RETRIES, default=2): cv.int_range(min=0, max=10),
-        # CMT2300A frequency codes (1 code ~= 6.199 Hz); shifts the RX-half LO onto
-        # the meter's reply carrier, a few kHz above our transmit frequency. The
-        # default is proven on hardware - tune only if reception is poor.
+        # CMT2300A frequency codes (1 code ~= 6.199 Hz); shifts the RX-half LO onto the
+        # meter's reply carrier. The default is proven on hardware.
         cv.Optional(CONF_RX_CENTER_OFFSET, default=758): cv.int_range(
             min=-4000, max=4000
         ),
         cv.Optional(CONF_SOURCES, default=[SOURCE_LIST_B]): cv.All(
             cv.ensure_list(cv.one_of(*SOURCES, lower=True)), validate_sources
         ),
-        # Extra reads once per cycle, logged in full and driving no entity. Reads
-        # only - the DL/T 645 control code is hard-wired, so no probe can turn into
-        # a write. That matters: this link also carries a relay-close command.
+        # Extra reads once per cycle, logged in full and driving no entity. Reads only -
+        # the control code is hard-wired, and this link also carries a relay command.
         cv.Optional(CONF_PROBE): cv.All(
             cv.ensure_list(PROBE_SCHEMA), cv.Length(min=1, max=8), validate_probes
         ),
     }
-    # The meter's own display syncs about once an hour; polling far more often than
-    # that buys little and risks colliding with the sync.
+    # The meter's own display syncs about once an hour; polling much more often buys
+    # little and risks colliding with the sync.
 ).extend(cv.polling_component_schema("300s"))
 
 

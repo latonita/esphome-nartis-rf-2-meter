@@ -200,28 +200,7 @@ bool Cmt2300aHal::init() {
   return true;
 }
 
-// Compute the 8-byte frequency bank for rf_freq_hz_ per CMOSTEK AN199 (see
-// cmt2300a_defs.h). TX LO = f_rf; RX LO = f_rf + IF. Matches RFPDK byte-for-byte.
-void Cmt2300aHal::compute_freq_bank_() {
-  auto word = [](uint32_t lo_hz) -> uint32_t {
-    // word = floor(FREQ_LO * DIVIDER / XTAL * 2^20); N = word>>20, K = low 20 bits.
-    return (uint32_t) ((((uint64_t) lo_hz * FREQ_DIVIDER) << 20) / XTAL_HZ);
-  };
-  const uint32_t w_tx = word(this->rf_freq_hz_);
-  const uint32_t w_rx = word(this->rf_freq_hz_ + FREQ_IF_HZ);
-  const uint8_t n_tx = (uint8_t) (w_tx >> 20);
-  const uint32_t k_tx = w_tx & 0xFFFFF;
-  const uint8_t n_rx = (uint8_t) (w_rx >> 20);
-  const uint32_t k_rx = w_rx & 0xFFFFF;
-  this->freq_bank_[0] = n_rx;                                                            // 0x18 FREQ_RX_N
-  this->freq_bank_[1] = k_rx & 0xFF;                                                     // 0x19 FREQ_RX_K[7:0]
-  this->freq_bank_[2] = (k_rx >> 8) & 0xFF;                                              // 0x1A FREQ_RX_K[15:8]
-  this->freq_bank_[3] = (FREQ_PALDO_SEL << 7) | (FREQ_DIVX_CODE << 4) | ((k_rx >> 16) & 0x0F);  // 0x1B
-  this->freq_bank_[4] = n_tx;                                                            // 0x1C FREQ_TX_N
-  this->freq_bank_[5] = k_tx & 0xFF;                                                     // 0x1D FREQ_TX_K[7:0]
-  this->freq_bank_[6] = (k_tx >> 8) & 0xFF;                                              // 0x1E FREQ_TX_K[15:8]
-  this->freq_bank_[7] = (FREQ_FSK_SWT << 7) | (FREQ_VCO_BANK << 4) | ((k_tx >> 16) & 0x0F);  // 0x1F
-}
+void Cmt2300aHal::compute_freq_bank_() { freq_bank_from_hz(this->rf_freq_hz_, this->freq_bank_); }
 
 void Cmt2300aHal::set_frequency(uint32_t freq_hz) {
   this->rf_freq_hz_ = freq_hz;
@@ -258,38 +237,22 @@ void Cmt2300aHal::init_rx(int off_codes) {
   this->spi_write_reg(REG_MODE_CTL, GO_STBY);
   this->wait_for_state(STA_STBY);
   // Sync taken verbatim from the original display: PKT5=0x04 with 0x44=55 0x43=19
-  // 0x42=CF, identical in all six SPI dumps of it and never rewritten between TX and RX.
-  //
-  // The sync bytes sit in on-air order descending from PKT13, held in the on-air
-  // (bit-reversed) domain: 55 19 CF on air is AA 98 F3 in frame terms. That leading AA
-  // is the meter's last preamble byte - it sends exactly 8 of them, and in every capture
-  // where a mis-lock left the preamble sitting in the FIFO all 8 were bit-perfect, so
-  // folding one into the sync costs nothing and narrows the match window 256x.
-  //
-  // SYNC_TOL=0 for the same reason: wherever a reply's body arrived intact its sync word
-  // had arrived with zero bit errors, so tolerance never once helped. What it did do was
-  // widen the window - a 2-byte sync at TOL=2 accepts 137 of 65536 patterns, and the
-  // detector was locking onto noise ahead of the reply on roughly 10% of all attempts.
-  // Every such mis-lock puts the reply in the FIFO at a wrong bit phase, where the frame
-  // layer cannot see it, and can also end the RX window early on a noise byte read as LEN.
-  //
-  // The FIFO still starts at the LEN byte, so the frame layer is unaffected.
+  // 0x42=CF, never rewritten between TX and RX. The bytes are held in the on-air
+  // (bit-reversed) domain, so 55 19 CF on air is AA 98 F3 in frame terms - that
+  // leading AA is the meter's last preamble byte, and folding it in narrows the
+  // match window 256x. SYNC_TOL stays 0: tolerance only widened the window, and the
+  // detector was locking onto noise ahead of the reply on ~10% of attempts, which
+  // leaves the reply in the FIFO at a wrong bit phase. The FIFO still starts at the
+  // LEN byte, so the frame layer is unaffected.
   this->spi_write_reg(REG_PKT5, 0x04);       // SYNC_TOL=0, SYNC_SIZE=2 (3 bytes)
   this->spi_write_reg(REG_PKT13, 0x55);      // SYNC_VALUE<63:56> = 1st byte on air (frame 0xAA)
   this->spi_write_reg(REG_PKT12, 0x19);      // SYNC_VALUE<55:48> = 2nd byte on air (frame 0x98)
   this->spi_write_reg(REG_PKT11, 0xCF);      // SYNC_VALUE<47:40> = 3rd byte on air (frame 0xf3)
-  // Fixed RX length 180, matching the original display (PKT14=0x02 PKT15=0xB4 in all six
-  // SPI dumps of it). PAYLOAD_LENG spans both registers - PKT14<6:4> carries bits 10:8 -
-  // so the ceiling only drops to 180 if those are cleared as well; leaving PKT14 at 0x12
-  // would give 0x1B4 = 436, not 180. Bit 1 is PAYLOAD_BIT_ORDER and stays set, so the chip
-  // still flips the payload bit order for us. (That also means the display runs with the
-  // flip on, not off as HAL_FIXES_FROM_SPI.md §3 reads it - 0x02 differs from our 0x12 only
-  // in the length bits.)
-  //
-  // 180 sits above the 146-byte largest frame the parser will accept and equals the drain
-  // cap, so nothing decodable can be truncated. Per RF_PHY_SPEC.md §4.5 the ceiling MUST be
-  // re-set here on every RX: transmit() leaves the packet engine at the exact TX length, and
-  // an un-restored ceiling truncates every incoming frame.
+  // Fixed RX length 180, matching the original display. PAYLOAD_LENG spans both
+  // registers - PKT14<6:4> carries bits 10:8 - so those must be cleared too, or the
+  // ceiling reads 0x1B4 = 436. Bit 1 is PAYLOAD_BIT_ORDER and stays set. The ceiling
+  // MUST be re-set on every RX: transmit() leaves the packet engine at the exact TX
+  // length, and an un-restored ceiling truncates every incoming frame.
   this->spi_write_reg(REG_PKT14, 0x02);      // PAYLOAD_BIT_ORDER=1, PAYLOAD_LENG<10:8>=0
   this->spi_write_reg(REG_PKT15, 0xB4);      // fixed length 180 (was 0x1FF = 511)
   this->update_reg(REG_INT2_CTL, MASK_INT2_SEL, INT_SEL_RX_FIFO_TH);
@@ -334,9 +297,8 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
   this->spi_write_reg(REG_INT_CLR1, 0x0C);
   this->spi_write_reg(REG_FIFO_CLR, FIFO_RESTORE | FIFO_CLR_RX | FIFO_CLR_TX);
 
-  // Fill the first FIFO-load, then refill as it drains: frames can exceed the
-  // 64-byte merged FIFO (e.g. an 89-byte AARQ), so writing it all at once would
-  // overflow the FIFO and truncate the frame on air.
+  // Fill the first FIFO-load, then refill as it drains: a frame can exceed the
+  // 64-byte merged FIFO, and writing it all at once would truncate it on air.
   size_t written = (tot > FIFO_SIZE_MERGED) ? FIFO_SIZE_MERGED : tot;
   this->write_fifo(fifo, written);
 

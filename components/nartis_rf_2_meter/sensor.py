@@ -37,8 +37,7 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_TAG): validate_numeric_tag,
             cv.Optional(CONF_STATUS): cv.enum(STATUS_FIELDS, lower=True),
-            # Value width for a TAG the decoder does not know. Only meaningful
-            # alongside `tag`.
+            # Value width for a TAG the decoder does not know; needs `tag`.
             cv.Optional(CONF_BYTES): cv.int_range(min=1, max=TAG_MAX_WIDTH),
         }
     ),
@@ -51,8 +50,6 @@ async def to_code(config):
     parent = await cg.get_variable(config[CONF_NARTIS_RF_2_METER_ID])
     var = await sensor.new_sensor(config)
 
-    # tag is meaningless for a status field and vice versa; the C++ side keys off
-    # the status enum being NONE.
     tag = config.get(CONF_TAG, 0)
     field = config.get(CONF_STATUS, StatusField.NONE)
 

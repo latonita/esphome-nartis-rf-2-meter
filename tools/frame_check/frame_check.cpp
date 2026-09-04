@@ -35,9 +35,7 @@ int main() {
   std::printf("frequency      %.3f MHz\n", f / 1e6);
   check(f == 443900000u, "frequency 443.900 MHz for ...060 (k=12, confirmed on air)");
 
-  // The grid steps 0.7 MHz per k, with one extra 100 kHz above k=18 - see
-  // frequency_from_serial in cmt2300a_defs.h for why the break is believed. These
-  // assertions exist to stop a uniform grid creeping back in.
+  // These assertions exist to stop a uniform grid creeping back in.
   auto freq_for_k = [](unsigned k) {
     char serial[13];
     std::snprintf(serial, sizeof(serial), "000000000%03u", k);  // last 3 digits = k, k < 24
@@ -58,8 +56,18 @@ int main() {
   check(freq_for_k(19) == 448900000u, "k=19 -> 448.900 MHz");
   check(freq_for_k(23) == 451700000u, "k=23 -> 451.700 MHz (the top of the documented band)");
 
-  // --- energy request: must match the doc byte-for-byte (LEN 0x17 is odd, so
-  //     HLEN = LEN-1 and LEN^1 agree) ---
+  // The RFPDK export for 443.900 MHz: the k=12 anchor freq_bank_from_hz() has to
+  // reproduce byte for byte, since every other channel's bank comes from the same
+  // formula and no capture pins those.
+  const uint8_t want_bank[FREQUENCY_BANK_SIZE] = {0x44, 0x60, 0x5F, 0x15, 0x44, 0x4A, 0xAD, 0x14};
+  uint8_t bank[FREQUENCY_BANK_SIZE];
+  freq_bank_from_hz(443900000u, bank);
+  hex("freq_bank", bank, sizeof(bank));
+  check(std::memcmp(bank, want_bank, sizeof(bank)) == 0, "frequency bank for 443.900 MHz = RFPDK export");
+  freq_bank_from_hz(frequency_from_serial("023240271060"), bank);
+  check(std::memcmp(bank, want_bank, sizeof(bank)) == 0, "the same bank via the serial-derived channel");
+
+  // --- energy request: LEN 0x17 is odd, so both candidate HLEN rules agree ---
   const uint8_t want_energy[] = {0x98, 0xF3, 0x17, 0x00, 0x01, 0x16, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32, 0x02, 0x68,
                                  0x01, 0x08, 0x33, 0x25, 0x33, 0x33, 0x33, 0x33, 0x34, 0x56, 0x92, 0x16, 0xFE, 0xB0};
   uint8_t buf[MAX_REQUEST_FRAME_SIZE];
@@ -68,9 +76,8 @@ int main() {
   hex("energy doc", want_energy, sizeof(want_energy));
   check(n == sizeof(want_energy) && std::memcmp(buf, want_energy, n) == 0, "energy request matches the capture exactly");
 
-  // --- status request: LEN 0x12 is even, the case where LEN ^ 1 and LEN - 1
-  //     differ. HLEN = LEN ^ 1 is what the display sends and what we now send, so
-  //     this must match the capture byte-for-byte too. ---
+  // --- status request: LEN 0x12 is even, the case where LEN ^ 1 and LEN - 1 differ.
+  //     HLEN = LEN ^ 1 is what the display sends, so this must match byte-for-byte ---
   const uint8_t want_status[] = {0x98, 0xF3, 0x12, 0x00, 0x01, 0x13, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32,
                                  0x02, 0x68, 0x01, 0x03, 0x34, 0x25, 0x33, 0x6B, 0x16, 0x29, 0x0A};
   n = build_request(buf, sizeof(buf), serial, DI_LIST_A_STATUS);
@@ -80,13 +87,11 @@ int main() {
         "status request matches the capture exactly (HLEN = LEN ^ 1)");
   check(buf[5] == 0x13, "status HLEN is LEN ^ 1 = 0x13");
 
-  // Both rules agree on the odd-length energy poll, so only the status poll can
-  // tell them apart - which is why it is the one that matters here.
+  // Only the status poll can tell the two rules apart.
   check((0x17 ^ 1) == (0x17 - 1), "for odd LEN the two HLEN rules coincide");
   check((0x12 ^ 1) != (0x12 - 1), "for even LEN they differ");
 
-  // --- worked-example response from doc section 6 ---
-  // On-air bytes with the 98 F3 sync stripped, as the radio hands them over.
+  // --- worked-example response from doc section 6, sync stripped as the radio does ---
   const uint8_t resp[] = {0x29, 0x00, 0x01, 0x28, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32, 0x02, 0x68,
                           0x81, 0x1A, 0x33, 0x25, 0x37, 0x33, 0x68, 0x7E, 0xFC, 0x33, 0x34, 0x9A,
                           0x2D, 0xBD, 0x33, 0x35, 0x01, 0x83, 0x71, 0x33, 0x5C, 0x8B, 0x87, 0x48,
@@ -132,9 +137,7 @@ int main() {
   check(parse_response(corrupt, sizeof(corrupt), serial, &tmp) == ParseResult::NO_FRAME,
         "a corrupted frame is rejected");
 
-  // Every cycle sends all four list requests, so build_request() has to know all
-  // four - and only those. Three share the long body and so differ from each other
-  // in the DI alone; list A's status half is the one that takes the short body.
+  // build_request() has to know all four list requests and only those.
   uint8_t page_frame[MAX_REQUEST_FRAME_SIZE];
   const size_t page_len = build_request(page_frame, sizeof(page_frame), serial, DI_LIST_A_RECORDS);
   for (uint16_t di : {DI_LIST_A_RECORDS, DI_LIST_B_RECORDS, DI_LIST_B_STATUS}) {
