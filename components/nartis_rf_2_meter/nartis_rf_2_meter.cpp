@@ -11,6 +11,11 @@ namespace esphome::nartis_rf_2_meter {
 
 static const char *const TAG = "nartis_rf_2_meter";
 
+// TEMPORARY: DI 0xF101 is not put on air, so `sources: [fixed]` sends only
+// DI 0xF102 and TAGs 0x0A..0x13 go unfilled. Set to false to restore it -
+// nothing else was changed, the request and the decode are both still there.
+static constexpr bool SKIP_F101 = true;
+
 void NartisRf2MeterComponent::setup() {
   if (this->pin_sdio_ == nullptr || this->pin_sclk_ == nullptr || this->pin_csb_ == nullptr ||
       this->pin_fcsb_ == nullptr || this->pin_gpio3_ == nullptr) {
@@ -376,6 +381,10 @@ void NartisRf2MeterComponent::dump_config() {
 
   if (this->read_fixed_) {
     for (const FixedRequest &req : FIXED_REQUESTS) {
+      if (SKIP_F101 && req.di == DI_FIXED_F101) {
+        ESP_LOGCONFIG(TAG, "  Fixed block DI 0x%04X: temporarily not queried", req.di);
+        continue;
+      }
       const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, req.di);
       if (n == 0) {
         ESP_LOGCONFIG(TAG, "  Fixed block DI 0x%04X: FAILED TO BUILD", req.di);
@@ -511,6 +520,9 @@ void NartisRf2MeterComponent::start_cycle_() {
   // from it yet. Asking for it is the point - the log is the product.
   if (this->read_fixed_) {
     for (uint8_t i = 0; i < FIXED_REQUEST_COUNT; i++) {
+      if (SKIP_F101 && FIXED_REQUESTS[i].di == DI_FIXED_F101) {
+        continue;
+      }
       this->steps_[this->step_count_++] = Step{StepKind::FIXED, i};
       this->fixed_polled_ |= static_cast<uint8_t>(1u << i);
     }
