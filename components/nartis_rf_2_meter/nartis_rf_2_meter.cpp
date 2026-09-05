@@ -318,6 +318,7 @@ void NartisRf2MeterComponent::dump_config() {
                 YESNO(this->need_data_ || this->need_status_));
   ESP_LOGCONFIG(TAG, "  Values are published scaled to the unit in tags.md - no multiply filter needed");
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
+  LOG_SENSOR("  ", "RSSI", this->rssi_sensor_);
   LOG_PIN("  SDIO pin: ", this->pin_sdio_);
   LOG_PIN("  SCLK pin: ", this->pin_sclk_);
   LOG_PIN("  CSB pin: ", this->pin_csb_);
@@ -446,6 +447,7 @@ void NartisRf2MeterComponent::start_cycle_() {
     this->list_arrived_[l] = 0;
   }
   this->attempt_ = 0;
+  this->rssi_valid_ = false;
 
   this->f101_ok_ = false;
   this->f102_len_ = 0;
@@ -616,6 +618,7 @@ void NartisRf2MeterComponent::handle_wait_() {
   if (this->poll_rx_() == RxPoll::COMPLETE) {
     // Read RSSI while still in RX - go_standby() would invalidate it.
     this->last_rssi_dbm_ = this->hal_.get_rssi_dbm();
+    this->rssi_valid_ = true;
 
     // Always show what came off the air, whether or not it decodes - this is the
     // primary record for working out an unfamiliar meter's indication set.
@@ -794,6 +797,11 @@ void NartisRf2MeterComponent::handle_publish_() {
   }
   this->publish_cycle_outcome_(!any_list ||
                                ((!this->need_data_ || any_records) && (!this->need_status_ || this->status_ok_)));
+
+  if (this->rssi_sensor_ != nullptr && this->rssi_valid_) {
+    this->rssi_sensor_->publish_state(this->last_rssi_dbm_);
+    ESP_LOGD(TAG, "  -> '%s' = %d dBm", this->rssi_sensor_->get_name().c_str(), this->last_rssi_dbm_);
+  }
 }
 
 void NartisRf2MeterComponent::publish_cycle_outcome_(bool ok) {

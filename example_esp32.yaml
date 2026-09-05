@@ -41,10 +41,16 @@ nartis_rf_2_meter:
   # rf_rx_timeout: 1800ms
   # rf_retries: 2
   # rx_center_offset: 758
+  # Diagnostic: signal level of the last reply heard in a cycle. dBm, device class
+  # and diagnostic category are set for you - a name is all it needs. A cycle that
+  # heard nothing publishes nothing, so the entity holds instead of reading a floor.
+  rssi:
+    name: "Meter RSSI"                   # Уровень сигнала
 
-# Values arrive raw, so each entity states its own scaling with a `multiply` filter.
-# Every cycle reads DI 0xF200, 0xF201, 0xF202 and 0xF203 and merges them, so a TAG
-# stays unavailable only if the meter's indication set has no such parameter.
+# Values are published already scaled to the unit tags.md names, so no `multiply`
+# filter - one would scale them twice. Every cycle reads DI 0xF200, 0xF201, 0xF202
+# and 0xF203 and merges them, so a TAG stays unavailable only if the meter's
+# indication set has no such parameter.
 sensor:
   # Active energy, import (A+)
   - platform: nartis_rf_2_meter
@@ -54,7 +60,6 @@ sensor:
     accuracy_decimals: 3
     device_class: energy
     state_class: total_increasing
-    filters: [multiply: 0.001]
 
   - platform: nartis_rf_2_meter
     name: "Active energy T1"             # Тариф 1 (день)
@@ -63,7 +68,6 @@ sensor:
     accuracy_decimals: 3
     device_class: energy
     state_class: total_increasing
-    filters: [multiply: 0.001]
 
   - platform: nartis_rf_2_meter
     name: "Active energy T2"             # Тариф 2 (ночь)
@@ -72,7 +76,6 @@ sensor:
     accuracy_decimals: 3
     device_class: energy
     state_class: total_increasing
-    filters: [multiply: 0.001]
 
   # Active energy, export (A-)
   - platform: nartis_rf_2_meter
@@ -82,7 +85,6 @@ sensor:
     accuracy_decimals: 3
     device_class: energy
     state_class: total_increasing
-    filters: [multiply: 0.001]
 
   - platform: nartis_rf_2_meter
     name: "Active energy export T1"
@@ -91,7 +93,6 @@ sensor:
     accuracy_decimals: 3
     device_class: energy
     state_class: total_increasing
-    filters: [multiply: 0.001]
 
   - platform: nartis_rf_2_meter
     name: "Active energy export T2"
@@ -100,7 +101,6 @@ sensor:
     accuracy_decimals: 3
     device_class: energy
     state_class: total_increasing
-    filters: [multiply: 0.001]
 
   # Phase voltages
   - platform: nartis_rf_2_meter
@@ -110,7 +110,6 @@ sensor:
     accuracy_decimals: 1
     device_class: voltage
     state_class: measurement
-    filters: [multiply: 0.1]
 
   - platform: nartis_rf_2_meter
     name: "Voltage L2"                   # Напряжение фазы B
@@ -119,7 +118,6 @@ sensor:
     accuracy_decimals: 1
     device_class: voltage
     state_class: measurement
-    filters: [multiply: 0.1]
 
   - platform: nartis_rf_2_meter
     name: "Voltage L3"                   # Напряжение фазы C
@@ -128,7 +126,6 @@ sensor:
     accuracy_decimals: 1
     device_class: voltage
     state_class: measurement
-    filters: [multiply: 0.1]
 
   # Currents
   - platform: nartis_rf_2_meter
@@ -138,7 +135,6 @@ sensor:
     accuracy_decimals: 2
     device_class: current
     state_class: measurement
-    filters: [multiply: 0.01]
 
   - platform: nartis_rf_2_meter
     name: "Current L1"                   # Ток фазы A
@@ -147,7 +143,6 @@ sensor:
     accuracy_decimals: 2
     device_class: current
     state_class: measurement
-    filters: [multiply: 0.01]
 
   - platform: nartis_rf_2_meter
     name: "Current L2"                   # Ток фазы B
@@ -156,7 +151,6 @@ sensor:
     accuracy_decimals: 2
     device_class: current
     state_class: measurement
-    filters: [multiply: 0.01]
 
   - platform: nartis_rf_2_meter
     name: "Current L3"                   # Ток фазы C
@@ -165,7 +159,6 @@ sensor:
     accuracy_decimals: 2
     device_class: current
     state_class: measurement
-    filters: [multiply: 0.01]
 
   # Power and frequency - the meter sends kW, so x10 gives watts.
   - platform: nartis_rf_2_meter
@@ -175,7 +168,6 @@ sensor:
     accuracy_decimals: 0
     device_class: power
     state_class: measurement
-    filters: [multiply: 10]
 
   - platform: nartis_rf_2_meter
     name: "Frequency"                    # Частота сети
@@ -184,7 +176,6 @@ sensor:
     accuracy_decimals: 2
     device_class: frequency
     state_class: measurement
-    filters: [multiply: 0.01]
 
   # Status block (DI 0xF201)
   - platform: nartis_rf_2_meter

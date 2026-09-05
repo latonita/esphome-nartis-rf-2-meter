@@ -24,7 +24,18 @@ unit, published raw.
 from esphome import pins
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.const import CONF_ADDRESS, CONF_FREQUENCY, CONF_ID
+# The dotted form on purpose: this package has its own sensor.py, and a plain
+# `from esphome.components import sensor` resolves to that one instead.
+from esphome.components.sensor import new_sensor, sensor_schema
+from esphome.const import (
+    CONF_ADDRESS,
+    CONF_FREQUENCY,
+    CONF_ID,
+    DEVICE_CLASS_SIGNAL_STRENGTH,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+    STATE_CLASS_MEASUREMENT,
+    UNIT_DECIBEL_MILLIWATT,
+)
 
 CODEOWNERS = ["@latonita"]
 # The component header includes binary_sensor's type unconditionally, so it has to
@@ -45,6 +56,7 @@ CONF_RF_RETRIES = "rf_retries"
 CONF_RX_CENTER_OFFSET = "rx_center_offset"
 
 CONF_SOURCES = "sources"
+CONF_RSSI = "rssi"
 
 CONF_PROBE = "probe"
 CONF_DI = "di"
@@ -226,6 +238,16 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_PROBE): cv.All(
             cv.ensure_list(PROBE_SCHEMA), cv.Length(min=1, max=8), validate_probes
         ),
+        # Radio-level diagnostic, not a meter value: the RSSI of the last reply heard
+        # in a cycle. Published only for a cycle that heard something, so it holds
+        # rather than reporting a floor while the link is down.
+        cv.Optional(CONF_RSSI): sensor_schema(
+            unit_of_measurement=UNIT_DECIBEL_MILLIWATT,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_SIGNAL_STRENGTH,
+            state_class=STATE_CLASS_MEASUREMENT,
+            entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+        ),
     }
     # The meter's own display syncs about once an hour; polling much more often buys
     # little and risks colliding with the sync.
@@ -263,6 +285,9 @@ async def to_code(config):
             SOURCE_FIXED in sources,
         )
     )
+
+    if CONF_RSSI in config:
+        cg.add(var.set_rssi_sensor(await new_sensor(config[CONF_RSSI])))
 
     for probe in config.get(CONF_PROBE, []):
         cg.add(var.add_probe(probe[CONF_DI], probe[CONF_BODY]))

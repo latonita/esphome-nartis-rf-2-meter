@@ -8,8 +8,6 @@
 // Meters:
 //   3ph = Wasion DTSD341-MB530 1-0(240411)   (NARTIS-I300)
 //   1ph = Wasion DDSD101-Z860  1-0(240406)   (NARTIS 1-phase)
-// Derived from firmware (Z860_DLT645_F2xx_Handler / DLT645_F2xx_Handler).
-// See DDSD101_Z860_DLT645.md §3b and DTSD341_DLT645_F2xx.md §5b/§5c.
 
 #ifndef NARTIS_DLT645_F1XX_H
 #define NARTIS_DLT645_F1XX_H

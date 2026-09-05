@@ -91,6 +91,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   }
 
   void set_last_read_ok_binary_sensor(esphome::binary_sensor::BinarySensor *s) { this->last_read_ok_bs_ = s; }
+  /// Diagnostic entity for the RSSI of the last reply heard in a cycle.
+  void set_rssi_sensor(esphome::sensor::Sensor *s) { this->rssi_sensor_ = s; }
 
   void set_request_gap_ms(uint32_t ms) { this->request_gap_ms_ = ms; }
   void set_rf_rx_timeout_ms(uint32_t ms) { this->rf_rx_timeout_ms_ = ms; }
@@ -160,6 +162,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   Cmt2300aHal hal_;
 
   esphome::binary_sensor::BinarySensor *last_read_ok_bs_{nullptr};
+  esphome::sensor::Sensor *rssi_sensor_{nullptr};
 
   esphome::InternalGPIOPin *pin_sdio_{nullptr};
   esphome::InternalGPIOPin *pin_sclk_{nullptr};
@@ -259,6 +262,9 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint32_t retry_count_{0};
   uint32_t giveup_count_{0};
   int8_t last_rssi_dbm_{0};
+  /// Whether last_rssi_dbm_ was measured in THIS cycle. A cycle that heard nothing
+  /// publishes no RSSI rather than repeating the last one or a floor value.
+  bool rssi_valid_{false};
   /// Bit per LIST_REQUESTS entry asked for at all, and answered at least once.
   uint8_t requests_polled_{0};
   uint8_t requests_seen_{0};
