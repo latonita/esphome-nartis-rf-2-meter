@@ -11,10 +11,6 @@ namespace esphome::nartis_rf_2_meter {
 
 static const char *const TAG = "nartis_rf_2_meter";
 
-// TEMPORARY: DI 0xF101 is not put on air, so TAGs 0x0A..0x13 go unfilled. Set to
-// false to restore it - the request and the decode are both still there.
-static constexpr bool SKIP_F101 = true;
-
 void NartisRf2MeterComponent::setup() {
   if (this->pin_sdio_ == nullptr || this->pin_sclk_ == nullptr || this->pin_csb_ == nullptr ||
       this->pin_fcsb_ == nullptr || this->pin_gpio3_ == nullptr) {
@@ -127,6 +123,7 @@ void NartisRf2MeterComponent::handle_fixed_reply_(uint8_t fixed_idx, const Parse
       // Length is the variant, so it is what gets stored.
       std::memcpy(this->f102_raw_, resp.payload, resp.payload_len);
       this->f102_len_ = resp.payload_len;
+      this->f102_layout_len_ = resp.payload_len;
       this->log_f102_();
       return;
 
@@ -272,7 +269,7 @@ void NartisRf2MeterComponent::report_silent_fixed_() {
     }
     ESP_LOGW(TAG,
              "Fixed block DI 0x%04X has not answered once in %" PRIu32 " cycle(s) - most likely this meter "
-             "does not implement it. It still costs one exchange per cycle",
+             "does not implement it. It costs an exchange on every cycle a list leaves one of its TAGs unfilled",
              FIXED_REQUESTS[i].di, this->cycles_);
   }
 }
@@ -343,11 +340,8 @@ void NartisRf2MeterComponent::dump_config() {
   }
 
   if (this->read_fixed_) {
+    ESP_LOGCONFIG(TAG, "  Fixed blocks are requested only when a list left a TAG an entity reads unfilled");
     for (const FixedRequest &req : FIXED_REQUESTS) {
-      if (SKIP_F101 && req.di == DI_FIXED_F101) {
-        ESP_LOGCONFIG(TAG, "  Fixed block DI 0x%04X: temporarily not queried", req.di);
-        continue;
-      }
       const size_t n = build_request(frame.data(), frame.size(), this->serial_le_, req.di);
       if (n == 0) {
         ESP_LOGCONFIG(TAG, "  Fixed block DI 0x%04X: FAILED TO BUILD", req.di);
@@ -404,6 +398,9 @@ void NartisRf2MeterComponent::register_sensor(esphome::sensor::Sensor *s, uint8_
   this->entries_.push_back(e);
   if (field == StatusField::NONE) {
     this->need_data_ = true;
+    if (tag < TAG_WIDTH_TABLE_SIZE) {
+      this->wanted_tag_[tag] = true;
+    }
   } else {
     this->need_status_ = true;
   }
@@ -419,6 +416,9 @@ void NartisRf2MeterComponent::register_text_sensor(esphome::text_sensor::TextSen
   this->entries_.push_back(e);
   if (field == StatusField::NONE) {
     this->need_data_ = true;
+    if (tag < TAG_WIDTH_TABLE_SIZE) {
+      this->wanted_tag_[tag] = true;
+    }
   } else {
     this->need_status_ = true;
   }
@@ -472,12 +472,39 @@ void NartisRf2MeterComponent::start_cycle_() {
     }
   }
 
-  // The fixed blocks go last. A request of any kind drops the lists' cursor, so
-  // they must not land between a records half and its status half. Not
-  // capability-gated: asking for them is the point, the log is the product.
+  // The fixed blocks and the probes are planned after the last list answers, by
+  // plan_tail_steps_(). With no list to wait for there is nothing to learn, so the
+  // gate runs here instead.
+  this->tail_planned_ = false;
+  if (this->step_count_ == 0) {
+    this->plan_tail_steps_();
+  }
+
+  if (this->step_count_ > 0) {
+    this->set_state_(State::TX_REQUEST);
+  }
+}
+
+/* The gate between the lists and the fixed blocks.
+ *
+ * A fixed block costs a full exchange and publishes only through the TAGs it maps,
+ * so it is worth asking for exactly when some entity's TAG is in its map and no
+ * list carried that TAG this cycle - which is also true when the lists went
+ * unanswered, making this the fallback path as well. `sources: fixed` permits the
+ * read; it no longer commands it.
+ *
+ * The probes are not gated: nothing consumes them, their log is the product.
+ *
+ * Ordering: a request of any kind drops the lists' leftover-record cursor, so
+ * everything planned here has to come after both halves of every list - which it
+ * does, being appended once the last list step is done.
+ */
+void NartisRf2MeterComponent::plan_tail_steps_() {
+  this->tail_planned_ = true;
+
   if (this->read_fixed_) {
     for (uint8_t i = 0; i < FIXED_REQUEST_COUNT; i++) {
-      if (SKIP_F101 && FIXED_REQUESTS[i].di == DI_FIXED_F101) {
+      if (!this->fixed_step_wanted_(i)) {
         continue;
       }
       this->steps_[this->step_count_++] = Step{StepKind::FIXED, i};
@@ -488,10 +515,42 @@ void NartisRf2MeterComponent::start_cycle_() {
   for (uint8_t i = 0; i < this->probe_count_; i++) {
     this->steps_[this->step_count_++] = Step{StepKind::PROBE, i};
   }
+}
 
-  if (this->step_count_ > 0) {
-    this->set_state_(State::TX_REQUEST);
+bool NartisRf2MeterComponent::fixed_step_wanted_(uint8_t fixed_idx) const {
+  if (FIXED_REQUESTS[fixed_idx].di == DI_FIXED_F101) {
+    return this->map_fills_wanted_(F101_MAP, F101_VALUE_COUNT);
   }
+
+  // DI 0xF102: which map applies is the reply's own length, so before the first
+  // reply the gate judges against the three-phase map - the superset of the two.
+  // That is the one read that learns the layout; from then on the real map is used,
+  // and a single-phase meter stops being asked for values it cannot answer with.
+  const FixedValue *map = F102_3PH_MAP;
+  uint8_t count = F102_3PH_VALUE_COUNT;
+  if (this->f102_layout_len_ != 0) {
+    count = f102_value_map(this->f102_layout_len_, &map);
+  }
+  return this->map_fills_wanted_(map, count);
+}
+
+bool NartisRf2MeterComponent::map_fills_wanted_(const FixedValue *map, uint8_t count) const {
+  if (map == nullptr) {
+    return false;
+  }
+  for (uint8_t i = 0; i < count; i++) {
+    const uint8_t tag = map[i].tag;
+    if (tag >= TAG_WIDTH_TABLE_SIZE || !this->wanted_tag_[tag]) {
+      continue;
+    }
+    // Presence in merged_ is the test, not a decoded value: resolve_values_() gives
+    // a list record priority over a fixed field either way, so a TAG a list carried
+    // is a TAG this block cannot contribute to.
+    if (this->find_merged_(tag) == nullptr) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint16_t NartisRf2MeterComponent::current_di_() const {
@@ -715,9 +774,12 @@ void NartisRf2MeterComponent::finish_exchange_() {
   this->hal_.go_standby();
   this->rx_len_ = 0;
 
-  // Every step in the list is sent; nothing is conditional on what an earlier reply
-  // held.
+  // Every planned step is sent, whatever the replies held. The one decision a cycle
+  // makes is which fixed blocks to plan, once the lists are in.
   this->step_idx_++;
+  if (this->step_idx_ >= this->step_count_ && !this->tail_planned_) {
+    this->plan_tail_steps_();
+  }
   if (this->step_idx_ < this->step_count_) {
     this->set_state_(State::GAP);
     return;

@@ -14,6 +14,12 @@ default list B alone:
 A status half must follow its own records half back to back: the leftover records
 come from a cursor the meter drops as soon as anything else is asked.
 
+`fixed` permits the fixed blocks rather than commanding them: they are put on air
+only at the end of a cycle whose lists left a TAG some entity reads unfilled - the
+per-phase power a list does not carry, the reactive energy in DI 0xF101, or
+anything at all when the lists went unanswered. A meter whose list already answers
+the whole configuration never spends the exchange.
+
 An entity selects a value by its 1-byte item TAG, or by a status-block field. Every
 reply is folded into one value per TAG, the list winning where both sources carry
 one, and published already scaled to the unit tags.md gives - so a `multiply`
@@ -133,9 +139,10 @@ def validate_tag_entity(config):
     )
 
 
-# Each source costs two exchanges, ~1 s apiece. Which list holds what is set per
+# Each list costs two exchanges, ~1 s apiece. Which list holds what is set per
 # meter with the vendor tool; list B was a superset of list A on the reference meter,
-# hence the default. `fixed` publishes what no list carried - chiefly per-phase power.
+# hence the default. `fixed` allows the fixed blocks to fill what no list carried -
+# chiefly per-phase power - one exchange each, and only on the cycles that need them.
 SOURCE_LIST_A = "list_a"
 SOURCE_LIST_B = "list_b"
 SOURCE_FIXED = "fixed"

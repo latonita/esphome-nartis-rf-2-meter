@@ -16,6 +16,12 @@
  * list's status half must follow its own records half back to back - see
  * LIST_REQUESTS.
  *
+ * The cycle is planned in two parts. The lists are planned up front; the fixed
+ * blocks and the probes are planned once the last list exchange is done, by
+ * plan_tail_steps_(), so that a fixed block goes on air only when it maps a TAG
+ * some entity wants and no list delivered. On a meter whose list already carries
+ * everything configured, that is one exchange saved every cycle.
+ *
  * SAFETY: read-only by construction. Every frame comes from build_read_request(),
  * which hard-wires the DL/T 645 control code to "read data". This link can also
  * command the meter's load relay, so do not add a write path and do not fuzz for
@@ -137,6 +143,13 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// TAG wins.
   void merge_records_(const ParsedResponse &resp);
   const ParsedItem *find_merged_(uint8_t tag) const;
+  /// Plan the rest of the cycle - the fixed blocks worth asking for, then the
+  /// probes. Called once a cycle, after the last list exchange has been folded in.
+  void plan_tail_steps_();
+  /// Whether this cycle still has something to gain from a fixed block.
+  bool fixed_step_wanted_(uint8_t fixed_idx) const;
+  /// Whether any field of `map` names a TAG an entity wants and no list carried.
+  bool map_fills_wanted_(const FixedValue *map, uint8_t count) const;
   void report_silent_requests_();
   void handle_publish_();
   void publish_cycle_outcome_(bool ok);
@@ -211,6 +224,8 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   std::array<Step, LIST_REQUEST_COUNT + FIXED_REQUEST_COUNT + MAX_PROBES> steps_{};
   uint8_t step_count_{0};
   uint8_t step_idx_{0};
+  /// Whether plan_tail_steps_() has already run for this cycle.
+  bool tail_planned_{false};
 
   void handle_list_reply_(uint8_t request_idx, const ParsedResponse &resp);
   void warn_unexpected_half_once_(uint8_t request_idx, const ParsedResponse &resp);
@@ -219,6 +234,10 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void log_f101_() const;
   void report_silent_fixed_();
   void log_f102_() const;
+
+  /// TAGs an entity reads, by TAG. What a cycle is trying to fill, and so what
+  /// decides whether a fixed block is worth an exchange.
+  bool wanted_tag_[TAG_WIDTH_TABLE_SIZE]{};
 
   /// YAML-declared widths by TAG, 0 = none. Consulted only for unknown TAGs.
   uint8_t tag_width_[TAG_WIDTH_TABLE_SIZE]{};
@@ -246,6 +265,11 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   bool f101_ok_{false};
   uint8_t f102_raw_[sizeof(f102_3ph)]{};
   uint8_t f102_len_{0};
+  /// The DI 0xF102 length last seen, kept across cycles. Nothing else says which
+  /// layout this meter has, so until one reply has arrived the gate has to assume
+  /// the three-phase map - which is what makes the first F102 read the one that
+  /// learns the layout.
+  uint8_t f102_layout_len_{0};
 
   /// Bit per LIST_REQUESTS entry that answered this cycle.
   uint8_t answered_{0};
