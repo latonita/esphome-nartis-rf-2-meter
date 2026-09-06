@@ -47,10 +47,12 @@ nartis_rf_2_meter:
   rssi:
     name: "Meter RSSI"                   # Уровень сигнала
 
-# Values are published already scaled to the unit tags.md names, so no `multiply`
-# filter - one would scale them twice. Every cycle reads DI 0xF200, 0xF201, 0xF202
-# and 0xF203 and merges them, so a TAG stays unavailable only if the meter's
-# indication set has no such parameter.
+  sources: 
+    #- list_1
+    - list_2
+    #- fix_1
+    - fix_2
+
 sensor:
   # Active energy, import (A+)
   - platform: nartis_rf_2_meter

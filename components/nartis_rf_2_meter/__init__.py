@@ -187,7 +187,7 @@ def validate_address(value) -> str:
     if not s.isdigit() or len(s) != 12:
         raise cv.Invalid(
             f"address must be exactly 12 digits (the meter serial, e.g. "
-            f"'023240271060'); got {len(s)} characters '{s}'"
+            f"'023240123456'); got {len(s)} characters '{s}'"
         )
     return s
 
@@ -200,17 +200,13 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_PIN_CSB): pins.internal_gpio_output_pin_schema,
         cv.Required(CONF_PIN_FCSB): pins.internal_gpio_output_pin_schema,
         cv.Required(CONF_PIN_GPIO3): pins.internal_gpio_input_pin_schema,
-        # The DL/T 645 address; its last 3 digits also select the channel.
         cv.Required(CONF_ADDRESS): validate_address,
         cv.Optional(CONF_FREQUENCY): cv.All(
             cv.frequency, cv.Range(min=430000000, max=460000000)
         ),
-        # The meter's cursor has to survive this gap: if a status half comes back with
-        # no leftover records on a working link, try a shorter one first.
         cv.Optional(
-            CONF_REQUEST_GAP, default="500ms"
+            CONF_REQUEST_GAP, default="300ms"
         ): cv.positive_time_period_milliseconds,
-        # Per on-air attempt; a good reply completes ~965 ms after transmit starts.
         cv.Optional(
             CONF_RF_RX_TIMEOUT, default="1800ms"
         ): cv.positive_time_period_milliseconds,
@@ -227,8 +223,6 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_PROBE): cv.All(
             cv.ensure_list(PROBE_SCHEMA), cv.Length(min=1, max=8), validate_probes
         ),
-        # Published only for a cycle that heard something, so it holds rather than
-        # reporting a floor while the link is down.
         cv.Optional(CONF_RSSI): sensor_schema(
             unit_of_measurement=UNIT_DECIBEL_MILLIWATT,
             accuracy_decimals=0,
@@ -237,8 +231,6 @@ CONFIG_SCHEMA = cv.Schema(
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
     }
-    # The meter's own display syncs about once an hour; polling much more often buys
-    # little and risks colliding with the sync.
 ).extend(cv.polling_component_schema("300s"))
 
 
