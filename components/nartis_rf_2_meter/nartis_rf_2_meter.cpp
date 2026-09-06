@@ -175,7 +175,7 @@ void NartisRf2MeterComponent::log_f101_() const {
     }
   }
 
-  ESP_LOGD(TAG, "  stat  %s",
+  ESP_LOGV(TAG, "  stat  %s",
            format_hex_pretty(reinterpret_cast<const uint8_t *>(&b.status), sizeof(b.status)).c_str());
 }
 
@@ -526,9 +526,10 @@ bool NartisRf2MeterComponent::send_request_() {
     this->requests_polled_ |= static_cast<uint8_t>(1u << step.idx);
   }
 
-  ESP_LOGD(TAG, "TX DI 0x%04X%s attempt %u: %s", di,
+  ESP_LOGD(TAG, "TX DI 0x%04X%s attempt %u (%zu bytes)", di,
            (step.kind == StepKind::STEP_KIND_PROBE) ? LOG_STR_LITERAL(" (probe)") : LOG_STR_LITERAL(""),
-           this->attempt_, format_hex_pretty(this->tx_buf_.data(), this->tx_len_).c_str());
+           this->attempt_, this->tx_len_);
+  ESP_LOGV(TAG, "  TX frame: %s", format_hex_pretty(this->tx_buf_.data(), this->tx_len_).c_str());
 
   // transmit() is synchronous: it applies the TX profile, fills the FIFO and blocks
   // until TX_DONE - tens of milliseconds for a 28-byte frame at 1.2 kbps.
@@ -583,10 +584,10 @@ void NartisRf2MeterComponent::handle_wait_() {
     this->last_rssi_dbm_ = this->hal_.get_rssi_dbm();
     this->rssi_valid_ = true;
 
-    // Always show what came off the air, whether or not it decodes - this is the
-    // primary record for working out an unfamiliar meter's indication set.
-    ESP_LOGD(TAG, "RX rssi=%d dBm: %s", this->last_rssi_dbm_,
-             format_hex_pretty(this->rx_buf_.data(), this->rx_len_).c_str());
+    // The bytes go out whether or not they decode - they are the primary record for
+    // working out an unfamiliar meter's indication set.
+    ESP_LOGD(TAG, "RX rssi=%d dBm (%zu bytes)", this->last_rssi_dbm_, this->rx_len_);
+    ESP_LOGV(TAG, "  RX frame: %s", format_hex_pretty(this->rx_buf_.data(), this->rx_len_).c_str());
 
     ParsedResponse resp{};
     const ParseResult r = parse_response(this->rx_buf_.data(), this->rx_len_, this->serial_le_, &resp,
@@ -653,7 +654,7 @@ void NartisRf2MeterComponent::handle_wait_() {
       ESP_LOGW(TAG, "DI 0x%04X: incomplete reply (%zu bytes) within %" PRIu32 " ms", di, this->rx_len_,
                this->rf_rx_timeout_ms_);
       // A truncated frame still says the meter answered, and often how far it got.
-      ESP_LOGD(TAG, "RX partial: %s", format_hex_pretty(this->rx_buf_.data(), this->rx_len_).c_str());
+      ESP_LOGV(TAG, "  RX partial: %s", format_hex_pretty(this->rx_buf_.data(), this->rx_len_).c_str());
     }
     this->retry_or_finish_();
   }
@@ -843,7 +844,7 @@ void NartisRf2MeterComponent::log_items_(const ParsedResponse &resp, bool warn) 
 }
 
 void NartisRf2MeterComponent::log_response_(const ParsedResponse &resp) const {
-  ESP_LOGVV(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
+  ESP_LOGV(TAG, "  payload: %s", format_hex_pretty(resp.payload, resp.payload_len).c_str());
   if (resp.announced_count > resp.count) {
     // Normal: the meter announces its whole record set and sends what fits.
     ESP_LOGV(TAG, "  page holds %u of the %u record(s) the meter announced", resp.count, resp.announced_count);
