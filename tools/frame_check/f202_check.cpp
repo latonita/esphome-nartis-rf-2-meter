@@ -114,26 +114,26 @@ int main() {
   const ParseResult pr = parse_response(frame, len, serial, &r);
   std::printf("parse: %s, DI 0x%04X, count %u, payload %u B\n", parse_result_to_string(pr), r.di, r.count,
               r.payload_len);
-  check(pr == ParseResult::OK, "page parses");
-  check(r.di == DI_LIST_B_RECORDS, "DI is 0xF202");
+  check(pr == ParseResult::PARSE_RESULT_OK, "page parses");
+  check(r.di == DI_LIST_2_RECORDS, "DI is 0xF202");
   check(r.count == 15, "15 records");
   check(r.payload_len == 0x51, "DATA length is 0x51 = 81, as captured");
 
   static const Expect want[] = {
-      {0x00, 4, TagEnc::UINT_LE, 13421097, "13421.097 kWh"},
-      {0x01, 4, TagEnc::UINT_LE, 9266781, "9266.781 kWh"},
-      {0x02, 4, TagEnc::UINT_LE, 4154316, "4154.316 kWh"},
-      {0x05, 4, TagEnc::UINT_LE, 0, "0 (A- total)"},
-      {0x06, 4, TagEnc::UINT_LE, 0, "0"},
-      {0x07, 4, TagEnc::UINT_LE, 0, "0"},
-      {0x15, 4, TagEnc::BCD_LE, 2331, "233.1 V"},
-      {0x16, 4, TagEnc::BCD_LE, 2317, "231.7 V"},
-      {0x17, 4, TagEnc::BCD_LE, 2336, "233.6 V"},
-      {0x1C, 4, TagEnc::BCD_LE, 1774, "17.74 A neutral"},
-      {0x1D, 4, TagEnc::BCD_LE, 1286, "12.86 A"},
-      {0x1E, 4, TagEnc::BCD_LE, 1117, "11.17 A"},
-      {0x20, 4, TagEnc::BCD_LE_SIGNED, 795, "7.95 kW"},
-      {0x28, 4, TagEnc::BCD_LE, 4999, "49.99 Hz"},
+      {0x00, 4, TagEnc::TAG_ENC_UINT_LE, 13421097, "13421.097 kWh"},
+      {0x01, 4, TagEnc::TAG_ENC_UINT_LE, 9266781, "9266.781 kWh"},
+      {0x02, 4, TagEnc::TAG_ENC_UINT_LE, 4154316, "4154.316 kWh"},
+      {0x05, 4, TagEnc::TAG_ENC_UINT_LE, 0, "0 (A- total)"},
+      {0x06, 4, TagEnc::TAG_ENC_UINT_LE, 0, "0"},
+      {0x07, 4, TagEnc::TAG_ENC_UINT_LE, 0, "0"},
+      {0x15, 4, TagEnc::TAG_ENC_BCD_LE, 2331, "233.1 V"},
+      {0x16, 4, TagEnc::TAG_ENC_BCD_LE, 2317, "231.7 V"},
+      {0x17, 4, TagEnc::TAG_ENC_BCD_LE, 2336, "233.6 V"},
+      {0x1C, 4, TagEnc::TAG_ENC_BCD_LE, 1774, "17.74 A neutral"},
+      {0x1D, 4, TagEnc::TAG_ENC_BCD_LE, 1286, "12.86 A"},
+      {0x1E, 4, TagEnc::TAG_ENC_BCD_LE, 1117, "11.17 A"},
+      {0x20, 4, TagEnc::TAG_ENC_BCD_LE_SIGNED, 795, "7.95 kW"},
+      {0x28, 4, TagEnc::TAG_ENC_BCD_LE, 4999, "49.99 Hz"},
   };
 
   std::printf("\n");
@@ -153,10 +153,10 @@ int main() {
     // `raw` is a magnitude, so a signed BCD row is compared on its magnitude.
     uint32_t got = 0;
     bool ok = true;
-    const bool is_bcd = (e.enc == TagEnc::BCD_LE) || (e.enc == TagEnc::BCD_LE_SIGNED);
-    if (e.enc == TagEnc::BCD_LE) {
+    const bool is_bcd = (e.enc == TagEnc::TAG_ENC_BCD_LE) || (e.enc == TagEnc::TAG_ENC_BCD_LE_SIGNED);
+    if (e.enc == TagEnc::TAG_ENC_BCD_LE) {
       ok = item_as_bcd(*item, &got);
-    } else if (e.enc == TagEnc::BCD_LE_SIGNED) {
+    } else if (e.enc == TagEnc::TAG_ENC_BCD_LE_SIGNED) {
       int32_t signed_got = 0;
       ok = item_as_bcd_signed(*item, &signed_got);
       got = static_cast<uint32_t>((signed_got < 0) ? -signed_got : signed_got);
@@ -185,7 +185,7 @@ int main() {
 
   // The truncation that hid this page: 90 bytes must be rejected, not half-parsed.
   ParsedResponse trunc{};
-  check(parse_response(frame, 90, serial, &trunc) != ParseResult::OK, "a 90-byte truncation is rejected");
+  check(parse_response(frame, 90, serial, &trunc) != ParseResult::PARSE_RESULT_OK, "a 90-byte truncation is rejected");
 
   // A live page from a second meter whose COUNT byte says 24 while DATA holds 16
   // records. COUNT is an upper bound; taking it literally used to reject the page.
@@ -198,8 +198,8 @@ int main() {
   const ParseResult pr2 = parse_response(frame2, len2, serial2, &r2);
   std::printf("parse: %s, DI 0x%04X, count %u of %u announced, payload %u B\n", parse_result_to_string(pr2), r2.di,
               r2.count, r2.announced_count, r2.payload_len);
-  check(pr2 == ParseResult::OK, "short page parses");
-  check(r2.di == DI_LIST_B_RECORDS, "DI is 0xF202");
+  check(pr2 == ParseResult::PARSE_RESULT_OK, "short page parses");
+  check(r2.di == DI_LIST_2_RECORDS, "DI is 0xF202");
   check(r2.count == 16, "16 records decoded");
   check(r2.announced_count == 24, "COUNT byte reported as announced_count");
   check(r2.payload_len == 0x53, "DATA length is 0x53 = 83");
@@ -242,9 +242,9 @@ int main() {
     const ParseResult pr3 = parse_response(frame3, len3, serial, &r3);
     std::printf("parse: %s, DI 0x%04X, count %u, shape '%s', payload %u B\n", parse_result_to_string(pr3), r3.di,
                 r3.count, payload_shape_to_string(r3.shape), r3.payload_len);
-    check(pr3 == ParseResult::OK, "the status half parses");
-    check(r3.di == DI_LIST_B_STATUS, "DI is 0xF203");
-    check(r3.shape == PayloadShape::STATUS_HALF, "read as a status half");
+    check(pr3 == ParseResult::PARSE_RESULT_OK, "the status half parses");
+    check(r3.di == DI_LIST_2_STATUS, "DI is 0xF203");
+    check(r3.shape == PayloadShape::PAYLOAD_SHAPE_STATUS_HALF, "read as a status half");
     check(r3.count == 8, "all 8 leftover records decoded");
     check(r3.announced_count == 0, "a status half has no COUNT byte to announce anything");
     check(r3.find(0x23) != nullptr && r3.find(0x2A) != nullptr, "first and last leftover records present");
@@ -272,8 +272,8 @@ int main() {
     const ParseResult pr4 = parse_response(frame4, len4, serial, &r4);
     std::printf("parse: %s, DI 0x%04X, count %u, shape '%s'\n", parse_result_to_string(pr4), r4.di, r4.count,
                 payload_shape_to_string(r4.shape));
-    check(pr4 == ParseResult::OK, "it parses");
-    check(r4.shape == PayloadShape::STATUS_HALF, "read as a status half");
+    check(pr4 == ParseResult::PARSE_RESULT_OK, "it parses");
+    check(r4.shape == PayloadShape::PAYLOAD_SHAPE_STATUS_HALF, "read as a status half");
     check(r4.count == 0, "zero leftover records");
     check(r4.has_status_block, "the block is still there - it always is");
     check(r4.payload_len == 2 + STATUS_BLOCK_SIZE, "DATA is exactly DI + block");
@@ -292,9 +292,9 @@ int main() {
     std::printf("parse: %s, DI 0x%04X, count %u, shape '%s', payload %u B\n", parse_result_to_string(pr6), r6.di,
                 r6.count, payload_shape_to_string(r6.shape), r6.payload_len);
     check(len6 == 31, "frame is 31 bytes from the LEN byte");
-    check(pr6 == ParseResult::OK, "the captured reply parses");
-    check(r6.di == DI_LIST_B_STATUS, "DI is 0xF203");
-    check(r6.shape == PayloadShape::STATUS_HALF, "read as a status half");
+    check(pr6 == ParseResult::PARSE_RESULT_OK, "the captured reply parses");
+    check(r6.di == DI_LIST_2_STATUS, "DI is 0xF203");
+    check(r6.shape == PayloadShape::PAYLOAD_SHAPE_STATUS_HALF, "read as a status half");
     check(r6.count == 0, "no leftover records, so the cursor was already gone");
     check(r6.has_status_block, "the block is there");
     check(std::memcmp(r6.status_block, STATUS_BLOCK, STATUS_BLOCK_SIZE) == 0,
@@ -341,13 +341,13 @@ int main() {
 
     TagInfo info{};
     // The one row that breaks the pattern of its neighbours.
-    check(tag_info(0x2A, &info) && info.width == 2 && info.enc == TagEnc::INT_LE,
+    check(tag_info(0x2A, &info) && info.width == 2 && info.enc == TagEnc::TAG_ENC_INT_LE,
           "temperature 0x2A is 2 bytes of signed binary, not the 4-byte BCD around it");
-    check(tag_info(0x24, &info) && info.enc == TagEnc::BCD_LE_SIGNED, "reactive power 0x24 is signed BCD");
+    check(tag_info(0x24, &info) && info.enc == TagEnc::TAG_ENC_BCD_LE_SIGNED, "reactive power 0x24 is signed BCD");
     // Signed because the vendor TAG list marks 0x20..0x23 so; not yet seen negative.
-    check(tag_info(0x23, &info) && info.enc == TagEnc::BCD_LE_SIGNED, "active power 0x23 is signed BCD as well");
-    check(tag_info(0x00, &info) && info.enc == TagEnc::UINT_LE, "energy 0x00 is binary, the one non-BCD family");
-    check(tag_info(0x29, &info) && info.width == 7 && info.enc == TagEnc::BCD_CLOCK, "the clock 0x29 is 7 bytes");
+    check(tag_info(0x23, &info) && info.enc == TagEnc::TAG_ENC_BCD_LE_SIGNED, "active power 0x23 is signed BCD as well");
+    check(tag_info(0x00, &info) && info.enc == TagEnc::TAG_ENC_UINT_LE, "energy 0x00 is binary, the one non-BCD family");
+    check(tag_info(0x29, &info) && info.width == 7 && info.enc == TagEnc::TAG_ENC_BCD_CLOCK, "the clock 0x29 is 7 bytes");
     check(!tag_info(0x48, &info), "the identity objects from 0x48 up have no single width to walk by");
 
     // The status block is not a record and has no TAG, so nothing shadows TAG 0x00.
@@ -358,7 +358,7 @@ int main() {
     overrides[0x00] = 9;
     overrides[0x2B] = 3;
     check(tag_info(0x00, &info, overrides) && info.width == 4, "a declared width cannot shadow a known TAG");
-    check(tag_info(0x2B, &info, overrides) && info.width == 3 && info.enc == TagEnc::USER,
+    check(tag_info(0x2B, &info, overrides) && info.width == 3 && info.enc == TagEnc::TAG_ENC_USER,
           "a declared width does fill a gap");
 
     // Signed BCD, with the worked example from the vendor notes.

@@ -34,34 +34,33 @@
 #include "d101_frame.h"
 
 #include <array>
-#include <string>
 #include <vector>
 
 namespace esphome::nartis_rf_2_meter {
 
-/// Which status-block field an entity reads; NONE = it reads a TAG item instead.
+/// Which status-block field an entity reads; STATUS_FIELD_NONE = it reads a TAG item.
 enum class StatusField : uint8_t {
-  NONE = 0,
-  ACTIVE_TARIFF,
-  TARIFF_COUNT,
-  RAW,
+  STATUS_FIELD_NONE = 0,
+  STATUS_FIELD_ACTIVE_TARIFF,
+  STATUS_FIELD_TARIFF_COUNT,
+  STATUS_FIELD_RAW,
 };
 
-enum class ValueSource : uint8_t { NONE = 0, LIST, FIXED };
+enum class ValueSource : uint8_t { VALUE_SOURCE_NONE = 0, VALUE_SOURCE_LIST, VALUE_SOURCE_FIXED };
 
 /// One TAG's value for this cycle, scaled into the unit tag_info() names for it.
 struct ValueSlot {
   float value{0.0f};
-  ValueSource src{ValueSource::NONE};
+  ValueSource src{ValueSource::VALUE_SOURCE_NONE};
 };
 
 struct SensorEntry {
   esphome::sensor::Sensor *sensor{nullptr};
   esphome::text_sensor::TextSensor *text_sensor{nullptr};
   uint8_t tag{0};
-  StatusField status{StatusField::NONE};
+  StatusField status{StatusField::STATUS_FIELD_NONE};
 
-  bool reads_status() const { return this->status != StatusField::NONE; }
+  bool reads_status() const { return this->status != StatusField::STATUS_FIELD_NONE; }
 };
 
 class NartisRf2MeterComponent : public esphome::PollingComponent {
@@ -70,7 +69,6 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void dump_config() override;
   void update() override;
   void loop() override;
-  float get_setup_priority() const override { return esphome::setup_priority::DATA; }
 
   // CMT2300A wiring: bit-bang 3-wire SPI + INT2 on the chip's GPIO3 pad.
   void set_pin_sdio(esphome::InternalGPIOPin *p) { this->pin_sdio_ = p; }
@@ -80,14 +78,17 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void set_pin_gpio3(esphome::InternalGPIOPin *p) { this->pin_gpio3_ = p; }
 
   /// 12-digit nameplate serial: the DL/T 645 address, and it selects the channel.
-  void set_address(const std::string &address) { this->address_ = address; }
+  /// Code generation passes a string literal, which outlives the component.
+  void set_address(const char *address) { this->address_ = address; }
   /// Channel frequency override; 0 = derive it from the serial.
   void set_frequency_override(uint32_t hz) { this->frequency_override_ = hz; }
 
-  void set_sources(bool list_a, bool list_b, bool fixed) {
-    this->read_list_[static_cast<uint8_t>(ListId::A)] = list_a;
-    this->read_list_[static_cast<uint8_t>(ListId::B)] = list_b;
-    this->read_fixed_ = fixed;
+  /// One flag per YAML source: the two indication lists, then the two fixed blocks.
+  void set_sources(bool list_1, bool list_2, bool fix_1, bool fix_2) {
+    this->read_list_[static_cast<uint8_t>(ListId::LIST_ID_1)] = list_1;
+    this->read_list_[static_cast<uint8_t>(ListId::LIST_ID_2)] = list_2;
+    this->read_fixed_[FIXED_IDX_F101] = fix_1;
+    this->read_fixed_[FIXED_IDX_F102] = fix_2;
   }
 
   void set_last_read_ok_binary_sensor(esphome::binary_sensor::BinarySensor *s) { this->last_read_ok_bs_ = s; }
@@ -105,23 +106,27 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void add_probe(uint16_t di, const std::vector<uint8_t> &body);
 
   /// `width` > 0 declares the on-wire width of a TAG the decoder does not know.
-  void register_sensor(esphome::sensor::Sensor *s, uint8_t tag, StatusField field, uint8_t width);
-  void register_text_sensor(esphome::text_sensor::TextSensor *s, uint8_t tag, StatusField field, uint8_t width);
+  void register_sensor(esphome::sensor::Sensor *s, uint8_t tag, StatusField field, uint8_t width) {
+    this->add_entry_(s, nullptr, tag, field, width);
+  }
+  void register_text_sensor(esphome::text_sensor::TextSensor *s, uint8_t tag, StatusField field, uint8_t width) {
+    this->add_entry_(nullptr, s, tag, field, width);
+  }
 
   enum class State : uint8_t {
-    NOT_INITIALIZED,
-    IDLE,
-    TX_REQUEST,  // build + transmit the current step's request, then arm RX
-    WAIT_REPLY,  // drain RX, parse, retry or advance
-    GAP,         // pause between exchanges
-    PUBLISH,
+    STATE_NOT_INITIALIZED,
+    STATE_IDLE,
+    STATE_TX_REQUEST,  // build + transmit the current step's request, then arm RX
+    STATE_WAIT_REPLY,  // drain RX, parse, retry or advance
+    STATE_GAP,         // pause between exchanges
+    STATE_PUBLISH,
   };
 
  protected:
   enum class RxPoll : uint8_t {
-    NOTHING,   // no bytes yet
-    BUSY,      // partial frame, keep draining
-    COMPLETE,  // hand the buffer to the carve/parse step
+    RX_POLL_NOTHING,   // no bytes yet
+    RX_POLL_BUSY,      // partial frame, keep draining
+    RX_POLL_COMPLETE,  // hand the buffer to the carve/parse step
   };
 
   void set_state_(State state);
@@ -137,13 +142,18 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// TAG wins.
   void merge_records_(const ParsedResponse &resp);
   const ParsedItem *find_merged_(uint8_t tag) const;
-  void report_silent_requests_();
+  /// Warn once about any request that has been asked every cycle and never answered.
+  void report_silent_();
   void handle_publish_();
   void publish_cycle_outcome_(bool ok);
   uint16_t current_di_() const;
 
+  void add_entry_(esphome::sensor::Sensor *s, esphome::text_sensor::TextSensor *ts, uint8_t tag, StatusField field,
+                  uint8_t width);
   static void describe_item_(const ParsedItem &item, char *out, size_t cap,
                              const uint8_t *width_overrides);
+  /// One line per decoded record. `warn` picks the log level and the indent.
+  void log_items_(const ParsedResponse &resp, bool warn) const;
   void note_tag_width_(uint8_t tag, StatusField field, uint8_t width);
   void log_response_(const ParsedResponse &resp) const;
   void log_unknown_tag_(uint16_t di, const ParsedResponse &resp) const;
@@ -170,7 +180,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   esphome::InternalGPIOPin *pin_fcsb_{nullptr};
   esphome::InternalGPIOPin *pin_gpio3_{nullptr};
 
-  std::string address_;
+  const char *address_{""};
   uint8_t serial_le_[SERIAL_BCD_SIZE]{};
   uint32_t frequency_override_{0};
   uint32_t rf_frequency_hz_{0};
@@ -180,7 +190,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint8_t rf_retries_{2};
   int rx_center_offset_{758};
 
-  State state_{State::NOT_INITIALIZED};
+  State state_{State::STATE_NOT_INITIALIZED};
   uint32_t state_entered_ms_{0};
   uint32_t cycle_start_ms_{0};
   bool radio_ready_{false};
@@ -202,9 +212,9 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
 
   /// A cycle is a list of exchanges, built at its start: a list request, a
   /// fixed-block request, or a probe.
-  enum class StepKind : uint8_t { LIST, FIXED, PROBE };
+  enum class StepKind : uint8_t { STEP_KIND_LIST, STEP_KIND_FIXED, STEP_KIND_PROBE };
   struct Step {
-    StepKind kind{StepKind::LIST};
+    StepKind kind{StepKind::STEP_KIND_LIST};
     /// Index into LIST_REQUESTS / FIXED_REQUESTS / probes_, per `kind`.
     uint8_t idx{0};
   };
@@ -217,16 +227,15 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
 
   void handle_fixed_reply_(uint8_t fixed_idx, const ParsedResponse &resp);
   void log_f101_() const;
-  void report_silent_fixed_();
   void log_f102_() const;
 
   /// YAML-declared widths by TAG, 0 = none. Consulted only for unknown TAGs.
   uint8_t tag_width_[TAG_WIDTH_TABLE_SIZE]{};
 
-  /// This cycle's records from all TAG pages, merged. Sized to the whole TAG
-  /// space, so no combination of pages can overflow it.
-  static constexpr size_t MAX_MERGED_ITEMS = TAG_WIDTH_TABLE_SIZE;
-  std::array<ParsedItem, MAX_MERGED_ITEMS> merged_{};
+  /// This cycle's records from all TAG pages, merged and indexed by TAG - one slot
+  /// per TAG, so no combination of pages can overflow it. A `len` of 0 means the
+  /// TAG did not arrive.
+  std::array<ParsedItem, TAG_WIDTH_TABLE_SIZE> merged_{};
   uint8_t merged_count_{0};
 
   /// This cycle's scaled values by TAG - the only thing an entity reads.
@@ -238,7 +247,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   bool status_ok_{false};
 
   bool read_list_[LIST_COUNT]{};
-  bool read_fixed_{false};
+  bool read_fixed_[FIXED_REQUEST_COUNT]{};
 
   /// This cycle's fixed blocks, kept whole. f102_len_ identifies the variant:
   /// 63 = three-phase, 23 = single-phase, 0 = nothing arrived.
@@ -268,13 +277,12 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   /// Bit per LIST_REQUESTS entry asked for at all, and answered at least once.
   uint8_t requests_polled_{0};
   uint8_t requests_seen_{0};
-  bool warned_silent_requests_{false};
-  static constexpr uint32_t REQUEST_SILENT_WARN_CYCLES = 3;
-  uint8_t warned_half_{0};
   /// The same, for FIXED_REQUESTS.
   uint8_t fixed_polled_{0};
   uint8_t fixed_seen_{0};
-  bool warned_fixed_silent_{false};
+  static constexpr uint32_t REQUEST_SILENT_WARN_CYCLES = 3;
+  bool warned_silent_{false};
+  uint8_t warned_half_{0};
 
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> tx_buf_{};
   size_t tx_len_{0};

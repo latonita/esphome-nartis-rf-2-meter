@@ -71,7 +71,7 @@ int main() {
   const uint8_t want_energy[] = {0x98, 0xF3, 0x17, 0x00, 0x01, 0x16, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32, 0x02, 0x68,
                                  0x01, 0x08, 0x33, 0x25, 0x33, 0x33, 0x33, 0x33, 0x34, 0x56, 0x92, 0x16, 0xFE, 0xB0};
   uint8_t buf[MAX_REQUEST_FRAME_SIZE];
-  size_t n = build_request(buf, sizeof(buf), serial, DI_LIST_A_RECORDS);
+  size_t n = build_request(buf, sizeof(buf), serial, DI_LIST_1_RECORDS);
   hex("energy built", buf, n);
   hex("energy doc", want_energy, sizeof(want_energy));
   check(n == sizeof(want_energy) && std::memcmp(buf, want_energy, n) == 0, "energy request matches the capture exactly");
@@ -80,7 +80,7 @@ int main() {
   //     HLEN = LEN ^ 1 is what the display sends, so this must match byte-for-byte ---
   const uint8_t want_status[] = {0x98, 0xF3, 0x12, 0x00, 0x01, 0x13, 0x68, 0x60, 0x10, 0x27, 0x40, 0x32,
                                  0x02, 0x68, 0x01, 0x03, 0x34, 0x25, 0x33, 0x6B, 0x16, 0x29, 0x0A};
-  n = build_request(buf, sizeof(buf), serial, DI_LIST_A_STATUS);
+  n = build_request(buf, sizeof(buf), serial, DI_LIST_1_STATUS);
   hex("status built", buf, n);
   hex("status doc", want_status, sizeof(want_status));
   check(n == sizeof(want_status) && std::memcmp(buf, want_status, n) == 0,
@@ -102,8 +102,8 @@ int main() {
   const ParseResult pr = parse_response(resp, sizeof(resp), serial, &r);
   std::printf("parse          %s, DI 0x%04X, count %u\n", parse_result_to_string(pr), r.di, r.count);
   hex("payload", r.payload, r.payload_len);
-  check(pr == ParseResult::OK, "worked-example response parses");
-  check(r.di == DI_LIST_A_RECORDS, "DI is 0xF200");
+  check(pr == ParseResult::PARSE_RESULT_OK, "worked-example response parses");
+  check(r.di == DI_LIST_1_RECORDS, "DI is 0xF200");
   check(r.count == 4, "4 items");
 
   const ParsedItem *total = r.find(0x00);
@@ -128,19 +128,19 @@ int main() {
   // --- rejection cases ---
   ParsedResponse tmp{};
   const uint8_t other_serial[6] = {0x61, 0x10, 0x27, 0x40, 0x32, 0x02};
-  check(parse_response(resp, sizeof(resp), other_serial, &tmp) == ParseResult::WRONG_ADDRESS,
+  check(parse_response(resp, sizeof(resp), other_serial, &tmp) == ParseResult::PARSE_RESULT_WRONG_ADDRESS,
         "a different meter's address is rejected");
 
   uint8_t corrupt[sizeof(resp)];
   std::memcpy(corrupt, resp, sizeof(resp));
   corrupt[20] ^= 0xFF;  // flip a payload byte -> CRC must fail
-  check(parse_response(corrupt, sizeof(corrupt), serial, &tmp) == ParseResult::NO_FRAME,
+  check(parse_response(corrupt, sizeof(corrupt), serial, &tmp) == ParseResult::PARSE_RESULT_NO_FRAME,
         "a corrupted frame is rejected");
 
   // build_request() has to know all four list requests and only those.
   uint8_t page_frame[MAX_REQUEST_FRAME_SIZE];
-  const size_t page_len = build_request(page_frame, sizeof(page_frame), serial, DI_LIST_A_RECORDS);
-  for (uint16_t di : {DI_LIST_A_RECORDS, DI_LIST_B_RECORDS, DI_LIST_B_STATUS}) {
+  const size_t page_len = build_request(page_frame, sizeof(page_frame), serial, DI_LIST_1_RECORDS);
+  for (uint16_t di : {DI_LIST_1_RECORDS, DI_LIST_2_RECORDS, DI_LIST_2_STATUS}) {
     uint8_t f[MAX_REQUEST_FRAME_SIZE];
     const size_t n = build_request(f, sizeof(f), serial, di);
     if (n != page_len) {
@@ -149,7 +149,7 @@ int main() {
     }
   }
   uint8_t status_frame[MAX_REQUEST_FRAME_SIZE];
-  const size_t status_len = build_request(status_frame, sizeof(status_frame), serial, DI_LIST_A_STATUS);
+  const size_t status_len = build_request(status_frame, sizeof(status_frame), serial, DI_LIST_1_STATUS);
   check(page_len > 0 && status_len == page_len - 5, "the three page polls agree in length, DI 0xF201 is 5 shorter");
   check(build_request(page_frame, sizeof(page_frame), serial, 0xF204) == 0, "an unknown DI builds nothing");
 

@@ -58,8 +58,8 @@ static constexpr size_t SERIAL_BCD_SIZE = 6;
 /* Two pre-defined indication lists, each read with two requests:
  *
  *                 tagged records    status block
- *      list A       DI 0xF200         DI 0xF201
- *      list B       DI 0xF202         DI 0xF203
+ *      list 1       DI 0xF200         DI 0xF201
+ *      list 2       DI 0xF202         DI 0xF203
  *
  * Request bodies are constant and select nothing; which values a list holds is a
  * per-meter vendor-tool setting, so both lists are read and their records merged.
@@ -75,18 +75,18 @@ static constexpr size_t SERIAL_BCD_SIZE = 6;
  * request. A status half must follow its own records half back to back, or it
  * answers with the block alone.
  */
-static constexpr uint16_t DI_LIST_A_RECORDS = 0xF200;
-static constexpr uint16_t DI_LIST_A_STATUS = 0xF201;
-static constexpr uint16_t DI_LIST_B_RECORDS = 0xF202;
-static constexpr uint16_t DI_LIST_B_STATUS = 0xF203;
+static constexpr uint16_t DI_LIST_1_RECORDS = 0xF200;
+static constexpr uint16_t DI_LIST_1_STATUS = 0xF201;
+static constexpr uint16_t DI_LIST_2_RECORDS = 0xF202;
+static constexpr uint16_t DI_LIST_2_STATUS = 0xF203;
 
-enum class ListId : uint8_t { A, B };
+enum class ListId : uint8_t { LIST_ID_1, LIST_ID_2 };
 static constexpr uint8_t LIST_COUNT = 2;
 const char *list_id_to_string(ListId l);
 
 enum class ListPart : uint8_t {
-  RECORDS,  // tagged values behind a COUNT
-  STATUS,   // leftover records, then the status block; no COUNT
+  LIST_PART_RECORDS,  // tagged values behind a COUNT
+  LIST_PART_STATUS,   // leftover records, then the status block; no COUNT
 };
 
 /// Constant in every captured request. Three of the four requests take the long
@@ -137,6 +137,10 @@ struct FixedRequest {
 static constexpr uint8_t FIXED_REQUEST_COUNT = 2;
 extern const FixedRequest FIXED_REQUESTS[FIXED_REQUEST_COUNT];
 
+/// Positions in FIXED_REQUESTS - the YAML `fix_1` and `fix_2`. f1xx_check pins these.
+static constexpr uint8_t FIXED_IDX_F101 = 0;
+static constexpr uint8_t FIXED_IDX_F102 = 1;
+
 /// Index of `di` in FIXED_REQUESTS, or FIXED_REQUEST_COUNT when it is neither.
 uint8_t fixed_request_index(uint16_t di);
 
@@ -169,23 +173,23 @@ static constexpr size_t STATUS_OFF_ACTIVE_TARIFF = 10;  // firmware: an internal
 
 /// How the DATA field is framed. The right shape is the one that consumes DATA exactly.
 enum class PayloadShape : uint8_t {
-  RECORDS,         // DI | COUNT | {TAG,value}...
-  STATUS_HALF,     // DI | {TAG,value}... | status block; no COUNT
-  FIXED_F101,      // struct nartis_f101; no TAGs, so `items` stays empty
-  FIXED_F102_3PH,  // struct f102_3ph: marker then 15 BCD values
-  FIXED_F102_1PH,  // struct f102_1ph: lead byte then 5 BCD values
+  PAYLOAD_SHAPE_RECORDS,         // DI | COUNT | {TAG,value}...
+  PAYLOAD_SHAPE_STATUS_HALF,     // DI | {TAG,value}... | status block; no COUNT
+  PAYLOAD_SHAPE_FIXED_F101,      // struct nartis_f101; no TAGs, so `items` stays empty
+  PAYLOAD_SHAPE_FIXED_F102_3PH,  // struct f102_3ph: marker then 15 BCD values
+  PAYLOAD_SHAPE_FIXED_F102_1PH,  // struct f102_1ph: lead byte then 5 BCD values
 };
 
 const char *payload_shape_to_string(PayloadShape s);
 
 /// How an item's value bytes are read; the byte count is TagInfo::width.
 enum class TagEnc : uint8_t {
-  UINT_LE,      // little-endian unsigned binary - the energy registers
-  INT_LE,       // little-endian two's-complement signed binary
-  BCD_LE,        // BCD, least-significant pair first: 41 23 -> 2341
-  BCD_LE_SIGNED,  // the same, with BCD_SIGN_BIT of the top byte meaning negative
-  BCD_CLOCK,      // 7 bytes BCD: ss mm hh dow DD MM YY
-  USER,           // width declared in YAML; read as UINT_LE, unit unknown
+  TAG_ENC_UINT_LE,        // little-endian unsigned binary - the energy registers
+  TAG_ENC_INT_LE,         // little-endian two's-complement signed binary
+  TAG_ENC_BCD_LE,         // BCD, least-significant pair first: 41 23 -> 2341
+  TAG_ENC_BCD_LE_SIGNED,  // the same, with BCD_SIGN_BIT of the top byte meaning negative
+  TAG_ENC_BCD_CLOCK,      // 7 bytes BCD: ss mm hh dow DD MM YY
+  TAG_ENC_USER,           // width declared in YAML; read as UINT_LE, unit unknown
 };
 
 /// BCD_LE_SIGNED sign bit: bit 7 of the top byte, overlapping its top BCD digit.
@@ -251,7 +255,7 @@ struct ParsedResponse {
   /// COUNT as received: records the list holds in total, so routinely more than
   /// `count`. Zero on a status half.
   uint8_t announced_count{0};
-  PayloadShape shape{PayloadShape::RECORDS};
+  PayloadShape shape{PayloadShape::PAYLOAD_SHAPE_RECORDS};
   ParsedItem items[MAX_ITEMS]{};
 
   /// The status block, when `shape` is STATUS_HALF. Not a record - it has no TAG.
@@ -265,19 +269,20 @@ struct ParsedResponse {
   uint8_t unknown_tag{0};
   uint8_t unknown_offset{0};
 
+  /// First record carrying `tag`, or nullptr. Used by the host frame checks.
   const ParsedItem *find(uint8_t tag) const;
 };
 
 enum class ParseResult : uint8_t {
-  OK,
-  ERROR_RESPONSE,  // the meter refused the read (control code has bit 6 set)
-  NO_FRAME,        // no length+CRC-consistent frame in the buffer
-  BAD_CHECKSUM,    // 645 sum checksum mismatch
-  MALFORMED,       // 645 delimiters / length fields inconsistent
-  WRONG_ADDRESS,   // a valid frame, but not from our meter
-  NOT_RESPONSE,    // control code is not 0x81 (0xC1 = the meter refused the read)
-  UNKNOWN_TAG,     // item TAG of unknown width - framing lost, aborted
-  TOO_MANY_ITEMS,  // more records present than MAX_ITEMS
+  PARSE_RESULT_OK,
+  PARSE_RESULT_ERROR_RESPONSE,  // the meter refused the read (control code has bit 6 set)
+  PARSE_RESULT_NO_FRAME,        // no length+CRC-consistent frame in the buffer
+  PARSE_RESULT_BAD_CHECKSUM,    // 645 sum checksum mismatch
+  PARSE_RESULT_MALFORMED,       // 645 delimiters / length fields inconsistent
+  PARSE_RESULT_WRONG_ADDRESS,   // a valid frame, but not from our meter
+  PARSE_RESULT_NOT_RESPONSE,    // control code is not 0x81 (0xC1 = the meter refused the read)
+  PARSE_RESULT_UNKNOWN_TAG,     // item TAG of unknown width - framing lost, aborted
+  PARSE_RESULT_TOO_MANY_ITEMS,  // more records present than MAX_ITEMS
 };
 
 const char *parse_result_to_string(ParseResult r);

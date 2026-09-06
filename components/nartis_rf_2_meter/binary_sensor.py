@@ -3,19 +3,15 @@
 One diagnostic entity: whether the last poll cycle got everything it asked for.
 
 This link is not always up - reception on the reference install is close to 100%
-overnight and can sit at zero for hours in the middle of the day - and the numeric
-entities cannot show that. They deliberately publish nothing on a failed cycle and
-hold their previous state, so a stale reading is indistinguishable from a fresh one
-unless you watch the entity's last-updated time. This is the entity that says so
-outright.
-
-It also gives the template sensors something to gate on: a lambda that returns `{}`
-while this reads false stops publishing confidently-timestamped stale values.
+overnight and can sit at zero for hours in the middle of the day. The value
+entities publish nothing on a failed cycle and hold their previous state, so a
+stale reading looks exactly like a fresh one; this entity is what says otherwise,
+and what a template lambda can gate on to stop republishing stale values.
 """
 
 import esphome.codegen as cg
-import esphome.config_validation as cv
 from esphome.components import binary_sensor
+import esphome.config_validation as cv
 from esphome.const import DEVICE_CLASS_CONNECTIVITY, ENTITY_CATEGORY_DIAGNOSTIC
 
 from . import CONF_NARTIS_RF_2_METER_ID, NartisRf2MeterComponent

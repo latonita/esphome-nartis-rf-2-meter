@@ -4,12 +4,13 @@ Reads Nartis И100/И300/И500 meters (2024+, the "RF-433-2" / Д101-2 protocol)
 a CMT2300A 443 MHz radio by emulating the НАРТИС-Д101-2 display. DL/T 645-1997
 inside a radio envelope: no encryption, no session, no password.
 
-The meter answers six constant requests. Which are sent is the `sources:` setting,
-default list B alone:
+The meter answers six constant requests, one per `sources:` entry (default
+`list_2`):
 
-    DI 0xF202/0xF203   list B, records + status half
-    DI 0xF200/0xF201   list A, records + status half
-    DI 0xF101/0xF102   fixed blocks - positional values, see fixed.md
+    list_1   DI 0xF200/0xF201   records + status half
+    list_2   DI 0xF202/0xF203   records + status half
+    fix_1    DI 0xF101          reactive energy, see fixed.md
+    fix_2    DI 0xF102          live P/Q/U/I/frequency, see fixed.md
 
 A status half must follow its own records half back to back: the leftover records
 come from a cursor the meter drops as soon as anything else is asked.
@@ -23,10 +24,11 @@ unit, published raw.
 
 from esphome import pins
 import esphome.codegen as cg
-import esphome.config_validation as cv
+
 # The dotted form on purpose: this package has its own sensor.py, and a plain
 # `from esphome.components import sensor` resolves to that one instead.
 from esphome.components.sensor import new_sensor, sensor_schema
+import esphome.config_validation as cv
 from esphome.const import (
     CONF_ADDRESS,
     CONF_FREQUENCY,
@@ -36,14 +38,14 @@ from esphome.const import (
     STATE_CLASS_MEASUREMENT,
     UNIT_DECIBEL_MILLIWATT,
 )
+from esphome.types import ConfigType
 
 CODEOWNERS = ["@latonita"]
-# The component header includes binary_sensor's type unconditionally, so it has to
-# be auto-loaded even though the platform is optional.
+# binary_sensor is auto-loaded even though the platform is optional: the component
+# header includes its type unconditionally.
 AUTO_LOAD = ["binary_sensor", "sensor", "text_sensor"]
 MULTI_CONF = True
 
-# CMT2300A wiring (bit-bang 3-wire SPI + INT2 on the chip's GPIO3 pad).
 CONF_PIN_SDIO = "pin_sdio"
 CONF_PIN_SCLK = "pin_sclk"
 CONF_PIN_CSB = "pin_csb"
@@ -73,33 +75,29 @@ NartisRf2MeterComponent = nartis_rf_2_meter_ns.class_(
 )
 StatusField = nartis_rf_2_meter_ns.enum("StatusField", is_class=True)
 
-# Both names are UNCONFIRMED - inferred from byte positions in one capture, where the
-# firmware layout calls the same bytes device state. Real temperature is `tag: 0x2A`.
+# UNCONFIRMED: inferred from byte positions in one capture, where the firmware layout
+# calls the same bytes device state. Real temperature is `tag: 0x2A`.
 STATUS_FIELDS = {
-    "active_tariff": StatusField.ACTIVE_TARIFF,
-    "tariff_count": StatusField.TARIFF_COUNT,
+    "active_tariff": StatusField.STATUS_FIELD_ACTIVE_TARIFF,
+    "tariff_count": StatusField.STATUS_FIELD_TARIFF_COUNT,
 }
 STATUS_FIELDS_TEXT = {
     **STATUS_FIELDS,
-    "raw": StatusField.RAW,
+    "raw": StatusField.STATUS_FIELD_RAW,
 }
 
-# Mirrors TAG_TABLE in d101_frame.cpp, which is the one place widths, encodings and
-# scales live. A TAG of unknown width destroys framing for the rest of the payload,
-# since records carry no length field - hence `bytes:` before use.
+# Mirrors TAG_TABLE in d101_frame.cpp, the one place widths, encodings and scales live.
 TAG_CLOCK = 0x29
 TAG_NO_WIDTH = {0x2B} | set(range(0x40, 0x50))
-TAG_KNOWN = set(range(0x00, 0x50)) - TAG_NO_WIDTH
+TAG_KNOWN = set(range(0x50)) - TAG_NO_WIDTH
 TAG_NUMERIC = TAG_KNOWN - {TAG_CLOCK}
 
 TAG_MIN = 0x00
 TAG_MAX = 0x4F
-# MAX_ITEM_WIDTH in d101_frame.h.
-TAG_MAX_WIDTH = 9
+TAG_MAX_WIDTH = 9  # MAX_ITEM_WIDTH in d101_frame.h
 
 
 def validate_tag(value):
-    """An item TAG of a data-page response (0x00-0x4F)."""
     tag = cv.hex_int(value)
     if not TAG_MIN <= tag <= TAG_MAX:
         raise cv.Invalid(
@@ -109,7 +107,6 @@ def validate_tag(value):
 
 
 def validate_numeric_tag(value):
-    """Same, but the clock is text-only so it is rejected on a numeric sensor."""
     tag = validate_tag(value)
     if tag == TAG_CLOCK:
         raise cv.Invalid(
@@ -118,8 +115,7 @@ def validate_numeric_tag(value):
     return tag
 
 
-def validate_tag_entity(config):
-    """A TAG with no built-in width needs `bytes:` before it can be decoded."""
+def validate_tag_entity(config: ConfigType) -> ConfigType:
     tag = config.get(CONF_TAG)
     if tag is None or tag in TAG_KNOWN or CONF_BYTES in config:
         return config
@@ -133,17 +129,17 @@ def validate_tag_entity(config):
     )
 
 
-# Each source costs two exchanges, ~1 s apiece. Which list holds what is set per
-# meter with the vendor tool; list B was a superset of list A on the reference meter,
-# hence the default. `fixed` publishes what no list carried - chiefly per-phase power.
-SOURCE_LIST_A = "list_a"
-SOURCE_LIST_B = "list_b"
-SOURCE_FIXED = "fixed"
-SOURCES = [SOURCE_LIST_A, SOURCE_LIST_B, SOURCE_FIXED]
+# A list costs two exchanges, a fixed block one, ~1 s apiece. Which list holds what
+# is set per meter with the vendor tool; list 2 was a superset of list 1 on the
+# reference meter, hence the default.
+SOURCE_LIST_1 = "list_1"
+SOURCE_LIST_2 = "list_2"
+SOURCE_FIX_1 = "fix_1"
+SOURCE_FIX_2 = "fix_2"
+SOURCES = [SOURCE_LIST_1, SOURCE_LIST_2, SOURCE_FIX_1, SOURCE_FIX_2]
 
 
-def validate_sources(value):
-    """A list of sources: at least one, each named at most once."""
+def validate_sources(value: list[str]) -> list[str]:
     seen = []
     for item in value:
         if item in seen:
@@ -173,7 +169,6 @@ PROBE_SCHEMA = cv.Schema(
 
 
 def validate_probes(value):
-    """Warn where a probe restates a DI whose body is already known."""
     for probe in value:
         di = probe[CONF_DI]
         known = KNOWN_DI.get(di)
@@ -187,8 +182,7 @@ def validate_probes(value):
     return value
 
 
-def validate_address(value):
-    """Meter serial: the 12-digit number printed on the nameplate."""
+def validate_address(value) -> str:
     s = cv.string_strict(value)
     if not s.isdigit() or len(s) != 12:
         raise cv.Invalid(
@@ -206,41 +200,35 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Required(CONF_PIN_CSB): pins.internal_gpio_output_pin_schema,
         cv.Required(CONF_PIN_FCSB): pins.internal_gpio_output_pin_schema,
         cv.Required(CONF_PIN_GPIO3): pins.internal_gpio_input_pin_schema,
-        # Becomes the DL/T 645 address; its last 3 digits select the channel.
+        # The DL/T 645 address; its last 3 digits also select the channel.
         cv.Required(CONF_ADDRESS): validate_address,
-        # Only needed if the meter sits off its serial-derived channel.
         cv.Optional(CONF_FREQUENCY): cv.All(
             cv.frequency, cv.Range(min=430000000, max=460000000)
         ),
-        # Also separates a records half from the status half that continues it, and
-        # the meter's cursor has to survive it - if a status half comes back with no
-        # leftover records on a working link, try a shorter gap first.
+        # The meter's cursor has to survive this gap: if a status half comes back with
+        # no leftover records on a working link, try a shorter one first.
         cv.Optional(
             CONF_REQUEST_GAP, default="500ms"
         ): cv.positive_time_period_milliseconds,
-        # Per on-air attempt. A good reply completes ~965 ms after transmit starts on
-        # the reference meter, with real spread above it.
+        # Per on-air attempt; a good reply completes ~965 ms after transmit starts.
         cv.Optional(
             CONF_RF_RX_TIMEOUT, default="1800ms"
         ): cv.positive_time_period_milliseconds,
-        # Total on-air attempts = 1 + rf_retries.
         cv.Optional(CONF_RF_RETRIES, default=2): cv.int_range(min=0, max=10),
-        # CMT2300A frequency codes (1 code ~= 6.199 Hz); shifts the RX-half LO onto the
-        # meter's reply carrier. The default is proven on hardware.
+        # CMT2300A frequency codes (1 code ~= 6.199 Hz), shifting the RX-half LO onto
+        # the meter's reply carrier. The default is proven on hardware.
         cv.Optional(CONF_RX_CENTER_OFFSET, default=758): cv.int_range(
             min=-4000, max=4000
         ),
-        cv.Optional(CONF_SOURCES, default=[SOURCE_LIST_B]): cv.All(
+        cv.Optional(CONF_SOURCES, default=[SOURCE_LIST_2]): cv.All(
             cv.ensure_list(cv.one_of(*SOURCES, lower=True)), validate_sources
         ),
-        # Extra reads once per cycle, logged in full and driving no entity. Reads only -
-        # the control code is hard-wired, and this link also carries a relay command.
+        # Extra reads once per cycle, logged in full and driving no entity.
         cv.Optional(CONF_PROBE): cv.All(
             cv.ensure_list(PROBE_SCHEMA), cv.Length(min=1, max=8), validate_probes
         ),
-        # Radio-level diagnostic, not a meter value: the RSSI of the last reply heard
-        # in a cycle. Published only for a cycle that heard something, so it holds
-        # rather than reporting a floor while the link is down.
+        # Published only for a cycle that heard something, so it holds rather than
+        # reporting a floor while the link is down.
         cv.Optional(CONF_RSSI): sensor_schema(
             unit_of_measurement=UNIT_DECIBEL_MILLIWATT,
             accuracy_decimals=0,
@@ -269,8 +257,8 @@ async def to_code(config):
         cg.add(setter(pin))
 
     cg.add(var.set_address(config[CONF_ADDRESS]))
-    if CONF_FREQUENCY in config:
-        cg.add(var.set_frequency_override(int(config[CONF_FREQUENCY])))
+    if (frequency := config.get(CONF_FREQUENCY)) is not None:
+        cg.add(var.set_frequency_override(int(frequency)))
 
     cg.add(var.set_request_gap_ms(config[CONF_REQUEST_GAP]))
     cg.add(var.set_rf_rx_timeout_ms(config[CONF_RF_RX_TIMEOUT]))
@@ -280,14 +268,15 @@ async def to_code(config):
     sources = config[CONF_SOURCES]
     cg.add(
         var.set_sources(
-            SOURCE_LIST_A in sources,
-            SOURCE_LIST_B in sources,
-            SOURCE_FIXED in sources,
+            SOURCE_LIST_1 in sources,
+            SOURCE_LIST_2 in sources,
+            SOURCE_FIX_1 in sources,
+            SOURCE_FIX_2 in sources,
         )
     )
 
-    if CONF_RSSI in config:
-        cg.add(var.set_rssi_sensor(await new_sensor(config[CONF_RSSI])))
+    if (rssi := config.get(CONF_RSSI)) is not None:
+        cg.add(var.set_rssi_sensor(await new_sensor(rssi)))
 
     for probe in config.get(CONF_PROBE, []):
         cg.add(var.add_probe(probe[CONF_DI], probe[CONF_BODY]))

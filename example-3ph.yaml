@@ -55,14 +55,14 @@ nartis_rf_2_meter:
   update_interval: 120s
   rf_rx_timeout: 1700ms
 
-  # list_b carries the active energy, voltage, current, P total, frequency and
-  # clock; fixed adds what no list on this meter sends - reactive energy from
-  # DI 0xF101, per-phase active and all reactive power from DI 0xF102.
-  sources: [fixed, list_b]
+  # list_2 carries the active energy, voltage, current, P total, frequency and
+  # clock. fix_1 (DI 0xF101) adds the reactive energy and fix_2 (DI 0xF102) the
+  # per-phase active and all reactive power - none of which this meter's lists send.
+  sources: [list_2, fix_1, fix_2]
 
 # Values arrive already scaled to the unit below - no `multiply` filter.
 sensor:
-  # --- Active energy, import (A+) -- list_b ---------------------------------
+  # --- Active energy, import (A+) -- list_2 ---------------------------------
   - platform: nartis_rf_2_meter
     name: "Active energy total"          # Активная энергия, импорт, всего
     tag: 0x00
@@ -87,7 +87,7 @@ sensor:
     device_class: energy
     state_class: total_increasing
 
-  # --- Active energy, export (A-) -- list_b ---------------------------------
+  # --- Active energy, export (A-) -- list_2 ---------------------------------
   - platform: nartis_rf_2_meter
     name: "Active energy export total"   # Активная энергия, экспорт, всего
     tag: 0x05
@@ -156,7 +156,7 @@ sensor:
     accuracy_decimals: 3
     state_class: total_increasing
 
-  # --- Phase voltages -- list_b (0.1 V steps) -------------------------------
+  # --- Phase voltages -- list_2 (0.1 V steps) -------------------------------
   - platform: nartis_rf_2_meter
     name: "Voltage L1"                   # Напряжение фазы A
     tag: 0x15
@@ -181,7 +181,7 @@ sensor:
     device_class: voltage
     state_class: measurement
 
-  # --- Phase currents -- list_b (1 mA steps) --------------------------------
+  # --- Phase currents -- list_2 (1 mA steps) --------------------------------
   # The vendor TAG list labels these one TAG higher and calls 0x1C the neutral
   # current; the object ids and the DI 0xF102 cross-check both say otherwise.
   - platform: nartis_rf_2_meter
@@ -208,7 +208,7 @@ sensor:
     device_class: current
     state_class: measurement
 
-  # --- Active power -- 0x20 from list_b, the phases from DI 0xF102 ----------
+  # --- Active power -- 0x20 from list_2, the phases from DI 0xF102 ----------
   - platform: nartis_rf_2_meter
     name: "Active power"                 # Активная мощность, сумма по фазам
     tag: 0x20
@@ -274,7 +274,7 @@ sensor:
     device_class: reactive_power
     state_class: measurement
 
-  # --- Frequency -- list_b --------------------------------------------------
+  # --- Frequency -- list_2 --------------------------------------------------
   - platform: nartis_rf_2_meter
     name: "Frequency"                    # Частота сети
     tag: 0x28

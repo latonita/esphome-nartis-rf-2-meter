@@ -32,29 +32,30 @@ struct TagRange {
 
 constexpr TagRange TAG_TABLE[] = {
     // Energy accumulators - the one family that is binary, not BCD.
-    {0x00, 0x09, 4, TagEnc::UINT_LE, 0.001f, "kWh"},
-    {0x0A, 0x13, 4, TagEnc::UINT_LE, 0.001f, "kvarh"},
+    {0x00, 0x09, 4, TagEnc::TAG_ENC_UINT_LE, 0.001f, "kWh"},
+    {0x0A, 0x13, 4, TagEnc::TAG_ENC_UINT_LE, 0.001f, "kvarh"},
 
     // Voltages: 0x14 single-phase, 0x15..0x17 per phase, 0x18..0x1A line-to-line.
-    {0x14, 0x14, 4, TagEnc::BCD_LE, 0.1f, "V"},
-    {0x15, 0x17, 4, TagEnc::BCD_LE, 0.1f, "V"},
-    {0x18, 0x1A, 4, TagEnc::BCD_LE, 0.1f, "V"},
+    {0x14, 0x14, 4, TagEnc::TAG_ENC_BCD_LE, 0.1f, "V"},
+    {0x15, 0x17, 4, TagEnc::TAG_ENC_BCD_LE, 0.1f, "V"},
+    {0x18, 0x1A, 4, TagEnc::TAG_ENC_BCD_LE, 0.1f, "V"},
 
     // Currents: 0x1B single-phase, 0x1C neutral, 0x1D..0x1F per phase.
-    {0x1B, 0x1F, 4, TagEnc::BCD_LE, 0.001f, "A"},
+    {0x1B, 0x1F, 4, TagEnc::TAG_ENC_BCD_LE, 0.001f, "A"},
 
     // Power, total then per phase. Reactive is the only signed BCD on the wire.
-    {0x20, 0x23, 4, TagEnc::BCD_LE_SIGNED, 1.0f, "W"},
-    {0x24, 0x27, 4, TagEnc::BCD_LE_SIGNED, 1.0f, "var"},
+    {0x20, 0x23, 4, TagEnc::TAG_ENC_BCD_LE_SIGNED, 1.0f, "W"},
+    {0x24, 0x27, 4, TagEnc::TAG_ENC_BCD_LE_SIGNED, 1.0f, "var"},
 
-    {0x28, 0x28, 4, TagEnc::BCD_LE, 0.01f, "Hz"},
-    {0x29, 0x29, 7, TagEnc::BCD_CLOCK, 1.0f, ""},
+    {0x28, 0x28, 4, TagEnc::TAG_ENC_BCD_LE, 0.01f, "Hz"},
+    {0x29, 0x29, 7, TagEnc::TAG_ENC_BCD_CLOCK, 1.0f, ""},
     // Temperature: 2-byte signed binary, unlike its 4-byte BCD neighbours.
-    {0x2A, 0x2A, 2, TagEnc::INT_LE, 0.1f, "\302\260C"},
+    {0x2A, 0x2A, 2, TagEnc::TAG_ENC_INT_LE, 0.1f, "\302\260C"},
 
     // 0x2B skipped, special use-case for D101-2 LCD test
-    {0x2C, 0x35, 4, TagEnc::BCD_LE, 0.001f, "kWh"}, // active energy import (sum + by 4 tariffs), then export, end of last period
-    {0x36, 0x3F, 4, TagEnc::BCD_LE, 0.001f, "kvarh"}, // reactive energy import  (sum + by 4 tariffs), then export end of last period
+    // Each family is import (sum, then 4 tariffs), then export, then end of the last period.
+    {0x2C, 0x35, 4, TagEnc::TAG_ENC_BCD_LE, 0.001f, "kWh"},    // active energy
+    {0x36, 0x3F, 4, TagEnc::TAG_ENC_BCD_LE, 0.001f, "kvarh"},  // reactive energy
     // 0x48..0x4F are identity/config objects of varying width - a YAML `bytes:`
     // is the only way to read one.
 };
@@ -73,7 +74,7 @@ bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
   }
   // A YAML-declared width fills the gap, consulted last so it cannot shadow a row.
   if (tag_width_overrides != nullptr && tag < TAG_WIDTH_TABLE_SIZE && tag_width_overrides[tag] != 0) {
-    *out = TagInfo{tag_width_overrides[tag], TagEnc::USER, 1.0f, ""};
+    *out = TagInfo{tag_width_overrides[tag], TagEnc::TAG_ENC_USER, 1.0f, ""};
     return true;
   }
   return false;
@@ -81,15 +82,15 @@ bool tag_info(uint8_t tag, TagInfo *out, const uint8_t *tag_width_overrides) {
 
 const char *payload_shape_to_string(PayloadShape s) {
   switch (s) {
-    case PayloadShape::RECORDS:
+    case PayloadShape::PAYLOAD_SHAPE_RECORDS:
       return "records half: DI, COUNT, records";
-    case PayloadShape::STATUS_HALF:
+    case PayloadShape::PAYLOAD_SHAPE_STATUS_HALF:
       return "status half: DI, leftover records, status block";
-    case PayloadShape::FIXED_F101:
+    case PayloadShape::PAYLOAD_SHAPE_FIXED_F101:
       return "fixed F101: DI, 2 energy groups of 9, status block";
-    case PayloadShape::FIXED_F102_3PH:
+    case PayloadShape::PAYLOAD_SHAPE_FIXED_F102_3PH:
       return "fixed F102 three-phase: DI, marker, 15 BCD values";
-    case PayloadShape::FIXED_F102_1PH:
+    case PayloadShape::PAYLOAD_SHAPE_FIXED_F102_1PH:
       return "fixed F102 single-phase: DI, lead, 5 BCD values";
     default:
       return "unknown";
@@ -98,23 +99,23 @@ const char *payload_shape_to_string(PayloadShape s) {
 
 const char *parse_result_to_string(ParseResult r) {
   switch (r) {
-    case ParseResult::OK:
+    case ParseResult::PARSE_RESULT_OK:
       return "OK";
-    case ParseResult::ERROR_RESPONSE:
+    case ParseResult::PARSE_RESULT_ERROR_RESPONSE:
       return "meter refused the read";
-    case ParseResult::NO_FRAME:
+    case ParseResult::PARSE_RESULT_NO_FRAME:
       return "no length/CRC-consistent frame";
-    case ParseResult::BAD_CHECKSUM:
+    case ParseResult::PARSE_RESULT_BAD_CHECKSUM:
       return "DL/T645 checksum mismatch";
-    case ParseResult::MALFORMED:
+    case ParseResult::PARSE_RESULT_MALFORMED:
       return "malformed DL/T645 frame";
-    case ParseResult::WRONG_ADDRESS:
+    case ParseResult::PARSE_RESULT_WRONG_ADDRESS:
       return "address is not our meter";
-    case ParseResult::NOT_RESPONSE:
+    case ParseResult::PARSE_RESULT_NOT_RESPONSE:
       return "control code is not a read response";
-    case ParseResult::UNKNOWN_TAG:
+    case ParseResult::PARSE_RESULT_UNKNOWN_TAG:
       return "unknown item TAG (width unknown, framing lost)";
-    case ParseResult::TOO_MANY_ITEMS:
+    case ParseResult::PARSE_RESULT_TOO_MANY_ITEMS:
       return "too many items";
     default:
       return "unknown";
@@ -171,11 +172,11 @@ const uint8_t REQUEST_BODY_LONG[6] = {0x00, 0x00, 0x00, 0x00, 0x01, 0x23};
 const uint8_t REQUEST_BODY_SHORT[1] = {0x00};
 
 const ListRequest LIST_REQUESTS[LIST_REQUEST_COUNT] = {
-    {DI_LIST_B_RECORDS, ListId::B, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    {DI_LIST_B_STATUS, ListId::B, ListPart::STATUS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
-    {DI_LIST_A_RECORDS, ListId::A, ListPart::RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    {DI_LIST_2_RECORDS, ListId::LIST_ID_2, ListPart::LIST_PART_RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    {DI_LIST_2_STATUS, ListId::LIST_ID_2, ListPart::LIST_PART_STATUS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
+    {DI_LIST_1_RECORDS, ListId::LIST_ID_1, ListPart::LIST_PART_RECORDS, REQUEST_BODY_LONG, sizeof(REQUEST_BODY_LONG)},
     // The one short body; sending the long one here gets no reply at all.
-    {DI_LIST_A_STATUS, ListId::A, ListPart::STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
+    {DI_LIST_1_STATUS, ListId::LIST_ID_1, ListPart::LIST_PART_STATUS, REQUEST_BODY_SHORT, sizeof(REQUEST_BODY_SHORT)},
 };
 
 const FixedRequest FIXED_REQUESTS[FIXED_REQUEST_COUNT] = {
@@ -204,21 +205,21 @@ uint8_t fixed_request_index(uint16_t di) {
  * TAG 0x1F is therefore deliberately absent - it is a different object.
  */
 const FixedValue F102_3PH_MAP[F102_3PH_VALUE_COUNT] = {
-    {0x20, offsetof(f102_3ph, p_total), TagEnc::BCD_LE_SIGNED, 0.1f},  // P total    x0.1 W   -> W
-    {0x21, offsetof(f102_3ph, p_l1), TagEnc::BCD_LE_SIGNED, 0.1f},     // P L1
-    {0x22, offsetof(f102_3ph, p_l2), TagEnc::BCD_LE_SIGNED, 0.1f},     // P L2
-    {0x23, offsetof(f102_3ph, p_l3), TagEnc::BCD_LE_SIGNED, 0.1f},     // P L3
-    {0x24, offsetof(f102_3ph, q_total), TagEnc::BCD_LE_SIGNED, 0.1f},  // Q total    x0.1 var -> var
-    {0x25, offsetof(f102_3ph, q_l1), TagEnc::BCD_LE_SIGNED, 0.1f},     // Q L1
-    {0x26, offsetof(f102_3ph, q_l2), TagEnc::BCD_LE_SIGNED, 0.1f},     // Q L2
-    {0x27, offsetof(f102_3ph, q_l3), TagEnc::BCD_LE_SIGNED, 0.1f},     // Q L3
-    {0x15, offsetof(f102_3ph, u_l1), TagEnc::BCD_LE, 0.01f},           // U L1       x0.01 V  -> V
-    {0x16, offsetof(f102_3ph, u_l2), TagEnc::BCD_LE, 0.01f},           // U L2
-    {0x17, offsetof(f102_3ph, u_l3), TagEnc::BCD_LE, 0.01f},           // U L3
-    {0x1C, offsetof(f102_3ph, i_l1), TagEnc::BCD_LE, 0.01f},           // I L1       x0.01 A  -> A
-    {0x1D, offsetof(f102_3ph, i_l2), TagEnc::BCD_LE, 0.01f},           // I L2
-    {0x1E, offsetof(f102_3ph, i_l3), TagEnc::BCD_LE, 0.01f},           // I L3
-    {0x28, offsetof(f102_3ph, freq), TagEnc::BCD_LE, 0.01f},           // frequency  x0.01 Hz -> Hz
+    {0x20, offsetof(f102_3ph, p_total), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},  // P total    x0.1 W   -> W
+    {0x21, offsetof(f102_3ph, p_l1), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},     // P L1
+    {0x22, offsetof(f102_3ph, p_l2), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},     // P L2
+    {0x23, offsetof(f102_3ph, p_l3), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},     // P L3
+    {0x24, offsetof(f102_3ph, q_total), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},  // Q total    x0.1 var -> var
+    {0x25, offsetof(f102_3ph, q_l1), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},     // Q L1
+    {0x26, offsetof(f102_3ph, q_l2), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},     // Q L2
+    {0x27, offsetof(f102_3ph, q_l3), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},     // Q L3
+    {0x15, offsetof(f102_3ph, u_l1), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // U L1       x0.01 V  -> V
+    {0x16, offsetof(f102_3ph, u_l2), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // U L2
+    {0x17, offsetof(f102_3ph, u_l3), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // U L3
+    {0x1C, offsetof(f102_3ph, i_l1), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // I L1       x0.01 A  -> A
+    {0x1D, offsetof(f102_3ph, i_l2), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // I L2
+    {0x1E, offsetof(f102_3ph, i_l3), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // I L3
+    {0x28, offsetof(f102_3ph, freq), TagEnc::TAG_ENC_BCD_LE, 0.01f},           // frequency  x0.01 Hz -> Hz
 };
 
 /* DI 0xF102, single-phase: power only.
@@ -230,8 +231,8 @@ const FixedValue F102_3PH_MAP[F102_3PH_VALUE_COUNT] = {
  * prints all five raw for that reason.
  */
 const FixedValue F102_1PH_MAP[F102_1PH_VALUE_COUNT] = {
-    {0x20, offsetof(f102_1ph, p), TagEnc::BCD_LE_SIGNED, 0.1f},  // P  x0.1 W   -> W
-    {0x24, offsetof(f102_1ph, q), TagEnc::BCD_LE_SIGNED, 0.1f},  // Q  x0.1 var -> var
+    {0x20, offsetof(f102_1ph, p), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},  // P  x0.1 W   -> W
+    {0x24, offsetof(f102_1ph, q), TagEnc::TAG_ENC_BCD_LE_SIGNED, 0.1f},  // Q  x0.1 var -> var
 };
 
 /* DI 0xF101: the reactive energy registers, two groups of nine [total, T1..T8] as
@@ -245,16 +246,16 @@ const FixedValue F102_1PH_MAP[F102_1PH_VALUE_COUNT] = {
  * and export ever look swapped, this is the line to doubt.
  */
 const FixedValue F101_MAP[F101_VALUE_COUNT] = {
-    {0x0A, offsetof(nartis_f101, group20) + 0, TagEnc::UINT_LE, 0.001f},   // R+ total
-    {0x0B, offsetof(nartis_f101, group20) + 4, TagEnc::UINT_LE, 0.001f},   // R+ T1
-    {0x0C, offsetof(nartis_f101, group20) + 8, TagEnc::UINT_LE, 0.001f},   // R+ T2
-    {0x0D, offsetof(nartis_f101, group20) + 12, TagEnc::UINT_LE, 0.001f},  // R+ T3
-    {0x0E, offsetof(nartis_f101, group20) + 16, TagEnc::UINT_LE, 0.001f},  // R+ T4
-    {0x0F, offsetof(nartis_f101, group30) + 0, TagEnc::UINT_LE, 0.001f},   // R- total
-    {0x10, offsetof(nartis_f101, group30) + 4, TagEnc::UINT_LE, 0.001f},   // R- T1
-    {0x11, offsetof(nartis_f101, group30) + 8, TagEnc::UINT_LE, 0.001f},   // R- T2
-    {0x12, offsetof(nartis_f101, group30) + 12, TagEnc::UINT_LE, 0.001f},  // R- T3
-    {0x13, offsetof(nartis_f101, group30) + 16, TagEnc::UINT_LE, 0.001f},  // R- T4
+    {0x0A, offsetof(nartis_f101, group20) + 0, TagEnc::TAG_ENC_UINT_LE, 0.001f},   // R+ total
+    {0x0B, offsetof(nartis_f101, group20) + 4, TagEnc::TAG_ENC_UINT_LE, 0.001f},   // R+ T1
+    {0x0C, offsetof(nartis_f101, group20) + 8, TagEnc::TAG_ENC_UINT_LE, 0.001f},   // R+ T2
+    {0x0D, offsetof(nartis_f101, group20) + 12, TagEnc::TAG_ENC_UINT_LE, 0.001f},  // R+ T3
+    {0x0E, offsetof(nartis_f101, group20) + 16, TagEnc::TAG_ENC_UINT_LE, 0.001f},  // R+ T4
+    {0x0F, offsetof(nartis_f101, group30) + 0, TagEnc::TAG_ENC_UINT_LE, 0.001f},   // R- total
+    {0x10, offsetof(nartis_f101, group30) + 4, TagEnc::TAG_ENC_UINT_LE, 0.001f},   // R- T1
+    {0x11, offsetof(nartis_f101, group30) + 8, TagEnc::TAG_ENC_UINT_LE, 0.001f},   // R- T2
+    {0x12, offsetof(nartis_f101, group30) + 12, TagEnc::TAG_ENC_UINT_LE, 0.001f},  // R- T3
+    {0x13, offsetof(nartis_f101, group30) + 16, TagEnc::TAG_ENC_UINT_LE, 0.001f},  // R- T4
 };
 
 uint8_t f102_value_map(uint8_t payload_len, const FixedValue **out) {
@@ -279,7 +280,7 @@ bool fixed_value(const uint8_t *payload, uint8_t payload_len, const FixedValue &
     return false;  // the map and the layout it describes have drifted apart
   }
 
-  if (v.enc == TagEnc::UINT_LE) {
+  if (v.enc == TagEnc::TAG_ENC_UINT_LE) {
     uint32_t raw = 0;
     for (uint8_t i = 0; i < 4; i++) {
       raw |= static_cast<uint32_t>(payload[v.offset + i]) << (8 * i);
@@ -301,12 +302,12 @@ bool fixed_value(const uint8_t *payload, uint8_t payload_len, const FixedValue &
   }
 
   const int32_t raw =
-      (v.enc == TagEnc::BCD_LE_SIGNED) ? bcd32_signed(&field) : static_cast<int32_t>(bcd32_value(&field));
+      (v.enc == TagEnc::TAG_ENC_BCD_LE_SIGNED) ? bcd32_signed(&field) : static_cast<int32_t>(bcd32_value(&field));
   *out = static_cast<float>(raw) * v.scale;
   return true;
 }
 
-const char *list_id_to_string(ListId l) { return (l == ListId::A) ? "A" : "B"; }
+const char *list_id_to_string(ListId l) { return (l == ListId::LIST_ID_1) ? "1" : "2"; }
 
 uint8_t list_request_index(uint16_t di) {
   for (uint8_t i = 0; i < LIST_REQUEST_COUNT; i++) {
@@ -401,7 +402,7 @@ namespace {
 struct ItemWalk {
   uint8_t count{0};                       ///< records written to `out`
   size_t end{0};                          ///< payload offset just past the last one
-  ParseResult result{ParseResult::OK};    ///< why the walk stopped, if it stopped early
+  ParseResult result{ParseResult::PARSE_RESULT_OK};    ///< why the walk stopped, if it stopped early
   uint8_t unknown_tag{0};                 ///< valid when result == UNKNOWN_TAG
   uint8_t unknown_offset{0};
 };
@@ -417,20 +418,20 @@ ItemWalk walk_items(const uint8_t *payload, size_t end, size_t start, size_t max
   size_t pos = start;
   while (w.count < max_records && pos < end) {
     if (w.count >= MAX_ITEMS) {
-      w.result = ParseResult::TOO_MANY_ITEMS;
+      w.result = ParseResult::PARSE_RESULT_TOO_MANY_ITEMS;
       return w;
     }
     const uint8_t tag = payload[pos];
     TagInfo info{};
     if (!tag_info(tag, &info, tag_width_overrides)) {
-      w.result = ParseResult::UNKNOWN_TAG;
+      w.result = ParseResult::PARSE_RESULT_UNKNOWN_TAG;
       w.unknown_tag = tag;
       w.unknown_offset = static_cast<uint8_t>(pos);
       return w;
     }
     if (pos + 1 + info.width > end) {
       // Cut mid-record - a framing error, unlike stopping short by whole records.
-      w.result = ParseResult::MALFORMED;
+      w.result = ParseResult::PARSE_RESULT_MALFORMED;
       return w;
     }
     out[w.count].tag = tag;
@@ -448,7 +449,7 @@ ItemWalk walk_items(const uint8_t *payload, size_t end, size_t start, size_t max
 ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_le[SERIAL_BCD_SIZE],
                            ParsedResponse *out, const uint8_t *tag_width_overrides) {
   if (buf == nullptr || serial_le == nullptr || out == nullptr) {
-    return ParseResult::NO_FRAME;
+    return ParseResult::PARSE_RESULT_NO_FRAME;
   }
 
   for (size_t lp = 0; lp <= MAX_START_SCAN && lp < len; lp++) {
@@ -469,24 +470,24 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     const size_t f_len = env_len - D101_HDR_AFTER_LEN;
 
     if (f[0] != DLT645_DELIM || f[7] != DLT645_DELIM) {
-      return ParseResult::MALFORMED;
+      return ParseResult::PARSE_RESULT_MALFORMED;
     }
     if (std::memcmp(f + 1, serial_le, SERIAL_BCD_SIZE) != 0) {
-      return ParseResult::WRONG_ADDRESS;  // a neighbour's meter, or a stray frame
+      return ParseResult::PARSE_RESULT_WRONG_ADDRESS;  // a neighbour's meter, or a stray frame
     }
     const size_t data_len = f[9];
     if (DLT645_OVERHEAD + data_len != f_len) {
-      return ParseResult::MALFORMED;
+      return ParseResult::PARSE_RESULT_MALFORMED;
     }
     if (f[11 + data_len] != DLT645_END) {
-      return ParseResult::MALFORMED;
+      return ParseResult::PARSE_RESULT_MALFORMED;
     }
     uint8_t cs = 0;
     for (size_t i = 0; i < 10 + data_len; i++) {
       cs = static_cast<uint8_t>(cs + f[i]);
     }
     if (cs != f[10 + data_len]) {
-      return ParseResult::BAD_CHECKSUM;
+      return ParseResult::PARSE_RESULT_BAD_CHECKSUM;
     }
 
     // Strip the +0x33 transmission offset, and keep the result in `out` so the
@@ -499,17 +500,17 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     }
     const uint8_t *payload = out->payload;
     if (data_len > MAX_PAYLOAD) {
-      return ParseResult::MALFORMED;  // longer than anything this protocol should send
+      return ParseResult::PARSE_RESULT_MALFORMED;  // longer than anything this protocol should send
     }
 
     // Bit 7 marks the reply direction, bit 6 a refusal - whose DATA carries error
     // bytes, not items.
     if (f[8] != DLT645_C_READ_RSP) {
-      return ((f[8] & 0x80) != 0) ? ParseResult::ERROR_RESPONSE : ParseResult::NOT_RESPONSE;
+      return ((f[8] & 0x80) != 0) ? ParseResult::PARSE_RESULT_ERROR_RESPONSE : ParseResult::PARSE_RESULT_NOT_RESPONSE;
     }
 
     if (data_len < 2) {
-      return ParseResult::MALFORMED;  // need at least the echoed DI
+      return ParseResult::PARSE_RESULT_MALFORMED;  // need at least the echoed DI
     }
     out->di = static_cast<uint16_t>(payload[0]) | static_cast<uint16_t>(payload[1] << 8);
 
@@ -520,17 +521,17 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
      */
     if (out->di == DI_FIXED_F101 || out->di == DI_FIXED_F102) {
       if (out->di == DI_FIXED_F101 && data_len == sizeof(nartis_f101)) {
-        out->shape = PayloadShape::FIXED_F101;
+        out->shape = PayloadShape::PAYLOAD_SHAPE_FIXED_F101;
       } else if (out->di == DI_FIXED_F102 && data_len == sizeof(f102_3ph)) {
-        out->shape = PayloadShape::FIXED_F102_3PH;
+        out->shape = PayloadShape::PAYLOAD_SHAPE_FIXED_F102_3PH;
       } else if (out->di == DI_FIXED_F102 && data_len == sizeof(f102_1ph)) {
-        out->shape = PayloadShape::FIXED_F102_1PH;
+        out->shape = PayloadShape::PAYLOAD_SHAPE_FIXED_F102_1PH;
       } else {
-        return ParseResult::MALFORMED;
+        return ParseResult::PARSE_RESULT_MALFORMED;
       }
       out->count = 0;
       out->announced_count = 0;
-      return ParseResult::OK;
+      return ParseResult::PARSE_RESULT_OK;
     }
 
     /* Which of the two framings is this? The request settles it, but the reading
@@ -539,34 +540,35 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
      * tried first and the other kept as a fallback.
      */
     const uint8_t req = list_request_index(out->di);
-    const bool expect_status = (req < LIST_REQUEST_COUNT) && (LIST_REQUESTS[req].part == ListPart::STATUS);
+    const bool expect_status = (req < LIST_REQUEST_COUNT) && (LIST_REQUESTS[req].part == ListPart::LIST_PART_STATUS);
 
     const auto records_end = [&](PayloadShape shape) -> size_t {
-      return (shape == PayloadShape::STATUS_HALF) ? data_len - STATUS_BLOCK_SIZE : data_len;
+      return (shape == PayloadShape::PAYLOAD_SHAPE_STATUS_HALF) ? data_len - STATUS_BLOCK_SIZE : data_len;
     };
 
     const auto try_shape = [&](PayloadShape shape) -> ItemWalk {
-      if (shape == PayloadShape::STATUS_HALF) {
+      if (shape == PayloadShape::PAYLOAD_SHAPE_STATUS_HALF) {
         // DI(2) plus the block is the shortest a status half can be.
         if (data_len < 2 + STATUS_BLOCK_SIZE) {
-          return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};
+          return ItemWalk{0, 0, ParseResult::PARSE_RESULT_MALFORMED, 0, 0};
         }
         const size_t end = records_end(shape);
-        return walk_items(payload, end, 2, end, out->items, tag_width_overrides);
+        // No COUNT on this half, so the only record cap is the buffer's.
+        return walk_items(payload, end, 2, MAX_ITEMS, out->items, tag_width_overrides);
       }
       if (data_len < 3) {
-        return ItemWalk{0, 0, ParseResult::MALFORMED, 0, 0};  // no room for a COUNT byte
+        return ItemWalk{0, 0, ParseResult::PARSE_RESULT_MALFORMED, 0, 0};  // no room for a COUNT byte
       }
       return walk_items(payload, data_len, 3, payload[2], out->items, tag_width_overrides);
     };
 
     PayloadShape candidates[2];
     if (expect_status) {
-      candidates[0] = PayloadShape::STATUS_HALF;
-      candidates[1] = PayloadShape::RECORDS;
+      candidates[0] = PayloadShape::PAYLOAD_SHAPE_STATUS_HALF;
+      candidates[1] = PayloadShape::PAYLOAD_SHAPE_RECORDS;
     } else {
-      candidates[0] = PayloadShape::RECORDS;
-      candidates[1] = PayloadShape::STATUS_HALF;
+      candidates[0] = PayloadShape::PAYLOAD_SHAPE_RECORDS;
+      candidates[1] = PayloadShape::PAYLOAD_SHAPE_STATUS_HALF;
     }
 
     ItemWalk walk{};
@@ -574,7 +576,7 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
     bool exact = false;
     for (const PayloadShape candidate : candidates) {
       walk = try_shape(candidate);
-      if (walk.result == ParseResult::OK && walk.end == records_end(candidate)) {
+      if (walk.result == ParseResult::PARSE_RESULT_OK && walk.end == records_end(candidate)) {
         shape = candidate;
         exact = true;
         break;
@@ -589,26 +591,26 @@ ParseResult parse_response(const uint8_t *buf, size_t len, const uint8_t serial_
 
     out->count = walk.count;
     out->shape = shape;
-    out->announced_count = (shape == PayloadShape::RECORDS && data_len >= 3) ? payload[2] : 0;
-    if (shape == PayloadShape::STATUS_HALF && data_len >= 2 + STATUS_BLOCK_SIZE) {
+    out->announced_count = (shape == PayloadShape::PAYLOAD_SHAPE_RECORDS && data_len >= 3) ? payload[2] : 0;
+    if (shape == PayloadShape::PAYLOAD_SHAPE_STATUS_HALF && data_len >= 2 + STATUS_BLOCK_SIZE) {
       std::memcpy(out->status_block, payload + data_len - STATUS_BLOCK_SIZE, STATUS_BLOCK_SIZE);
       out->has_status_block = true;
     }
-    if (walk.result == ParseResult::UNKNOWN_TAG) {
+    if (walk.result == ParseResult::PARSE_RESULT_UNKNOWN_TAG) {
       out->unknown_tag = walk.unknown_tag;
       out->unknown_offset = walk.unknown_offset;
     }
-    if (walk.result != ParseResult::OK) {
+    if (walk.result != ParseResult::PARSE_RESULT_OK) {
       return walk.result;
     }
     if (!exact) {
       // Every record read cleanly yet bytes are left over, so a width must be wrong.
-      return ParseResult::MALFORMED;
+      return ParseResult::PARSE_RESULT_MALFORMED;
     }
-    return ParseResult::OK;
+    return ParseResult::PARSE_RESULT_OK;
   }
 
-  return ParseResult::NO_FRAME;
+  return ParseResult::PARSE_RESULT_NO_FRAME;
 }
 
 int32_t item_as_i32(const ParsedItem &item) {
@@ -706,16 +708,16 @@ bool item_as_scaled(const ParsedItem &item, const TagInfo &info, float *out) {
     return false;
   }
   switch (info.enc) {
-    case TagEnc::UINT_LE:
+    case TagEnc::TAG_ENC_UINT_LE:
     // A YAML-declared width has no unit and a scale of 1, so read it raw and leave
     // a `multiply` filter as the way to scale it.
-    case TagEnc::USER:
+    case TagEnc::TAG_ENC_USER:
       *out = static_cast<float>(item_as_u32(item)) * info.scale;
       return true;
-    case TagEnc::INT_LE:
+    case TagEnc::TAG_ENC_INT_LE:
       *out = static_cast<float>(item_as_i32(item)) * info.scale;
       return true;
-    case TagEnc::BCD_LE: {
+    case TagEnc::TAG_ENC_BCD_LE: {
       uint32_t value = 0;
       if (!item_as_bcd(item, &value)) {
         return false;
@@ -723,7 +725,7 @@ bool item_as_scaled(const ParsedItem &item, const TagInfo &info, float *out) {
       *out = static_cast<float>(value) * info.scale;
       return true;
     }
-    case TagEnc::BCD_LE_SIGNED: {
+    case TagEnc::TAG_ENC_BCD_LE_SIGNED: {
       int32_t value = 0;
       if (!item_as_bcd_signed(item, &value)) {
         return false;

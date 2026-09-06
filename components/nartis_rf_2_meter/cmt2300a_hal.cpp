@@ -15,8 +15,6 @@ static const char *const TAG = "cmt2300a_hal";
 
 static constexpr size_t TX_PAD = 6;  // 0x55 pad: the chip drops ~2-3 leading FIFO bytes at TX start
 
-Cmt2300aHal::~Cmt2300aHal() = default;
-
 // ---------------- bit-banged 3-wire SPI (MSB-first) ----------------
 void Cmt2300aHal::spi_delay() { esphome::delayMicroseconds(2); }
 void Cmt2300aHal::sdio_set_output() { this->sdio_.pin_mode(gpio::FLAG_OUTPUT); }
@@ -195,7 +193,6 @@ bool Cmt2300aHal::init() {
   this->update_reg(REG_IO_SEL, MASK_GPIO3_SEL, GPIO3_SEL_INT2);           // GPIO3 pad = INT2
   this->update_reg(REG_INT2_CTL, MASK_INT_POLAR, 0x00);                   // INT2 active-high
 
-  this->initialized_ = true;
   ESP_LOGI(TAG, "CMT2300A initialized (%.3f MHz)", this->rf_freq_hz_ / 1e6f);
   return true;
 }
@@ -355,8 +352,6 @@ bool Cmt2300aHal::begin_rx(int off_codes) {
   }
   return true;
 }
-
-bool Cmt2300aHal::rx_fifo_threshold() { return pin_read(this->gpio3_); }
 
 size_t Cmt2300aHal::drain_rx(uint8_t *buf, size_t buf_size, uint8_t max_chunks) {
   size_t total = 0;

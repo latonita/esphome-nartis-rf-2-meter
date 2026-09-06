@@ -23,9 +23,6 @@ namespace esphome::nartis_rf_2_meter {
 
 class Cmt2300aHal {
  public:
-  Cmt2300aHal() = default;
-  ~Cmt2300aHal();
-
   /// Set GPIO pins. Must be called before init().
   void set_pins(esphome::InternalGPIOPin *sdio, esphome::InternalGPIOPin *sclk,
                 esphome::InternalGPIOPin *csb, esphome::InternalGPIOPin *fcsb,
@@ -49,9 +46,6 @@ class Cmt2300aHal {
   /// Enter RX centred at rf_freq_hz_ + off_codes * 6.199 Hz.
   bool begin_rx(int off_codes);
 
-  /// True while >= FIFO threshold (15) unread bytes sit in the RX FIFO.
-  bool rx_fifo_threshold();
-
   /// Drain full 15-byte chunks while the threshold line is asserted, up to
   /// buf_size / max_chunks. Returns bytes appended.
   size_t drain_rx(uint8_t *buf, size_t buf_size, uint8_t max_chunks = 5);
@@ -69,8 +63,6 @@ class Cmt2300aHal {
   uint8_t spi_recv_byte();
   void spi_write_reg(uint8_t addr, uint8_t val);
   uint8_t spi_read_reg(uint8_t addr);
-  void write_reg(uint8_t addr, uint8_t val) { this->spi_write_reg(addr, val); }
-  uint8_t read_reg(uint8_t addr) { return this->spi_read_reg(addr); }
   void update_reg(uint8_t addr, uint8_t mask, uint8_t val);
   void write_bank(uint8_t start_addr, const uint8_t *data, size_t len);
   void write_fifo(const uint8_t *data, size_t len);
@@ -101,8 +93,6 @@ class Cmt2300aHal {
   esphome::ISRInternalGPIOPin csb_;
   esphome::ISRInternalGPIOPin fcsb_;
   esphome::ISRInternalGPIOPin gpio3_;
-
-  bool initialized_{false};
 
   // Per-channel frequency: rf_freq_hz_ -> freq_bank_ (8 bytes: [RX-LO 4B][TX-LO 4B]).
   uint32_t rf_freq_hz_{443900000};

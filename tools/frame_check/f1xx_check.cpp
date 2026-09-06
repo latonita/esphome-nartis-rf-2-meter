@@ -97,9 +97,9 @@ int main() {
   const ParseResult pr = parse_response(frame, buf_len, serial, &r);
   std::printf("parse: %s, DI 0x%04X, shape '%s', payload %u B\n", parse_result_to_string(pr), r.di,
               payload_shape_to_string(r.shape), r.payload_len);
-  check(pr == ParseResult::OK, "the captured reply parses");
+  check(pr == ParseResult::PARSE_RESULT_OK, "the captured reply parses");
   check(r.di == DI_FIXED_F102, "DI is 0xF102");
-  check(r.shape == PayloadShape::FIXED_F102_3PH, "read as the three-phase fixed block");
+  check(r.shape == PayloadShape::PAYLOAD_SHAPE_FIXED_F102_3PH, "read as the three-phase fixed block");
   check(r.payload_len == sizeof(f102_3ph), "DATA is 63 bytes - which is the whole 3ph/1ph test");
   check(r.count == 0, "no records: a fixed block has no TAGs to walk");
   check(r.announced_count == 0, "and no COUNT byte to announce anything");
@@ -164,8 +164,8 @@ int main() {
     const ParseResult p1 = parse_response(f, n, serial, &r1);
     std::printf("parse: %s, shape '%s', payload %u B\n", parse_result_to_string(p1), payload_shape_to_string(r1.shape),
                 r1.payload_len);
-    check(p1 == ParseResult::OK, "it parses");
-    check(r1.shape == PayloadShape::FIXED_F102_1PH, "23 bytes of DATA reads as the single-phase block");
+    check(p1 == ParseResult::PARSE_RESULT_OK, "it parses");
+    check(r1.shape == PayloadShape::PAYLOAD_SHAPE_FIXED_F102_1PH, "23 bytes of DATA reads as the single-phase block");
     check(r1.payload_len == sizeof(f102_1ph), "DATA is 23 bytes");
 
     f102_1ph s{};
@@ -209,9 +209,9 @@ int main() {
     const ParseResult p2 = parse_response(f, n, serial, &r2);
     std::printf("parse: %s, shape '%s', payload %u B\n", parse_result_to_string(p2), payload_shape_to_string(r2.shape),
                 r2.payload_len);
-    check(p2 == ParseResult::OK, "it parses");
+    check(p2 == ParseResult::PARSE_RESULT_OK, "it parses");
     check(r2.di == DI_FIXED_F101, "DI is 0xF101");
-    check(r2.shape == PayloadShape::FIXED_F101, "read as the F101 fixed block");
+    check(r2.shape == PayloadShape::PAYLOAD_SHAPE_FIXED_F101, "read as the F101 fixed block");
     check(r2.payload_len == 84, "DATA is 84 bytes: DI, 2 x 9 x u32, 10-byte status");
 
     nartis_f101 blk{};
@@ -242,7 +242,7 @@ int main() {
                               4u * (import_half ? i : (i - 5));
       const uint8_t want_tag = (uint8_t) (0x0A + i);
       TagInfo info{};
-      if (fv.offset != want_off || fv.tag != want_tag || fv.enc != TagEnc::UINT_LE || fv.scale != 0.001f ||
+      if (fv.offset != want_off || fv.tag != want_tag || fv.enc != TagEnc::TAG_ENC_UINT_LE || fv.scale != 0.001f ||
           !tag_info(want_tag, &info) || info.width != 4 || std::strcmp(info.unit, "kvarh") != 0) {
         std::printf("      entry %u: TAG 0x%02X off %u\n", i, fv.tag, fv.offset);
         map_ok = false;
@@ -282,7 +282,7 @@ int main() {
       const ParseResult p = parse_response(f, n, serial, &rr);
       char msg[96];
       std::snprintf(msg, sizeof(msg), "DI 0xF102 with %zu bytes of DATA is refused", want);
-      check(p != ParseResult::OK, msg);
+      check(p != ParseResult::PARSE_RESULT_OK, msg);
     }
     // And F101's length is not interchangeable with F102's.
     uint8_t data[128];
@@ -292,7 +292,7 @@ int main() {
     uint8_t f[192];
     const size_t n = build_response(f, sizeof(f), serial, data, sizeof(f102_3ph));
     ParsedResponse rr{};
-    check(parse_response(f, n, serial, &rr) != ParseResult::OK, "DI 0xF101 with F102's length is refused");
+    check(parse_response(f, n, serial, &rr) != ParseResult::PARSE_RESULT_OK, "DI 0xF101 with F102's length is refused");
   }
 
   std::printf("\n== requests ==\n");
@@ -316,9 +316,10 @@ int main() {
     }
     // The DI byte, the checksum and the two CRC bytes.
     check(diff <= 4, "and differ only in the DI, the checksum and the CRC");
-    check(fixed_request_index(DI_FIXED_F101) == 0 && fixed_request_index(DI_FIXED_F102) == 1,
-          "fixed_request_index() finds both");
-    check(fixed_request_index(DI_LIST_B_RECORDS) == FIXED_REQUEST_COUNT, "and rejects a list DI");
+    check(fixed_request_index(DI_FIXED_F101) == FIXED_IDX_F101 &&
+              fixed_request_index(DI_FIXED_F102) == FIXED_IDX_F102,
+          "fixed_request_index() agrees with the FIXED_IDX_* the YAML sources index by");
+    check(fixed_request_index(DI_LIST_2_RECORDS) == FIXED_REQUEST_COUNT, "and rejects a list DI");
     check(list_request_index(DI_FIXED_F102) == LIST_REQUEST_COUNT, "list_request_index() rejects a fixed DI");
     check(build_request(buf, sizeof(buf), serial, 0xF1FF) == 0, "an unknown DI still refuses to build");
   }
@@ -411,7 +412,7 @@ int main() {
     bool encs = true;
     for (uint8_t i = 0; i < F102_3PH_VALUE_COUNT; i++) {
       const bool signed_group = F102_3PH_MAP[i].tag >= 0x20 && F102_3PH_MAP[i].tag <= 0x27;
-      const TagEnc want = signed_group ? TagEnc::BCD_LE_SIGNED : TagEnc::BCD_LE;
+      const TagEnc want = signed_group ? TagEnc::TAG_ENC_BCD_LE_SIGNED : TagEnc::TAG_ENC_BCD_LE;
       if (F102_3PH_MAP[i].enc != want) {
         std::printf("      TAG 0x%02X: wrong encoding\n", F102_3PH_MAP[i].tag);
         encs = false;

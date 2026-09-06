@@ -1,18 +1,16 @@
 """Nartis RF-2 meter - numeric sensor platform.
 
-Each entity selects either a value by its item `tag` - from whichever configured
-source carried it - or a numeric field of the `status` block. Exactly one of the
-two.
+An entity selects either a value by its item `tag` - from whichever configured
+source carried it - or a numeric field of the `status` block, never both.
 
-The published state is already scaled to the unit `tags.md` gives for that TAG, so
-set `unit_of_measurement` to match and do not add a `multiply` filter. A `tag`
-read with a `bytes:` override is the exception: its unit is unknown, so it is
-published raw and a filter is the only way to scale it.
+The state is already scaled to the unit `tags.md` gives that TAG, so set
+`unit_of_measurement` to match and do not add a `multiply` filter. A `tag` read
+with `bytes:` is the exception: unknown unit, published raw.
 """
 
 import esphome.codegen as cg
-import esphome.config_validation as cv
 from esphome.components import sensor
+import esphome.config_validation as cv
 
 from . import (
     CONF_BYTES,
@@ -51,6 +49,6 @@ async def to_code(config):
     var = await sensor.new_sensor(config)
 
     tag = config.get(CONF_TAG, 0)
-    field = config.get(CONF_STATUS, StatusField.NONE)
+    field = config.get(CONF_STATUS, StatusField.STATUS_FIELD_NONE)
 
     cg.add(parent.register_sensor(var, tag, field, config.get(CONF_BYTES, 0)))

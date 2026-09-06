@@ -10,22 +10,23 @@
 #                 the 4-byte binary the DLMS data types had suggested, plus the
 #                 DI 0xF203 replies: the assembled continuation forms and the one
 #                 captured off the air, which turned out to be a status block
+#   f1xx_check  - the fixed blocks DI 0xF101 and DI 0xF102: length as the only
+#                 identification of the layout, and the map from their positional
+#                 fields onto TAGs
 COMP := ../../components/nartis_rf_2_meter
+CXX ?= g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -I$(COMP)
 DEPS := $(COMP)/d101_frame.cpp $(COMP)/d101_frame.h
+CHECKS := frame_check f202_check f1xx_check
 
-all: frame_check f202_check
+all: $(CHECKS)
 
-frame_check: frame_check.cpp $(DEPS)
-	g++ $(CXXFLAGS) -o $@ frame_check.cpp $(COMP)/d101_frame.cpp
-
-f202_check: f202_check.cpp $(DEPS)
-	g++ $(CXXFLAGS) -o $@ f202_check.cpp $(COMP)/d101_frame.cpp
+$(CHECKS): %: %.cpp $(DEPS)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(COMP)/d101_frame.cpp
 
 .PHONY: all check clean
-check: frame_check f202_check
-	./frame_check
-	./f202_check
+check: $(CHECKS)
+	$(foreach c,$(CHECKS),./$(c) &&) true
 
 clean:
-	rm -f frame_check f202_check
+	rm -f $(CHECKS)
