@@ -1,0 +1,206 @@
+esphome:
+  name: nartis-rf-2-reader
+  friendly_name: Nartis RF-2 Meter Reader
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+# Fill in your own secrets to enable these.
+#api:
+#  encryption:
+#    key: !secret api_encryption_key
+#ota:
+#  - platform: esphome
+#    password: !secret ota_password
+#wifi:
+#  ssid: !secret wifi_ssid
+#  password: !secret wifi_password
+
+external_components:
+  - source: github://latonita/esphome-nartis-rf-2-meter
+    components: [nartis_rf_2_meter]
+
+# CMT2300A wiring - adjust the GPIOs to your board.
+nartis_rf_2_meter:
+  id: nartis
+  address: "023240271060"   # 12 digits from the meter nameplate
+  pin_sdio: GPIO19
+  pin_sclk: GPIO18
+  pin_csb: GPIO5
+  pin_fcsb: GPIO21
+  pin_gpio3: GPIO22         # INT2
+  update_interval: 300s
+  # Optional, shown with their defaults:
+  # frequency: 443.9MHz     # default: derived from `address`
+  # request_gap: 500ms      # also separates DI 0xF202 from its DI 0xF203 tail
+  # rf_rx_timeout: 1800ms
+  # rf_retries: 2
+  # rx_center_offset: 758
+  # Diagnostic: signal level of the last reply heard in a cycle. dBm, device class
+  # and diagnostic category are set for you - a name is all it needs. A cycle that
+  # heard nothing publishes nothing, so the entity holds instead of reading a floor.
+  rssi:
+    name: "Meter RSSI"                   # Уровень сигнала
+
+  sources: 
+    #- list_1
+    - list_2
+    #- fix_1
+    - fix_2
+
+sensor:
+  # Active energy, import (A+)
+  - platform: nartis_rf_2_meter
+    name: "Active energy total"          # Активная энергия, импорт, всего
+    tag: 0x00
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy T1"             # Тариф 1 (день)
+    tag: 0x01
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy T2"             # Тариф 2 (ночь)
+    tag: 0x02
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  # Active energy, export (A-)
+  - platform: nartis_rf_2_meter
+    name: "Active energy export total"   # Активная энергия, экспорт, всего
+    tag: 0x05
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy export T1"
+    tag: 0x06
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  - platform: nartis_rf_2_meter
+    name: "Active energy export T2"
+    tag: 0x07
+    unit_of_measurement: kWh
+    accuracy_decimals: 3
+    device_class: energy
+    state_class: total_increasing
+
+  # Phase voltages
+  - platform: nartis_rf_2_meter
+    name: "Voltage L1"                   # Напряжение фазы A
+    tag: 0x15
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Voltage L2"                   # Напряжение фазы B
+    tag: 0x16
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Voltage L3"                   # Напряжение фазы C
+    tag: 0x17
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    device_class: voltage
+    state_class: measurement
+
+  # Currents
+  - platform: nartis_rf_2_meter
+    name: "Current neutral"              # Ток нейтрали
+    tag: 0x1C
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Current L1"                   # Ток фазы A
+    tag: 0x1D
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Current L2"                   # Ток фазы B
+    tag: 0x1E
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Current L3"                   # Ток фазы C
+    tag: 0x1F
+    unit_of_measurement: A
+    accuracy_decimals: 2
+    device_class: current
+    state_class: measurement
+
+  # Power and frequency - the meter sends kW, so x10 gives watts.
+  - platform: nartis_rf_2_meter
+    name: "Active power"                 # Активная мощность, сумма по фазам
+    tag: 0x20
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    device_class: power
+    state_class: measurement
+
+  - platform: nartis_rf_2_meter
+    name: "Frequency"                    # Частота сети
+    tag: 0x28
+    unit_of_measurement: Hz
+    accuracy_decimals: 2
+    device_class: frequency
+    state_class: measurement
+
+  # Status block (DI 0xF201)
+  - platform: nartis_rf_2_meter
+    name: "Active tariff"                # Текущий тариф
+    status: active_tariff
+    icon: mdi:counter
+    entity_category: diagnostic
+
+  - platform: nartis_rf_2_meter
+    name: "Tariff count"                 # Число тарифов
+    status: tariff_count
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: nartis_rf_2_meter
+    name: "Meter clock"                  # Часы счётчика
+    tag: 0x29
+    icon: mdi:clock-outline
+    entity_category: diagnostic
+
+# Diagnostic: false when the last poll cycle did not get everything it asked for.
+# The value entities publish nothing on a failed cycle and hold their previous
+# reading, so this is what distinguishes fresh data from hours-old data.
+binary_sensor:
+  - platform: nartis_rf_2_meter
+    name: "Last read OK"                 # Последний опрос успешен
