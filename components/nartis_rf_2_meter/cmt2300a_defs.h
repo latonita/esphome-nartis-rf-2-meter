@@ -14,46 +14,6 @@
 namespace esphome::nartis_rf_2_meter {
 
 /* ================================================================
- * Channel grid
- * ================================================================ */
-
-/* Which channel a meter answers on is derived from its serial, not configured:
- *
- *   k = last three digits of the serial, mod 24
- *   f = CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ, plus CHANNEL_STEP_EXTRA_HZ once
- *       k > CHANNEL_STEP_BREAK
- *
- * so the k=18 -> 19 step is 800 kHz and every other one is 700 kHz. That break is
- * on-air evidence rather than a reading of the display's register writes.
- */
-static constexpr uint32_t CHANNEL_BASE_HZ = 435500000u;
-static constexpr uint32_t CHANNEL_STEP_HZ = 700000u;
-static constexpr uint32_t CHANNEL_STEP_BREAK = 18u;
-static constexpr uint32_t CHANNEL_STEP_EXTRA_HZ = 100000u;
-
-/// Channel frequency (Hz) from the last three digits of the meter serial.
-/// e.g. "...060" -> 60 % 24 = 12 -> 443.900 MHz; "...596" -> 20 -> 449.600 MHz.
-/// Non-digit characters are skipped; a null pointer reads as serial 0.
-inline uint32_t frequency_from_serial(const char *digits12) {
-  uint32_t n3 = 0;
-  if (digits12 != nullptr) {
-    size_t len = 0;
-    while (digits12[len] != '\0') {
-      len++;
-    }
-    const size_t start = (len >= 3) ? (len - 3) : 0;
-    for (size_t i = start; i < len; i++) {
-      const char c = digits12[i];
-      if (c >= '0' && c <= '9') {
-        n3 = n3 * 10 + static_cast<uint32_t>(c - '0');
-      }
-    }
-  }
-  const uint32_t k = n3 % 24;
-  return CHANNEL_BASE_HZ + k * CHANNEL_STEP_HZ + (k > CHANNEL_STEP_BREAK ? CHANNEL_STEP_EXTRA_HZ : 0u);
-}
-
-/* ================================================================
  * Register bank base addresses / sizes
  * ================================================================ */
 static constexpr uint8_t CMT_BANK_ADDR = 0x00;

@@ -20,13 +20,6 @@ void Cmt2300aHal::spi_delay() { esphome::delayMicroseconds(2); }
 void Cmt2300aHal::sdio_set_output() { this->sdio_.pin_mode(gpio::FLAG_OUTPUT); }
 void Cmt2300aHal::sdio_set_input() { this->sdio_.pin_mode(gpio::FLAG_INPUT); }
 
-uint8_t Cmt2300aHal::reverse8(uint8_t b) {
-  b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
-  b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
-  b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
-  return b;
-}
-
 void Cmt2300aHal::spi_send_byte(uint8_t b) {
   this->sdio_set_output();
   for (int8_t i = 7; i >= 0; i--) {
@@ -204,6 +197,16 @@ void Cmt2300aHal::set_frequency(uint32_t freq_hz) {
   this->compute_freq_bank_();
 }
 
+// The RX offset expressed in Hz - the unit the CC1101 backend takes, and the one a
+// YAML author reasons in - folded into the frequency codes this chip's registers
+// want. Rounded to nearest rather than truncated: a code is only 6.199 Hz, so
+// truncation would bias every setting toward zero by up to a whole code, and the
+// hardware-proven 758 codes = 4699 Hz has to come back as exactly 758.
+void Cmt2300aHal::set_rx_offset_hz(int32_t hz) {
+  const float codes = static_cast<float>(hz) / RX_CODE_HZ;
+  this->rx_center_offset_ = static_cast<int>(codes + ((codes >= 0.0f) ? 0.5f : -0.5f));
+}
+
 bool Cmt2300aHal::is_chip_connected() {
   uint8_t id = this->spi_read_reg(0x01);  // CMT2 product ID
   ESP_LOGD(TAG, "Product ID: 0x%02X (expected 0x66)", id);
@@ -302,6 +305,11 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
   this->spi_write_reg(REG_MODE_CTL, GO_TFS);
   if (!this->wait_for_state(STA_TFS)) {
     ESP_LOGW(TAG, "TX: no TFS");
+    // Park before leaving. The interface promises standby on every exit from
+    // transmit(), and by this point the chip has been handed a GO_TFS and a loaded
+    // FIFO: bailing out without it would leave the synthesiser running and the next
+    // begin_rx() reconfiguring a chip that is not in the state it assumes.
+    this->go_standby();
     return false;
   }
   this->spi_write_reg(REG_MODE_CTL, GO_TX);
@@ -314,8 +322,15 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
     if (this->spi_read_reg(REG_INT_CLR1) & CLR1_TX_DONE_FLG) {
       this->go_standby();
       const uint32_t dur = esphome::millis() - t0;
-      if (written < tot)
+      if (written < tot) {
         ESP_LOGW(TAG, "TX_DONE but only %zu/%zu written - frame truncated on air", written, tot);
+        // A truncated request is a failed transmission, not a qualified success: what
+        // the meter heard is a frame whose CRC cannot check out, so it will never
+        // answer. Reporting false is what lets the component's retry path resend it
+        // instead of spending the whole RX timeout waiting for a reply to a frame
+        // that was never completely sent.
+        return false;
+      }
       // For a chunked (>FIFO) frame, log timing + fill so we can tell a clean send
       // (dur ~ airtime, written==tot) from a FIFO underrun (dur too short).
       if (chunked)
@@ -338,8 +353,8 @@ bool Cmt2300aHal::transmit(const uint8_t *frame, size_t len) {
   return false;
 }
 
-bool Cmt2300aHal::begin_rx(int off_codes) {
-  this->init_rx(off_codes);
+bool Cmt2300aHal::begin_rx() {
+  this->init_rx(this->rx_center_offset_);
   this->spi_write_reg(REG_MODE_CTL, GO_RFS);
   if (!this->wait_for_state(STA_RFS)) {
     ESP_LOGW(TAG, "RX: no RFS");
@@ -353,17 +368,38 @@ bool Cmt2300aHal::begin_rx(int off_codes) {
   return true;
 }
 
-size_t Cmt2300aHal::drain_rx(uint8_t *buf, size_t buf_size, uint8_t max_chunks) {
+size_t Cmt2300aHal::drain_rx(uint8_t *buf, size_t buf_size, RxStatus &status) {
   size_t total = 0;
   uint8_t chunks = 0;
-  while (chunks < max_chunks && total + FIFO_TH_VALUE <= buf_size && pin_read(this->gpio3_)) {
+  while (chunks < MAX_DRAIN_CHUNKS && total + FIFO_TH_VALUE <= buf_size && pin_read(this->gpio3_)) {
     this->read_fifo(buf + total, FIFO_TH_VALUE);
     total += FIFO_TH_VALUE;
     chunks++;
   }
+  // DATA or NO_DATA, never a fault. The merged packet FIFO exposes no overflow flag
+  // this driver reads, and the one fault the chip could still report - having fallen
+  // out of RX - would cost a MODE_STA transaction on every poll of a bit-banged bus
+  // whose timing here is proven on hardware. The INT2 = RX_FIFO_TH line is the whole
+  // story: asserted means a full chunk is waiting, deasserted means not yet.
+  status = (total > 0) ? RxStatus::RX_STATUS_DATA : RxStatus::RX_STATUS_NO_DATA;
   return total;
 }
 
 int8_t Cmt2300aHal::get_rssi_dbm() { return (int8_t) ((int) this->spi_read_reg(REG_RSSI_DBM) - 128); }
+
+// Called from the component's dump_config() after its own lines, so the two-space
+// indent makes these read as part of the same block. Everything here comes out of
+// member state - LOG_PIN is null-safe and prints the pin object, not a register -
+// because ESPHome dumps a component's config even after mark_failed(), so this can
+// run with no chip answering on the bus at all.
+void Cmt2300aHal::dump_config() {
+  LOG_PIN("  SDIO pin: ", this->sdio_pin_);
+  LOG_PIN("  SCLK pin: ", this->sclk_pin_);
+  LOG_PIN("  CSB pin: ", this->csb_pin_);
+  LOG_PIN("  FCSB pin: ", this->fcsb_pin_);
+  LOG_PIN("  GPIO3 pin: ", this->gpio3_pin_);
+  ESP_LOGCONFIG(TAG, "  RX centre offset: %d codes (~%.1f kHz)", this->rx_center_offset_,
+                this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
+}
 
 }  // namespace esphome::nartis_rf_2_meter

@@ -41,16 +41,23 @@ external_components:
    components: [nartis_rf_2_meter]
    refresh: 1s
 
-# CMT2300A RF transceiver wiring (ESP32 GPIOs - adjust to your board).
+# RF transceiver wiring (ESP32 GPIOs - adjust to your board). `type:` picks the
+# backend; `cmt2300a` is the default and the one proven on live meters. The
+# CC1101 alternative is shown in example_esp32.yaml.
 nartis_rf_2_meter:
   id: nartis
   address: "023240123456"
 
-  pin_sdio: GPIO23
-  pin_sclk: GPIO18
-  pin_csb: GPIO27
-  pin_fcsb: GPIO26
-  pin_gpio3: GPIO14
+  radio:
+    type: cmt2300a
+    pin_sdio: GPIO23
+    pin_sclk: GPIO18
+    pin_csb: GPIO27
+    pin_fcsb: GPIO26
+    pin_gpio3: GPIO14
+    # rx_offset: 4699Hz     # preferred: signed Hz, the proven default
+    # rx_center_offset: 758 # legacy spelling, in CMT2300A codes (= 4699 Hz).
+                            # Only one of the two may be given.
 
   update_interval: 120s
   rf_rx_timeout: 1700ms

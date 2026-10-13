@@ -2,9 +2,9 @@
  * Nartis RF-2 meter - ESPHome component.
  *
  * Emulates the НАРТИС-Д101-2 display: constant DL/T 645 read requests over the
- * 443 MHz CMT2300A link. See d101_frame.h for the wire format and the sources.
+ * 443 MHz radio link. See d101_frame.h for the wire format and the sources.
  *
- *   Cmt2300aHal   - radio (bit-bang SPI, register banks, TX/RX profiles)
+ *   RadioHal      - radio backend (CMT2300A or CC1101), see radio_hal.h
  *   d101_frame.*  - envelope + DL/T 645 + item payload, pure protocol
  *   this file     - polling state machine and entity publishing
  *
@@ -30,7 +30,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 
-#include "cmt2300a_hal.h"
+#include "radio_hal.h"
 #include "d101_frame.h"
 
 #include <array>
@@ -70,12 +70,10 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void update() override;
   void loop() override;
 
-  // CMT2300A wiring: bit-bang 3-wire SPI + INT2 on the chip's GPIO3 pad.
-  void set_pin_sdio(esphome::InternalGPIOPin *p) { this->pin_sdio_ = p; }
-  void set_pin_sclk(esphome::InternalGPIOPin *p) { this->pin_sclk_ = p; }
-  void set_pin_csb(esphome::InternalGPIOPin *p) { this->pin_csb_ = p; }
-  void set_pin_fcsb(esphome::InternalGPIOPin *p) { this->pin_fcsb_ = p; }
-  void set_pin_gpio3(esphome::InternalGPIOPin *p) { this->pin_gpio3_ = p; }
+  /// The radio backend, already wired and configured by code generation. The
+  /// component only ever sees the RadioHal interface, so which chip is on the
+  /// board is a YAML decision.
+  void set_radio(RadioHal *radio) { this->radio_ = radio; }
 
   /// 12-digit nameplate serial: the DL/T 645 address, and it selects the channel.
   /// Code generation passes a string literal, which outlives the component.
@@ -99,8 +97,6 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void set_rf_rx_timeout_ms(uint32_t ms) { this->rf_rx_timeout_ms_ = ms; }
   /// Retransmissions per exchange. Total attempts = 1 + n.
   void set_rf_retries(uint8_t n) { this->rf_retries_ = n; }
-  /// RX centre offset in CMT2300A frequency codes (1 code ~= 6.199 Hz).
-  void set_rx_center_offset(int off) { this->rx_center_offset_ = off; }
 
   /// Extra read once per cycle, logged in full and driving no entity.
   void add_probe(uint16_t di, const std::vector<uint8_t> &body);
@@ -127,10 +123,12 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
     RX_POLL_NOTHING,   // no bytes yet
     RX_POLL_BUSY,      // partial frame, keep draining
     RX_POLL_COMPLETE,  // hand the buffer to the carve/parse step
+    RX_POLL_FAULT,     // the radio reported a fault; rx_status_ says which
   };
 
   void set_state_(State state);
   static const LogString *state_to_string_(State state);
+  static const LogString *rx_status_to_string_(RxStatus status);
 
   void start_cycle_();
   bool send_request_();
@@ -169,16 +167,10 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void publish_from_data_(const SensorEntry &e);
   void publish_from_status_(const SensorEntry &e);
 
-  Cmt2300aHal hal_;
+  RadioHal *radio_{nullptr};
 
   esphome::binary_sensor::BinarySensor *last_read_ok_bs_{nullptr};
   esphome::sensor::Sensor *rssi_sensor_{nullptr};
-
-  esphome::InternalGPIOPin *pin_sdio_{nullptr};
-  esphome::InternalGPIOPin *pin_sclk_{nullptr};
-  esphome::InternalGPIOPin *pin_csb_{nullptr};
-  esphome::InternalGPIOPin *pin_fcsb_{nullptr};
-  esphome::InternalGPIOPin *pin_gpio3_{nullptr};
 
   const char *address_{""};
   uint8_t serial_le_[SERIAL_BCD_SIZE]{};
@@ -188,7 +180,6 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint32_t request_gap_ms_{500};
   uint32_t rf_rx_timeout_ms_{1500};
   uint8_t rf_retries_{2};
-  int rx_center_offset_{758};
 
   State state_{State::STATE_NOT_INITIALIZED};
   uint32_t state_entered_ms_{0};
@@ -268,6 +259,12 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   uint32_t cycles_{0};
   uint32_t no_reply_count_{0};
   uint32_t bad_frame_count_{0};
+  /// Attempts abandoned because the radio itself reported a fault (FIFO overflow,
+  /// an implausible SPI reply, or a chip that left RX). Kept apart from the two
+  /// above on purpose: those two say something about the link or the meter, this
+  /// one says something about the board, and conflating them is what sends a
+  /// hardware fault to be debugged as poor reception.
+  uint32_t radio_error_count_{0};
   uint32_t retry_count_{0};
   uint32_t giveup_count_{0};
   int8_t last_rssi_dbm_{0};
@@ -287,17 +284,21 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   std::array<uint8_t, MAX_REQUEST_FRAME_SIZE> tx_buf_{};
   size_t tx_len_{0};
 
-  /// RX accumulation. Fixed-length capture never raises PKT_DONE, so a frame is
-  /// bounded by its own LEN byte. Sized from the protocol: the radio hands over
-  /// 1 + LEN + 2 and LEN = 15 + payload, so the largest frame accepted is
-  /// 18 + MAX_PAYLOAD = 146 bytes, and draining only happens in whole
-  /// FIFO_TH_VALUE chunks.
+  /// RX accumulation. No backend reports end-of-frame - the CMT2300A captures a
+  /// fixed length and never raises PKT_DONE, the CC1101 runs infinite-length - so a
+  /// frame is bounded by its own LEN byte. Sized from the protocol: the radio hands
+  /// over 1 + LEN + 2 and LEN = 15 + payload, so the largest frame accepted is
+  /// 18 + MAX_PAYLOAD = 146 bytes; the remainder is headroom for a backend to
+  /// overshoot the end of a frame by one drain chunk (see max_drain_chunk()).
   static constexpr size_t RX_DRAIN_CAP = 192;
   /// No new FIFO chunk for this long means reception is over.
   static constexpr uint32_t RX_END_GAP_MS = 400;
   std::array<uint8_t, RX_DRAIN_CAP> rx_buf_{};
   size_t rx_len_{0};
   uint32_t rx_last_chunk_ms_{0};
+  /// What the last drain_rx() reported. Only read when poll_rx_() returned
+  /// RX_POLL_FAULT, which is the one case where it is not DATA or NO_DATA.
+  RxStatus rx_status_{RxStatus::RX_STATUS_NO_DATA};
 
   std::vector<SensorEntry> entries_;
 };

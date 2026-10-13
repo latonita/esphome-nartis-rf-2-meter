@@ -13,9 +13,8 @@ namespace esphome::nartis_rf_2_meter {
 static const char *const TAG = "nartis_rf_2_meter";
 
 void NartisRf2MeterComponent::setup() {
-  if (this->pin_sdio_ == nullptr || this->pin_sclk_ == nullptr || this->pin_csb_ == nullptr ||
-      this->pin_fcsb_ == nullptr || this->pin_gpio3_ == nullptr) {
-    ESP_LOGE(TAG, "CMT2300A pins are not configured");
+  if (this->radio_ == nullptr) {
+    ESP_LOGE(TAG, "No radio configured");
     this->publish_cycle_outcome_(false);
     this->mark_failed();
     return;
@@ -25,18 +24,17 @@ void NartisRf2MeterComponent::setup() {
   this->rf_frequency_hz_ =
       (this->frequency_override_ != 0) ? this->frequency_override_ : frequency_from_serial(this->address_);
 
-  this->hal_.set_pins(this->pin_sdio_, this->pin_sclk_, this->pin_csb_, this->pin_fcsb_, this->pin_gpio3_);
   // Must precede init(): init() is what writes the computed frequency bank.
-  this->hal_.set_frequency(this->rf_frequency_hz_);
+  this->radio_->set_frequency(this->rf_frequency_hz_);
 
-  if (!this->hal_.init()) {
-    ESP_LOGE(TAG, "CMT2300A initialization failed - check wiring");
+  if (!this->radio_->init()) {
+    ESP_LOGE(TAG, "%s initialization failed - check wiring", this->radio_->radio_name());
     // Fail safe: a radio that never came up must not leave the entity unknown.
     this->publish_cycle_outcome_(false);
     this->mark_failed();
     return;
   }
-  this->hal_.go_standby();
+  this->radio_->go_standby();
   this->radio_ready_ = true;
 
   // The diagnostic entity reports on a poll cycle, so with no value entities
@@ -50,7 +48,8 @@ void NartisRf2MeterComponent::setup() {
     ESP_LOGW(TAG, "No sensors configured - nothing will be polled");
   }
 
-  ESP_LOGI(TAG, "CMT2300A ready at %.3f MHz (meter %s)", this->rf_frequency_hz_ / 1e6f, this->address_);
+  ESP_LOGI(TAG, "%s ready at %.3f MHz (meter %s)", this->radio_->radio_name(), this->rf_frequency_hz_ / 1e6f,
+           this->address_);
   this->set_state_(State::STATE_IDLE);
 }
 
@@ -283,8 +282,6 @@ void NartisRf2MeterComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Frequency: %.3f MHz%s", this->rf_frequency_hz_ / 1e6f,
                 (this->frequency_override_ != 0) ? LOG_STR_LITERAL(" (override)")
                                                  : LOG_STR_LITERAL(" (derived from address)"));
-  ESP_LOGCONFIG(TAG, "  RX centre offset: %d codes (~%.1f kHz)", this->rx_center_offset_,
-                this->rx_center_offset_ * RX_CODE_HZ / 1000.0f);
   ESP_LOGCONFIG(TAG, "  RX timeout: %" PRIu32 " ms, retries: %u, request gap: %" PRIu32 " ms", this->rf_rx_timeout_ms_,
                 this->rf_retries_, this->request_gap_ms_);
   ESP_LOGCONFIG(TAG, "  Sources: list 1 %s, list 2 %s, fixed DI 0xF101 %s, fixed DI 0xF102 %s",
@@ -296,11 +293,10 @@ void NartisRf2MeterComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Values are published scaled to the unit in tags.md - no multiply filter needed");
   LOG_BINARY_SENSOR("  ", "Last read OK", this->last_read_ok_bs_);  // macro is nullptr-safe
   LOG_SENSOR("  ", "RSSI", this->rssi_sensor_);
-  LOG_PIN("  SDIO pin: ", this->pin_sdio_);
-  LOG_PIN("  SCLK pin: ", this->pin_sclk_);
-  LOG_PIN("  CSB pin: ", this->pin_csb_);
-  LOG_PIN("  FCSB pin: ", this->pin_fcsb_);
-  LOG_PIN("  GPIO3 pin: ", this->pin_gpio3_);
+  if (this->radio_ != nullptr) {
+    ESP_LOGCONFIG(TAG, "  Radio: %s", this->radio_->radio_name());
+    this->radio_->dump_config();  // wiring and whatever else the backend wants shown
+  }
   LOG_UPDATE_INTERVAL(this);
 
   // Print the frames we will actually put on the air, to compare against a capture.
@@ -500,7 +496,7 @@ void NartisRf2MeterComponent::loop() {
 
     default:
       ESP_LOGE(TAG, "Unhandled state %u - returning to idle", static_cast<unsigned>(this->state_));
-      this->hal_.go_standby();
+      this->radio_->go_standby();
       this->set_state_(State::STATE_IDLE);
       break;
   }
@@ -533,11 +529,11 @@ bool NartisRf2MeterComponent::send_request_() {
 
   // transmit() is synchronous: it applies the TX profile, fills the FIFO and blocks
   // until TX_DONE - tens of milliseconds for a 28-byte frame at 1.2 kbps.
-  if (!this->hal_.transmit(this->tx_buf_.data(), this->tx_len_)) {
+  if (!this->radio_->transmit(this->tx_buf_.data(), this->tx_len_)) {
     ESP_LOGW(TAG, "DI 0x%04X: transmit did not complete", di);
     return false;
   }
-  if (!this->hal_.begin_rx(this->rx_center_offset_)) {
+  if (!this->radio_->begin_rx()) {
     ESP_LOGW(TAG, "DI 0x%04X: could not enter RX", di);
     return false;
   }
@@ -550,25 +546,44 @@ bool NartisRf2MeterComponent::send_request_() {
 NartisRf2MeterComponent::RxPoll NartisRf2MeterComponent::poll_rx_() {
   const uint32_t now = App.get_loop_component_start_time();
 
-  // drain_rx() only ever appends whole FIFO_TH_VALUE chunks that fit.
-  const size_t got = this->hal_.drain_rx(this->rx_buf_.data() + this->rx_len_, this->rx_buf_.size() - this->rx_len_);
+  // drain_rx() appends only what fits in the space it is given, and always says why
+  // it appended nothing - which is the difference between a meter that has not
+  // answered yet and a radio that can no longer hear one.
+  RxStatus status = RxStatus::RX_STATUS_NO_DATA;
+  const size_t got = this->radio_->drain_rx(this->rx_buf_.data() + this->rx_len_,
+                                            this->rx_buf_.size() - this->rx_len_, status);
   if (got > 0) {
     this->rx_len_ += got;
     this->rx_last_chunk_ms_ = now;
+  }
+
+  this->rx_status_ = status;
+  if (status != RxStatus::RX_STATUS_DATA && status != RxStatus::RX_STATUS_NO_DATA) {
+    // The epoch is over whatever is already in the buffer: an overflow lost the
+    // middle of the frame, and the other two mean the radio is not listening. Any
+    // bytes held are a fragment, so there is nothing to parse and nothing to gain
+    // from sitting out the rest of rf_rx_timeout_ms_.
+    return RxPoll::RX_POLL_FAULT;
   }
 
   if (this->rx_len_ == 0) {
     return RxPoll::RX_POLL_NOTHING;
   }
 
-  // The first received byte is LEN, so the whole frame is LEN + 3 bytes. Fixed-length
-  // capture keeps feeding noise past it, so stop as soon as the frame is in.
+  // The first received byte is LEN, so the whole frame is LEN + 3 bytes. Neither
+  // backend stops at the end of the reply - the CMT2300A is capturing a fixed 180
+  // bytes, the CC1101 an infinite packet - so both keep handing over demodulated
+  // noise past it, and the frame has to be cut off here as soon as it is in.
   const size_t env_len = this->rx_buf_[0];
   if (env_len >= D101_HDR_AFTER_LEN + DLT645_OVERHEAD && this->rx_len_ >= env_len + 3) {
     return RxPoll::RX_POLL_COMPLETE;
   }
-  // Fallbacks for a bogus LEN: buffer full, or the chunks stopped arriving.
-  if (this->rx_len_ + FIFO_TH_VALUE > this->rx_buf_.size() || (now - this->rx_last_chunk_ms_) >= RX_END_GAP_MS) {
+  // Fallbacks for a bogus LEN: buffer full, or the chunks stopped arriving. "Full"
+  // is asked of the backend rather than assumed - the CMT2300A appends up to 75 bytes
+  // a call (five 15-byte threshold chunks) and the CC1101 up to 64, so a constant
+  // here would be wrong for one of them.
+  if (this->rx_len_ + this->radio_->max_drain_chunk() > this->rx_buf_.size() ||
+      (now - this->rx_last_chunk_ms_) >= RX_END_GAP_MS) {
     return RxPoll::RX_POLL_COMPLETE;
   }
   return RxPoll::RX_POLL_BUSY;
@@ -579,9 +594,24 @@ void NartisRf2MeterComponent::handle_wait_() {
   const uint16_t di = this->current_di_();
   const bool is_probe = (step.kind == StepKind::STEP_KIND_PROBE);
 
-  if (this->poll_rx_() == RxPoll::RX_POLL_COMPLETE) {
+  const RxPoll poll = this->poll_rx_();
+
+  if (poll == RxPoll::RX_POLL_FAULT) {
+    // Not the meter's silence and not a mangled frame - the radio said it could not
+    // do its job. Counted on its own, and the attempt ends here instead of waiting
+    // out rf_rx_timeout_ms_ for a reply that cannot now arrive; the retry path below
+    // gets the time back.
+    this->radio_error_count_++;
+    ESP_LOGW(TAG, "%sDI 0x%04X: radio reported %s after %zu byte(s) - abandoning this attempt",
+             is_probe ? LOG_STR_LITERAL("PROBE ") : LOG_STR_LITERAL(""), di,
+             LOG_STR_ARG(rx_status_to_string_(this->rx_status_)), this->rx_len_);
+    this->retry_or_finish_();
+    return;
+  }
+
+  if (poll == RxPoll::RX_POLL_COMPLETE) {
     // Read RSSI while still in RX - go_standby() would invalidate it.
-    this->last_rssi_dbm_ = this->hal_.get_rssi_dbm();
+    this->last_rssi_dbm_ = this->radio_->get_rssi_dbm();
     this->rssi_valid_ = true;
 
     // The bytes go out whether or not they decode - they are the primary record for
@@ -662,7 +692,7 @@ void NartisRf2MeterComponent::handle_wait_() {
 
 void NartisRf2MeterComponent::retry_or_finish_() {
   const uint16_t di = this->current_di_();
-  this->hal_.go_standby();
+  this->radio_->go_standby();
 
   if (this->attempt_ <= this->rf_retries_) {
     this->retry_count_++;
@@ -677,7 +707,7 @@ void NartisRf2MeterComponent::retry_or_finish_() {
 }
 
 void NartisRf2MeterComponent::finish_exchange_() {
-  this->hal_.go_standby();
+  this->radio_->go_standby();
   this->rx_len_ = 0;
 
   // Every step in the list is sent; nothing is conditional on what an earlier reply
@@ -740,8 +770,11 @@ void NartisRf2MeterComponent::handle_publish_() {
   }
   ESP_LOGD(TAG, "Cycle %" PRIu32 " finished in %" PRIu32 " ms (%u merged record(s); %s)", this->cycles_,
            App.get_loop_component_start_time() - this->cycle_start_ms_, this->merged_count_, asked);
-  ESP_LOGV(TAG, "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", retries %" PRIu32 ", give-ups %" PRIu32,
-           this->no_reply_count_, this->bad_frame_count_, this->retry_count_, this->giveup_count_);
+  ESP_LOGV(TAG,
+           "Counters: no-reply %" PRIu32 ", bad frame %" PRIu32 ", radio error %" PRIu32 ", retries %" PRIu32
+           ", give-ups %" PRIu32,
+           this->no_reply_count_, this->bad_frame_count_, this->radio_error_count_, this->retry_count_,
+           this->giveup_count_);
 
   // A cycle counts as successful only if every exchange it needed came back: a
   // partial cycle left some entity holding a stale value, which is what this entity
@@ -1108,6 +1141,26 @@ const LogString *NartisRf2MeterComponent::state_to_string_(State state) {
       return LOG_STR("GAP");
     case State::STATE_PUBLISH:
       return LOG_STR("PUBLISH");
+    default:
+      return LOG_STR("UNKNOWN");
+  }
+}
+
+// Spelled out rather than printed as a number: these lines are what a user pastes
+// into a bug report, and "RX FIFO overflow" tells them to look at the wiring and the
+// loop rate where "status 2" tells them nothing.
+const LogString *NartisRf2MeterComponent::rx_status_to_string_(RxStatus status) {
+  switch (status) {
+    case RxStatus::RX_STATUS_DATA:
+      return LOG_STR("data");
+    case RxStatus::RX_STATUS_NO_DATA:
+      return LOG_STR("no data yet");
+    case RxStatus::RX_STATUS_OVERFLOW:
+      return LOG_STR("RX FIFO overflow");
+    case RxStatus::RX_STATUS_IO_ERROR:
+      return LOG_STR("SPI I/O error");
+    case RxStatus::RX_STATUS_NOT_IN_RX:
+      return LOG_STR("radio no longer in RX");
     default:
       return LOG_STR("UNKNOWN");
   }

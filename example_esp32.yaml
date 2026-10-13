@@ -25,22 +25,55 @@ external_components:
   - source: github://latonita/esphome-nartis-rf-2-meter
     components: [nartis_rf_2_meter]
 
-# CMT2300A wiring - adjust the GPIOs to your board.
+# Radio wiring - adjust the GPIOs to your board.
 nartis_rf_2_meter:
   id: nartis
   address: "023240271060"   # 12 digits from the meter nameplate
-  pin_sdio: GPIO19
-  pin_sclk: GPIO18
-  pin_csb: GPIO5
-  pin_fcsb: GPIO21
-  pin_gpio3: GPIO22         # INT2
+
+  # CMT2300A on a bit-banged 3-wire SPI. This is the proven backend.
+  radio:
+    type: cmt2300a
+    pin_sdio: GPIO19
+    pin_sclk: GPIO18
+    pin_csb: GPIO5
+    pin_fcsb: GPIO21
+    pin_gpio3: GPIO22       # INT2
+    # rx_offset: 4699Hz     # preferred: signed Hz, same key/unit as cc1101.
+                            # This is the proven default; raise or lower it a few
+                            # hundred Hz if the meter does not answer.
+    # rx_center_offset: 758 # legacy spelling of the line above, in CMT2300A
+                            # frequency codes (1 code ~= 6.199 Hz). 758 codes is
+                            # exactly 4699 Hz. Give one or the other, never both.
+
+  # ...or a TI CC1101 on a normal 4-wire SPI instead. Same PHY, different chip -
+  # but UNPROVEN on hardware so far, and ~10 dB weaker on transmit than the
+  # CMT2300A path (see README). Comment out the block above to use this one.
+  # radio:
+  #   type: cc1101
+  #   pin_sclk: GPIO18
+  #   pin_miso: GPIO19
+  #   pin_mosi: GPIO23
+  #   pin_cs: GPIO5
+  #   pin_gdo0: GPIO22      # optional; without it the driver polls over SPI
+  #   rx_offset: 0Hz        # signed, Hz
+  #   output_power: 10      # dBm, -30..+10
+  #   bandwidth: 81250Hz    # 58kHz..812kHz
+  #   deviation: 25kHz      # the protocol's value - leave it alone
+  #   foc_carrier_sense_gate: true
+  #                         # bring-up knob, default false. Try this FIRST if the
+  #                         # meter is heard (RSSI moves, bytes arrive) but the
+  #                         # replies never decode: it freezes the frequency and
+  #                         # bit-sync loops until carrier sense asserts, instead
+  #                         # of letting them track noise while we wait. The other
+  #                         # way round it can lose a weak reply entirely - judge
+  #                         # by the rate of CRC-valid replies, not by bytes seen.
+
   update_interval: 300s
   # Optional, shown with their defaults:
   # frequency: 443.9MHz     # default: derived from `address`
   # request_gap: 500ms      # also separates DI 0xF202 from its DI 0xF203 tail
   # rf_rx_timeout: 1800ms
   # rf_retries: 2
-  # rx_center_offset: 758
   # Diagnostic: signal level of the last reply heard in a cycle. dBm, device class
   # and diagnostic category are set for you - a name is all it needs. A cycle that
   # heard nothing publishes nothing, so the entity holds instead of reading a floor.
