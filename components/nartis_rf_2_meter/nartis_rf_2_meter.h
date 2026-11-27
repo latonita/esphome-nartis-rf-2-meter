@@ -154,6 +154,7 @@ class NartisRf2MeterComponent : public esphome::PollingComponent {
   void log_items_(const ParsedResponse &resp, bool warn) const;
   void note_tag_width_(uint8_t tag, StatusField field, uint8_t width);
   void log_response_(const ParsedResponse &resp) const;
+  void log_hex_(const char *dir, const uint8_t *data, size_t len) const;
   void log_unknown_tag_(uint16_t di, const ParsedResponse &resp) const;
   void log_bad_records_(uint16_t di, ParseResult r, const ParsedResponse &resp) const;
 
